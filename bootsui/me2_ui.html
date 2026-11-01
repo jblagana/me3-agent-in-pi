@@ -1,0 +1,701 @@
+﻿<!doctype html>
+<html lang="en" data-theme="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Boots · ME3</title>
+<style>
+/* ============ THEME TOKENS ============ */
+@property --a{syntax:'<angle>';initial-value:0deg;inherits:false}
+:root{
+  --bg:#0d1117;--bg-grad:linear-gradient(170deg,#0d1117 0%,#111827 50%,#0d1117 100%);
+  --card:#161b22;--card2:#1c2230;--line:#21262d;--track:#21262d;
+  --tx:#e6edf3;--dim:#8b949e;
+  --blue:#58a6ff;--green:#3fb950;--amber:#d29922;--red:#f85149;
+  --glow-blue:rgba(88,166,255,.28);--glow-green:rgba(63,185,80,.30);
+  --shadow:0 1px 3px rgba(0,0,0,.5),0 4px 14px rgba(0,0,0,.3);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.4);
+  --accent-top:rgba(88,166,255,.08);
+}
+[data-theme="light"]{
+  --bg:#f0f3f7;--bg-grad:linear-gradient(170deg,#f8fafc 0%,#e8edf5 40%,#f0f3f7 100%);
+  --card:#ffffff;--card2:#f3f6fa;--line:#d8dee6;--track:#e8ecf1;
+  --tx:#1a202c;--dim:#5a6577;
+  --blue:#2563eb;--green:#16a34a;--amber:#d97706;--red:#dc2626;
+  --glow-blue:rgba(37,99,235,.22);--glow-green:rgba(22,163,74,.24);
+  --shadow:0 1px 3px rgba(0,0,0,.06),0 6px 20px rgba(0,0,0,.08);
+  --shadow-sm:0 1px 2px rgba(0,0,0,.05);
+  --accent-top:rgba(37,99,235,.06);
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-grad);background-attachment:fixed;color:var(--tx);min-height:100vh;
+  font:16px/1.5 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+  display:flex;justify-content:center;padding:28px 16px;
+  transition:background .3s,color .3s}
+main{width:100%;max-width:640px}
+
+/* ============ HEADER ============ */
+header{display:flex;align-items:center;gap:10px;margin-bottom:16px;
+  padding:12px 16px;background:var(--card);border:1px solid var(--line);
+  border-radius:14px;box-shadow:var(--shadow-sm)}
+.lamp{width:12px;height:12px;border-radius:50%;background:var(--blue);
+  box-shadow:0 0 10px var(--blue);transition:background .3s}
+.lamp.awake{background:var(--green);box-shadow:0 0 10px var(--green)}
+.lamp.clarify{background:var(--amber);box-shadow:0 0 10px var(--amber)}
+.lamp.reject{background:var(--red);box-shadow:0 0 10px var(--red)}
+.brand{font-size:15px;font-weight:700;letter-spacing:.06em}
+.mode{font-size:11px;letter-spacing:.14em;color:var(--dim)}
+.mode.awake{color:var(--green)}
+.mode.clarify{color:var(--amber)}
+.mode.reject{color:var(--red)}
+.mode.slotfill,.mode.slotcheck{color:var(--amber)}
+.hright{margin-left:auto;display:flex;align-items:center;gap:14px}
+.hw{display:flex;align-items:center;gap:6px}
+.wicon{font-size:18px;line-height:1}
+.wtemp{font-size:14px;font-weight:650;font-variant-numeric:tabular-nums}
+.wcond{font-size:11.5px;color:var(--dim)}
+.hclock{font-size:14px;font-weight:650;font-variant-numeric:tabular-nums}
+.toggle{width:30px;height:30px;border-radius:8px;cursor:pointer;
+  border:1px solid var(--line);background:var(--card2);color:var(--tx);
+  font-size:14px;display:flex;align-items:center;justify-content:center;
+  transition:background .2s,border-color .2s}
+.toggle:hover{border-color:var(--blue)}
+
+/* ============ BIG CARD (LAST COMMAND) ============ */
+.bigcard{position:relative;margin-bottom:16px;border-radius:15px}
+.bigcard::before{content:"";position:absolute;inset:-3px;border-radius:17px;
+  z-index:0;opacity:0;filter:blur(7px);
+  background:conic-gradient(from var(--a),
+    transparent 0deg,var(--green) 42deg,transparent 84deg,
+    transparent 180deg,var(--blue) 222deg,transparent 264deg);
+  transition:opacity .3s}
+/* amber variant for clarify/slot-fill */
+.bigcard.amber-glow::before{
+  background:conic-gradient(from var(--a),
+    transparent 0deg,var(--amber) 42deg,transparent 84deg,
+    transparent 180deg,var(--blue) 222deg,transparent 264deg)}
+.bigcard.listening{z-index:0}
+.bigcard.listening::before{opacity:.95;animation:spin 2.4s linear infinite}
+@keyframes spin{to{--a:360deg}}
+.bigcard .inner{position:relative;z-index:1;background:var(--card);
+  border:1px solid var(--line);border-radius:15px;padding:22px;
+  box-shadow:var(--shadow);transition:background .3s,border-color .3s;
+  border-top:2px solid var(--accent-top)}
+.k{font-size:11px;letter-spacing:.18em;color:var(--dim);margin-bottom:8px}
+.cmd{font-size:30px;font-weight:650}
+.cmd-ic{margin-right:10px;font-size:26px;vertical-align:-2px;display:inline-block}
+.cmd-ic[data-ico=timer]{animation:icoFlip 2s ease-in-out infinite}
+.cmd-ic[data-ico=alarm]{animation:icoRing .6s ease-in-out infinite}
+.cmd-ic[data-ico=music]{animation:icoBounce 1.2s ease-in-out infinite}
+.cmd-ic[data-ico=lights]{animation:icoPulse 2s ease-in-out infinite}
+.cmd-ic[data-ico=thermo]{animation:icoSpin 4s linear infinite}
+.cmd-ic[data-ico=ask]{animation:icoWiggle 1.5s ease-in-out infinite}
+.cmd-ic[data-ico=call]{animation:icoCall .5s ease-in-out infinite}
+@keyframes icoFlip{0%,40%{transform:translateY(-2px) rotate(0)}50%,90%{transform:translateY(-2px) rotate(180deg)}100%{transform:translateY(-2px) rotate(360deg)}}
+@keyframes icoRing{0%,100%{transform:translateY(-2px) rotate(0)}20%{transform:translateY(-2px) rotate(14deg)}40%{transform:translateY(-2px) rotate(-12deg)}60%{transform:translateY(-2px) rotate(8deg)}80%{transform:translateY(-2px) rotate(-6deg)}}
+@keyframes icoBounce{0%,100%{transform:translateY(-2px)}50%{transform:translateY(-8px)}}
+@keyframes icoPulse{0%,100%{transform:translateY(-2px) scale(1);opacity:1}50%{transform:translateY(-2px) scale(1.15);opacity:.8}}
+@keyframes icoSpin{from{transform:translateY(-2px) rotate(0)}to{transform:translateY(-2px) rotate(360deg)}}
+@keyframes icoWiggle{0%,100%{transform:translateY(-2px) rotate(0)}25%{transform:translateY(-2px) rotate(8deg)}75%{transform:translateY(-2px) rotate(-8deg)}}
+@keyframes icoCall{0%,100%{transform:translateY(-2px) rotate(0)}15%{transform:translateY(-2px) rotate(-20deg)}30%{transform:translateY(-2px) rotate(18deg)}45%{transform:translateY(-2px) rotate(-14deg)}60%{transform:translateY(-2px) rotate(10deg)}75%{transform:translateY(-2px) rotate(-6deg)}}
+.slot{font-size:20px;color:var(--blue);margin-top:2px}
+.slot.q{font-size:23px;font-weight:560;line-height:1.35;margin-top:6px;
+  padding:12px 14px;border-left:3px solid var(--blue);
+  background:var(--card2);border-radius:0 10px 10px 0}
+.slot.q .qtag{display:block;font-size:11px;letter-spacing:.14em;
+  color:var(--dim);margin-bottom:4px}
+.slot.dim{font-size:24px;font-weight:650;margin-top:4px;font-variant-numeric:tabular-nums}
+.slot.dim .arr{color:var(--dim);margin:0 8px;font-weight:400}
+.slot.dim .old{color:var(--dim);opacity:.7}
+.slot.dim .new{color:var(--blue)}
+.slot.none{color:var(--dim);font-size:15px}
+.slot.lowconf{color:var(--amber)}
+.bar{height:8px;background:var(--track);border-radius:4px;margin-top:14px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--blue);border-radius:4px;transition:width .3s}
+.meta{display:flex;gap:18px;margin-top:12px;font-size:12px;color:var(--dim)}
+.empty{font-size:17px;color:var(--dim)}
+.empty .hint{display:block;font-size:13px;margin-top:6px;opacity:.7}
+
+/* ============ CLARIFY / REJECT / SLOT-FILL STATES ============ */
+.clarify-msg{font-size:28px;color:var(--amber);font-weight:650;margin-bottom:12px}
+.clarify-sub{font-size:18px;color:#fff;margin-bottom:14px}
+.cand-row{display:flex;flex-wrap:wrap;gap:8px;margin-bottom:14px}
+.cand{padding:8px 14px;border-radius:10px;cursor:pointer;font-size:14px;font-weight:600;
+  border:1px solid var(--line);background:var(--card2);color:var(--tx);
+  transition:border-color .2s,background .2s,transform .1s}
+.cand:hover{border-color:var(--blue);background:var(--glow-blue);transform:translateY(-1px)}
+.cand .cand-conf{font-size:11px;color:var(--dim);font-weight:400;margin-left:6px}
+.reject-msg{font-size:28px;font-weight:650;color:var(--red);margin-bottom:8px}
+.reject-sub{font-size:18px;color:#fff;margin-bottom:8px}
+.slotfill-msg{font-size:28px;color:var(--amber);font-weight:650;margin-bottom:8px}
+.slotfill-prompt{font-size:18px;color:#fff;margin-bottom:8px}
+.slotfill-hint{font-size:13px;color:var(--dim)}
+.slotcheck-msg{font-size:28px;color:var(--amber);font-weight:650;margin-bottom:8px}
+.slotcheck-prompt{font-size:18px;color:#fff;margin-bottom:14px}
+.slotcheck-hint{font-size:13px;color:var(--dim);margin-top:10px}
+.retry-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px;
+  color:var(--dim);background:var(--card2);padding:3px 8px;border-radius:6px;margin-top:10px}
+.retry-badge .dot{width:6px;height:6px;border-radius:50%;background:var(--amber)}
+
+/* ============ DEVICES GRID ============ */
+h2{font-size:12px;letter-spacing:.16em;color:var(--dim);margin:0 0 10px 2px}
+.tiles{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}
+.tile{position:relative;background:var(--card);border:1px solid var(--line);
+  border-radius:14px;padding:16px;box-shadow:var(--shadow-sm);
+  transition:border-color .25s,box-shadow .25s}
+.tile.active{border-color:var(--blue);box-shadow:0 0 0 2px var(--glow-blue),var(--shadow)}
+.tk{font-size:10px;letter-spacing:.14em;color:var(--dim);margin-bottom:10px}
+.big{font-size:22px;font-weight:650}
+.big.mid{font-size:17px;line-height:1.3}
+.big.dim{color:var(--dim)}
+.sub{font-size:12px;color:var(--dim);margin-top:2px}
+.lampdot{width:44px;height:44px;border-radius:50%;background:var(--track);
+  margin-bottom:8px;transition:background .3s,box-shadow .3s}
+.lampdot.on{
+  background:radial-gradient(circle,#fff8e1 30%,#ffd54f 70%,#ffb300);
+  box-shadow:0 0 var(--glow,18px) rgba(255,213,79,.7);
+  animation:lampPulse 2s ease-in-out infinite}
+@keyframes lampPulse{
+  0%,100%{box-shadow:0 0 var(--glow,18px) rgba(255,213,79,.7)}
+  50%{box-shadow:0 0 calc(var(--glow,18px) * 1.5) rgba(255,213,79,.9)}}
+.lvl{height:6px;background:var(--track);border-radius:3px;overflow:hidden;margin-bottom:6px}
+.lvl i{display:block;height:100%;background:var(--amber);border-radius:3px;transition:width .3s}
+.lvltext{font-size:12px;color:var(--dim);font-weight:600}
+.lvltext.on{color:var(--amber)}
+/* thermostat */
+.thermo-big{font-size:28px;font-weight:700;font-variant-numeric:tabular-nums}
+/* timer — static SVG arc */
+.twrap{display:flex;align-items:center;gap:12px}
+.tarc{width:56px;height:56px;flex-shrink:0}
+.tarc svg{width:100%;height:100%;transform:rotate(-90deg)}
+.tarc .bg{fill:none;stroke:var(--track);stroke-width:5}
+.tarc .fg{fill:none;stroke:var(--blue);stroke-width:5;stroke-linecap:round;
+  transition:stroke-dashoffset .5s ease}
+.tval{font-size:18px;font-weight:650;font-variant-numeric:tabular-nums}
+.tsub2{font-size:11px;color:var(--dim)}
+/* music */
+#mtrack{text-align:center}
+#t-music .mbtns{justify-content:center}
+.mbtns{display:flex;gap:6px;margin-top:10px}
+.mbtn{width:32px;height:32px;border-radius:8px;border:1px solid var(--line);
+  background:var(--card2);color:var(--tx);font-size:13px;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;transition:background .2s,border-color .2s}
+.mbtn:hover{border-color:var(--blue);background:var(--glow-blue)}
+.mbtn.play{background:var(--blue);color:#fff;border-color:var(--blue)}
+/* music — progress bar + equalizer (2026-10-02) */
+.mprog{height:6px;background:var(--track);border-radius:3px;overflow:hidden;margin-top:12px}
+.mprog i{display:block;height:100%;width:0;background:var(--blue);border-radius:3px;
+  transition:width .5s linear}
+.mtime{font-size:11px;color:var(--dim);text-align:center;margin-top:5px;
+  font-variant-numeric:tabular-nums;min-height:14px}
+.meq{display:flex;align-items:flex-end;justify-content:center;gap:3px;height:18px;margin-top:10px}
+.meq i{width:3px;height:100%;background:var(--blue);border-radius:2px;
+  transform-origin:bottom;transform:scaleY(.22);opacity:.45;
+  transition:transform .3s,opacity .3s}
+#t-music.playing .meq i{opacity:1;animation:eqB .9s ease-in-out infinite}
+#t-music.playing .meq i:nth-child(1){animation-duration:.85s;animation-delay:-.20s}
+#t-music.playing .meq i:nth-child(2){animation-duration:1.15s;animation-delay:-.55s}
+#t-music.playing .meq i:nth-child(3){animation-duration:.70s;animation-delay:-.10s}
+#t-music.playing .meq i:nth-child(4){animation-duration:1.25s;animation-delay:-.45s}
+#t-music.playing .meq i:nth-child(5){animation-duration:.95s;animation-delay:-.30s}
+@keyframes eqB{0%,100%{transform:scaleY(.22)}50%{transform:scaleY(1)}}
+/* chips (alarms, notes) */
+.chiprow{display:flex;flex-wrap:wrap;gap:6px}
+.chip{font-size:12px;padding:4px 10px;border-radius:8px;background:var(--card2);
+  border:1px solid var(--line);font-weight:600}
+.chip.faded{color:var(--dim);opacity:.5}
+
+/* ============ MOCK CONTROL STRIP ============ */
+.mockbar{margin-top:20px;padding:14px 16px;background:var(--card);
+  border:1px dashed var(--line);border-radius:12px}
+.mockbar .mk{font-size:10px;letter-spacing:.14em;color:var(--dim);margin-bottom:8px}
+.mockbtns{display:flex;flex-wrap:wrap;gap:6px}
+.mockbtn{padding:6px 12px;border-radius:8px;font-size:12px;font-weight:600;
+  border:1px solid var(--line);background:var(--card2);color:var(--tx);cursor:pointer;
+  transition:border-color .2s,background .2s}
+.mockbtn:hover{border-color:var(--blue);background:var(--glow-blue)}
+.mockbtn.active{border-color:var(--blue);background:var(--glow-blue);color:var(--blue)}
+/* ============ BOOTS LIVE CONVERSATION ============ */
+.me3card{margin-bottom:16px;border-radius:14px;background:var(--card);
+  border:1px solid var(--line);box-shadow:var(--shadow-sm);overflow:hidden}
+.me3card .top{display:flex;align-items:center;gap:10px;padding:10px 14px;
+  border-bottom:1px solid var(--line)}
+.me3dot{width:10px;height:10px;border-radius:50%;background:var(--dim);
+  transition:background .25s,box-shadow .25s}
+.me3dot.on{background:var(--green);box-shadow:0 0 10px var(--green)}
+.me3dot.listen{background:var(--blue);box-shadow:0 0 10px var(--blue);
+  animation:me3pulse 1.1s ease-in-out infinite}
+.me3dot.think{background:var(--amber);box-shadow:0 0 10px var(--amber);
+  animation:me3pulse .7s ease-in-out infinite}
+.me3dot.speak{background:var(--blue);box-shadow:0 0 10px var(--blue);
+  animation:me3pulse .5s ease-in-out infinite}
+@keyframes me3pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.me3micval{display:flex;align-items:center;gap:8px;width:100%}
+#me3micon{transition:stroke .12s}
+#me3micon.on{stroke:var(--green)}
+.me3meter{flex:1;height:8px;border-radius:5px;background:rgba(255,255,255,.08);overflow:hidden}
+.me3meterfill{display:block;height:100%;width:0%;border-radius:5px;
+  background:linear-gradient(90deg,var(--green),var(--amber) 70%,#ff6b6b);transition:width .08s linear}
+.me3phase{font-size:12px;font-weight:700;letter-spacing:.14em;color:var(--dim)}
+.me3phase.on{color:var(--green)}.me3phase.listen{color:var(--blue)}
+.me3phase.think{color:var(--amber)}.me3phase.speak{color:var(--blue)}
+.me3body{padding:10px 14px;display:flex;flex-direction:column;gap:8px}
+.me3row{display:flex;gap:8px;font-size:13.5px;line-height:1.45;align-items:flex-start}
+.me3row .tag{flex:0 0 78px;font-size:10px;font-weight:700;letter-spacing:.12em;
+  color:var(--dim);padding-top:2px;text-transform:uppercase}
+.me3row .val{flex:1;min-height:1em;color:var(--tx)}
+.me3row .val.heard{color:var(--green)}
+.me3row .val.think{color:var(--amber)}
+.me3row .val.say{color:var(--blue);font-weight:500}
+.me3row .val.tool{color:var(--dim);font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12.5px}
+.me3row .val.empty{color:var(--dim);opacity:.5;font-style:italic}
+</style>
+</head>
+<body>
+<main>
+<header>
+  <div class="lamp" id="lamp"></div>
+  <span class="brand">BOOTS</span>
+  <span class="mode" id="mode">IDLE</span>
+  <div class="hright">
+    <div class="hw">
+      <span class="wicon" id="wicon">⛅</span>
+      <span class="wtemp" id="wtemp">23°</span>
+      <span class="wcond" id="wcond">Partly cloudy</span>
+    </div>
+    <span class="hclock" id="wtime-clock">--:--</span>
+    <button class="toggle" id="theme" title="toggle theme">◐</button>
+  </div>
+</header>
+
+<div class="me3card" id="me3card">
+  <div class="top">
+    <div class="me3dot" id="me3dot"></div>
+    <span class="me3phase" id="me3phase">BOOTS · IDLE</span>
+  </div>
+  <div class="me3body">
+    <div class="me3row"><span class="tag">Heard</span>
+      <span class="val heard empty" id="me3heard">—</span></div>
+    <div class="me3row"><span class="tag">Thinking</span>
+      <span class="val think empty" id="me3think">—</span></div>
+    <div class="me3row"><span class="tag">Response</span>
+      <span class="val say empty" id="me3say">—</span></div>
+    <div class="me3row"><span class="tag">Mic</span>
+      <span class="val me3micval" id="me3micval">
+        <svg id="me3micon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="var(--dim)" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex:0 0 auto">
+          <path d="M12 2a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/>
+          <path d="M19 11a7 7 0 0 1-14 0"/><line x1="12" y1="18" x2="12" y2="22"/>
+        </svg>
+        <span class="me3meter" id="me3meter"><span class="me3meterfill" id="me3meterfill"></span></span>
+      </span></div>
+  </div>
+</div>
+
+<div class="bigcard" id="bigcard">
+  <div class="inner">
+    <div class="k">LAST COMMAND</div>
+    <div id="last"><div class="empty">waiting — say "Hey boots", then speak
+      your command<span class="hint">the big card glows around its edges while Boots is listening</span></div></div>
+  </div>
+</div>
+
+<h2>DEVICES</h2>
+<div class="tiles">
+  <div class="tile" id="t-lamp"><div class="tk">LIGHTS</div>
+    <div class="lampdot" id="lampdot"></div>
+    <div class="lvl"><i id="lvlbar" style="width:0%"></i></div>
+    <div class="lvltext" id="lvltext">OFF</div></div>
+  <div class="tile" id="t-thermo"><div class="tk">THERMOSTAT</div>
+    <div class="thermo-big" id="tcur">21.5°</div>
+    <div class="sub" id="tmode">set point</div></div>
+  <div class="tile" id="t-timer"><div class="tk">TIMER</div>
+    <div class="twrap">
+      <div class="tarc"><svg viewBox="0 0 56 56">
+        <circle class="bg" cx="28" cy="28" r="23"/>
+        <circle class="fg" id="tarc-fg" cx="28" cy="28" r="23"
+          stroke-dasharray="144.5" stroke-dashoffset="0"/>
+      </svg></div>
+      <div><div class="tval" id="ttext">—</div><div class="tsub2" id="tsub"></div></div>
+    </div></div>
+  <div class="tile" id="t-alarm"><div class="tk">ALARMS</div>
+    <div class="chiprow" id="alarms"><span class="chip faded">none</span></div></div>
+  <div class="tile" id="t-music"><div class="tk">MUSIC</div>
+    <div class="big mid dim" id="mtrack">nothing playing</div>
+    <div class="meq"><i></i><i></i><i></i><i></i><i></i></div>
+    <div class="mprog"><i id="mprog-fill"></i></div>
+    <div class="mtime" id="mtime"></div>
+    <div class="mbtns">
+      <button class="mbtn" id="mprev" title="previous">⏮</button>
+      <button class="mbtn" id="mpb" title="play/pause">▶</button>
+      <button class="mbtn" id="mnext" title="next">⏭</button>
+    </div></div>
+  <div class="tile" id="t-notes"><div class="tk">NOTES</div>
+    <div class="chiprow" id="notes"><span class="chip faded">—</span></div></div>
+</div>
+
+</main>
+
+<script>
+// ---- helpers ----
+const $=id=>document.getElementById(id);
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const cap=s=>s.charAt(0).toUpperCase()+s.slice(1);
+const fmtT=sec=>{sec=Math.max(0,Math.floor(sec||0));
+  const m=Math.floor(sec/60),s2=sec%60;
+  return m+':'+String(s2).padStart(2,'0');};
+function setTimerArc(frac){
+  const C=144.5;
+  $('tarc-fg').style.strokeDashoffset=C*(1-frac);
+}
+
+// ---- tile map: command → tile id ----
+const TILES={
+  control_lights:'t-lamp',dim_lights:'t-lamp',
+  set_temperature:'t-thermo',
+  set_timer:'t-timer',
+  set_alarm:'t-alarm',
+  play_music:'t-music',media_control:'t-music',
+  set_reminder:'t-notes',make_call:'t-notes'
+};
+
+// ---- clock ----
+function tick(){
+  const d=new Date();
+  $('wtime-clock').textContent=d.toLocaleTimeString([],{hour:'2-digit',minute:'2-digit'});
+}
+tick();setInterval(tick,1000);
+
+// ---- theme ----
+const saved=localStorage.getItem('me2-theme');
+if(saved)document.documentElement.dataset.theme=saved;
+$('theme').onclick=()=>{
+  const t=document.documentElement.dataset.theme==='light'?'dark':'light';
+  document.documentElement.dataset.theme=t;
+  localStorage.setItem('me2-theme',t);
+};
+
+// music transport buttons are inert in prod — voice drives the deck
+// (play_music / media_control fires update s.music from the server)
+
+// ---- DEMO STATES (including clarify / reject / slot-fill) ----
+const DEMO=[
+  {label:'Idle',state:{mode:'idle',last:null,lamp:{on:false,level:0},thermo:21.5,
+    music:{track:'nothing playing',playing:false}}},
+  {label:'Listening',state:{mode:'awake',last:null,lamp:{on:false,level:0},thermo:21.5,
+    music:{track:'nothing playing',playing:false}}},
+  {label:'Play music',state:{mode:'done',last:{cmd:'play_music',slot:'midnight city'},
+    lamp:{on:false,level:0},thermo:21.5,
+    music:{track:'Midnight City — M83',playing:true,elapsed:84,duration:243,fraction:0.35}}},
+  {label:'Dim lights',state:{mode:'done',last:{cmd:'dim_lights',slot:{old:80,new:40}},
+    lamp:{on:true,level:40},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Brighten lights',state:{mode:'done',last:{cmd:'dim_lights',slot:{old:40,new:80}},
+    lamp:{on:true,level:80},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Set timer',state:{mode:'done',last:{cmd:'set_timer',slot:'5:00'},
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Set alarm',state:{mode:'done',last:{cmd:'set_alarm',slot:'7:00 AM'},
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Thermostat',state:{mode:'done',last:{cmd:'set_temperature',slot:'22°'},
+    lamp:{on:false,level:0},thermo:22,music:{track:'nothing playing',playing:false}}},
+  {label:'Question',state:{mode:'done',last:{cmd:'ask_question',slot:'what is the capital of france'},
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Make call',state:{mode:'done',last:{cmd:'make_call',slot:'mom'},
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  // --- CLARIFY (middle confidence) ---
+  {label:'Clarify (mid)',state:{mode:'clarify',last:null,
+    candidates:[
+      {cmd:'set_timer',conf:0.44,label:'Set timer'},
+      {cmd:'set_alarm',conf:0.31,label:'Set alarm'},
+      {cmd:'set_reminder',conf:0.15,label:'Set reminder'}
+    ],
+    retries:1,
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  // --- REJECT (low confidence) ---
+  {label:'Reject (low)',state:{mode:'reject',last:null,retries:1,
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  // --- SLOT-FILL (command confident, slot missing) ---
+  {label:'Slot fill (timer)',state:{mode:'slotfill',
+    last:{cmd:'set_timer',slot:null,missing:'duration'},
+    slotPrompt:'for how long?',
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Slot fill (alarm)',state:{mode:'slotfill',
+    last:{cmd:'set_alarm',slot:null,missing:'time'},
+    slotPrompt:'at what time?',
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  // --- SLOT-CHECK (command confident, slot predicted but low margin) ---
+  {label:'Slot check (alarm)',state:{mode:'slotcheck',
+    last:{cmd:'set_alarm',slot:'8:00 AM',slotAlt:'10:00 AM',slotConf:0.31,slotAltConf:0.28,margin:0.03},
+    slotPrompt:'did you mean.',
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+  {label:'Slot check (call)',state:{mode:'slotcheck',
+    last:{cmd:'make_call',slot:'mom',slotAlt:'dad',slotConf:0.42,slotAltConf:0.39,margin:0.03},
+    slotPrompt:'did you mean.',
+    lamp:{on:false,level:0},thermo:21.5,music:{track:'nothing playing',playing:false}}},
+];
+
+// ---- render ----
+function render(s){
+  const bc=$('bigcard');
+  const last=s.last;
+  const mode=s.mode;
+
+  // Boots live conversation panel (driven by the voice agent's /me3 state)
+  try{
+    const m3=s.me3||{};
+    const ph=m3.phase||'idle';
+    const dot=$('me3dot'), pe=$('me3phase');
+    dot.className='me3dot'; pe.className='me3phase';
+    const PHASE_LABEL={idle:'BOOTS · LISTENING',starting:'BOOTS · READY',listening:'BOOTS · LISTENING',
+      transcribing:'BOOTS · LISTENING',thinking:'BOOTS · THINKING',
+      tool:'BOOTS · RUNNING TOOL',speaking:'BOOTS · SPEAKING'};
+    pe.textContent=PHASE_LABEL[ph]||('BOOTS · '+ph.toUpperCase());
+    if(ph==='idle'||ph==='starting'){dot.classList.add('listen');pe.classList.add('listen')}
+    else if(ph==='listening'||ph==='transcribing'){dot.classList.add('listen');pe.classList.add('listen')}
+    else if(ph==='thinking'){dot.classList.add('think');pe.classList.add('think')}
+    else if(ph==='tool'){dot.classList.add('think');pe.classList.add('think')}
+    else if(ph==='speaking'){dot.classList.add('speak');pe.classList.add('speak')}
+    if(m3.active){dot.classList.add('on')}
+    const heard=(m3.heard||'').trim(), think=(m3.thinking||'').trim(),
+      say=(m3.response||'').trim(), tool=(m3.tool||'').trim();
+    const setRow=(id,val,cls)=>{const e=$(id);
+      if(val){e.textContent=val;e.className='val '+cls+' on'}
+      else{e.textContent='\u2014';e.className='val '+cls+' empty'}};
+    setRow('me3heard',heard,'heard');
+    const thinkShow=(ph==='tool'&&tool)?('running: '+tool):think;
+    setRow('me3think',thinkShow, (ph==='tool'&&tool)?'tool':'think');
+    setRow('me3say',say,'say');
+    // liveness: alive if the agent pushed (hb/mic/state) within 5s
+    const alive=(m3.last_hb>0)&&((Date.now()/1000)-m3.last_hb<5);
+    const micFill=$('me3meterfill'), micIcon=$('me3micon');
+    const lvl=(typeof m3.mic_level==='number')?m3.mic_level:0;
+    if(micFill){micFill.style.width=(Math.round(lvl*100))+'%';}
+    if(micIcon){micIcon.classList.toggle('on',alive&&lvl>0.03);}
+    // phase label: OFF if agent is down, else the live phase
+    if(!alive){pe.textContent='BOOTS · OFF';dot.className='me3dot';pe.className='me3phase';}
+  }catch(e){}
+
+
+  // header lamp + mode
+  const lamp=$('lamp');
+  lamp.className='lamp';
+  const modeEl=$('mode');
+  modeEl.className='mode';
+
+  if(mode==='awake'){lamp.classList.add('awake');modeEl.textContent='SPEAK NOW';modeEl.classList.add('awake')}
+  else if(mode==='clarify'){lamp.classList.add('clarify');modeEl.textContent='CLARIFY';modeEl.classList.add('clarify')}
+  else if(mode==='reject'){lamp.classList.add('reject');modeEl.textContent='RETRY';modeEl.classList.add('reject')}
+  else if(mode==='slotfill'){lamp.classList.add('clarify');modeEl.textContent='NEED DETAIL';modeEl.classList.add('slotfill')}
+  else if(mode==='slotcheck'){lamp.classList.add('clarify');modeEl.textContent='SLOT CHECK';modeEl.classList.add('slotcheck')}
+  else if(mode==='done'){modeEl.textContent='DONE'}
+  else{modeEl.textContent='IDLE'}
+
+  // big card: edge glow for listening states (awake, clarify, reject, slotfill)
+  bc.classList.toggle('listening',mode==='awake'||mode==='clarify'||mode==='reject'||mode==='slotfill'||mode==='slotcheck');
+  bc.classList.toggle('amber-glow',mode==='clarify'||mode==='slotfill'||mode==='reject'||mode==='slotcheck');
+
+  // big card content
+  const lastEl=$('last');
+  if(mode==='idle'){
+    lastEl.innerHTML='<div class="empty">waiting — say "Hey boots", then speak\n      your command<span class="hint">the big card glows around its edges while Boots is listening</span></div>';
+  }else if(mode==='awake'){
+    lastEl.innerHTML='<div class="cmd" style="color:var(--green)">Listening…</div><div class="slot none">speak now</div>';
+  }else if(mode==='clarify'){
+    // candidates as tappable chips
+    const cands=s.candidates||[];
+    let chips=cands.map(c=>
+      `<div class="cand" data-cmd="${c.cmd}">${esc(c.label)}<span class="cand-conf">${Math.round(c.conf*100)}%</span></div>`
+    ).join('');
+    const retryBadge=s.retries?`<div class="retry-badge"><span class="dot"></span>attempt ${s.retries}/2</div>`:'';
+    lastEl.innerHTML=`<div class="clarify-msg">Didn't quite catch that</div>
+      <div class="clarify-sub">Did you mean one of these?</div>
+      <div class="cand-row">${chips}</div>
+      ${retryBadge}`;
+    // MOCKUP-ONLY: prod chip tap POSTs the choice to the Pi
+    lastEl.querySelectorAll('.cand').forEach(el=>{
+      el.onclick=()=>{
+        const cmd=el.dataset.cmd;
+        const d=DEMO.find(x=>x.state.last&&x.state.last.cmd===cmd);
+        if(d)showState(d);
+      };
+    });
+  }else if(mode==='reject'){
+    const retryBadge=s.retries?`<div class="retry-badge"><span class="dot"></span>attempt ${s.retries}/2</div>`:'';
+    lastEl.innerHTML=`<div class="reject-msg">Didn't catch that</div>
+      <div class="reject-sub">Please speak again.</div>
+      ${retryBadge}`;
+  }else if(mode==='slotfill'){
+    const cmdLabel=last?cap(last.cmd.replace(/_/g,' ')):'';
+    lastEl.innerHTML=`<div class="slotfill-msg">Got it — ${esc(cmdLabel)}</div>
+      <div class="slotfill-prompt">${esc(s.slotPrompt||'…')}</div>`;
+  }else if(mode==='slotcheck'&&last){
+    const cmdLabel=cap(last.cmd.replace(/_/g,' '));
+    const slotVal=esc(last.slot||'');
+    const slotAlt=esc(last.slotAlt||'');
+    const confPct=Math.round((last.slotConf||0)*100);
+    const altPct=Math.round((last.slotAltConf||0)*100);
+    lastEl.innerHTML=`<div class="slotcheck-msg">${esc(cmdLabel)} for ${slotVal}</div>
+      <div class="slotcheck-prompt">${esc(s.slotPrompt||'did you mean')}</div>
+      <div class="cand-row">
+        <div class="cand" data-choice="heard">${slotVal}<span class="cand-conf">${confPct}%</span></div>
+        <div class="cand" data-choice="alt">${slotAlt}<span class="cand-conf">${altPct}%</span></div>
+      </div>
+      <div class="slotcheck-hint">or say it again</div>`;
+    // MOCKUP-ONLY: prod chip tap POSTs the choice to the Pi
+    lastEl.querySelectorAll('.cand').forEach(el=>{
+      el.onclick=()=>{
+        const choice=el.dataset.choice;
+        if(choice==='alt'){
+          const tmp=last.slot;
+          last.slot=last.slotAlt;
+          last.slotAlt=tmp;
+        }
+        s.mode='done';
+        render(s);
+      };
+    });
+  }else if(mode==='done'&&last){
+    const c=last.cmd;
+    const ICONS={play_music:['🎵','music'],dim_lights:['💡','lights'],set_timer:['⏳','timer'],
+      set_alarm:['⏰','alarm'],set_temperature:['❄️','thermo'],ask_question:['❓','ask'],
+      make_call:['📞','call']};
+    const [icon,icoKey]=ICONS[c]||['⚙',''];
+    const isAsk=c==='ask_question';
+    const isDim=c==='dim_lights'&&last.slot&&typeof last.slot==='object';
+    const verb=isDim?(last.slot.new>last.slot.old?'Brighten lights':'Dim lights')
+      :cap(c.replace(/_/g,' '));
+    let slotHtml='';
+    if(isAsk){
+      slotHtml=`<div class="slot q"><span class="qtag">YOU ASKED</span>${esc(last.slot||'')}</div>`;
+    }else if(isDim){
+      slotHtml=`<div class="slot dim"><span class="old">${last.slot.old}%</span><span class="arr">→</span><span class="new">${last.slot.new}%</span></div>`;
+    }else if(last.slot){
+      const lowConf=last.slotMargin!==undefined&&last.slotMargin<0.15;
+      slotHtml=`<div class="slot${lowConf?' lowconf':''}">${esc(last.slot)}</div>`;
+    }else{
+      slotHtml='<div class="slot none">—</div>';
+    }
+    const conf=last.conf!==undefined?last.conf:0.97;
+    const lat=last.latency!==undefined?last.latency:128;
+    lastEl.innerHTML=`<div class="cmd"><span class="cmd-ic"${icoKey?` data-ico="${icoKey}"`:''}>${icon}</span>${esc(verb)}</div>${slotHtml}
+      <div class="meta"><span>conf ${conf.toFixed(2)}</span><span>${lat} ms</span></div>`;
+  }else{
+    lastEl.innerHTML='<div class="empty">—</div>';
+  }
+
+  // tiles: only the matching one glows
+  document.querySelectorAll('.tile').forEach(t=>t.classList.remove('active'));
+  if(s.last&&TILES[s.last.cmd])
+    document.getElementById(TILES[s.last.cmd]).classList.add('active');
+
+  // lights
+  const lamp2=s.lamp||{on:false,level:0};
+  const ld=$('lampdot');
+  ld.classList.toggle('on',lamp2.on);
+  ld.style.setProperty('--glow',lamp2.on?Math.round(8+lamp2.level*0.32)+'px':'0px');
+  $('lvlbar').style.width=lamp2.on?lamp2.level+'%':'0%';
+  const lt=$('lvltext');
+  lt.textContent=lamp2.on?('ON · '+lamp2.level+'%'):'OFF';
+  lt.classList.toggle('on',lamp2.on);
+
+  // thermostat
+  $('tcur').textContent=(s.thermo??21.5)+'°';
+
+  // timer — real device state in live mode (s.timer present);
+  // ?d= previews keep the mockup's static behaviour
+  if('timer' in s){
+    const T=s.timer;
+    if(T&&!T.done){
+      const r=Math.max(0,T.remaining|0);
+      $('ttext').textContent=Math.floor(r/60)+':'+String(r%60).padStart(2,'0');
+      $('tsub').textContent='counting down';
+      setTimerArc(T.frac_left||0);
+    }else if(T){
+      $('ttext').textContent='done';$('tsub').textContent='';setTimerArc(0);
+    }else{
+      $('ttext').textContent='—';$('tsub').textContent='';setTimerArc(0);
+    }
+  }else{
+    const timerActive=s.last&&s.last.cmd==='set_timer'&&s.mode==='done';
+    if(timerActive){
+      $('ttext').textContent=s.last.slot||'5:00';
+      $('tsub').textContent='counting down';
+      setTimerArc(1);
+    }else{
+      $('ttext').textContent='04:32';
+      $('tsub').textContent='';
+      setTimerArc(0.75);
+    }
+  }
+
+  // alarms — real list in live mode
+  if('alarms' in s){
+    const A=s.alarms||[];
+    $('alarms').innerHTML=A.length
+      ?A.map(a=>'<span class="chip">'+esc(a)+'</span>').join('')
+      :'<span class="chip faded">none</span>';
+  }else{
+    const alarmActive=s.last&&s.last.cmd==='set_alarm'&&s.mode==='done';
+    $('alarms').innerHTML=`<span class="chip${alarmActive?'':' faded'}">${alarmActive?esc(s.last.slot):'7:00 AM'}</span>`;
+  }
+
+  // music — track + equalizer + progress bar + elapsed/duration
+  const music=s.music||{track:'nothing playing',playing:false};
+  const mt=$('mtrack');
+  mt.textContent=music.track;
+  mt.classList.toggle('dim',!music.playing);
+  $('mpb').textContent=music.playing?'⏸':'▶';
+  $('mpb').classList.toggle('play',music.playing);
+  $('t-music').classList.toggle('playing',!!music.playing);
+  const frac=Math.max(0,Math.min(1,(music.fraction!=null?music.fraction:0)));
+  $('mprog-fill').style.width=(frac*100).toFixed(1)+'%';
+  $('mtime').textContent=(music.duration!=null)
+    ?fmtT(music.elapsed||0)+' / '+fmtT(music.duration)
+    :'';
+
+  // notes — real reminders + recent event chips in live mode
+  if('notes' in s){
+    const N=s.notes||[];
+    $('notes').innerHTML=N.length
+      ?N.map(n=>'<span class="chip">'+esc(n)+'</span>').join('')
+      :'<span class="chip faded">—'+'</span>';
+  }else{
+    const notesActive=s.last&&(s.last.cmd==='set_reminder'||s.last.cmd==='make_call')&&s.mode==='done';
+    $('notes').innerHTML=`<span class="chip${notesActive?'':' faded'}">${notesActive?esc(s.last.slot):'—'}</span>`;
+  }
+
+  // thermostat sub + weather — live mode (server fetch, fail-soft)
+  if(s.tmode)$('tmode').textContent=s.tmode;
+  if('weather' in s){
+    if(s.weather){
+      $('wicon').textContent=s.weather.icon||'—';
+      $('wtemp').textContent=Math.round(s.weather.temp)+'°';
+      $('wcond').textContent=s.weather.condition||'';
+    }else{
+      $('wicon').textContent='—';$('wtemp').textContent='—';$('wcond').textContent='';
+    }
+  }
+}
+
+// ?d=<idx> still previews DEMO states (handover §13); live mode is below
+function showState(d,idx){
+  document.querySelectorAll('.mockbtn').forEach((b,i)=>b.classList.toggle('active',i===idx));
+  render(d.state);
+}
+
+// ---- URL params for quick preview: ?d=<idx> &theme=light|dark ----
+const params=new URLSearchParams(location.search);
+if(params.get('theme')){
+  document.documentElement.dataset.theme=params.get('theme');
+  localStorage.setItem('me2-theme',params.get('theme'));
+}
+const di=parseInt(params.get('d'));
+if(!isNaN(di)&&DEMO[di])showState(DEMO[di],di);
+else if(location.protocol!=='file:'){
+  // LIVE mode — poll the Pi UI server (handover §7 data model, 1 Hz)
+  async function live(){
+    try{render(await (await fetch('/ui_state')).json());}catch(e){}
+  }
+  live();setInterval(live,1000);
+}else showState(DEMO[0],0);
+</script>
+</body>
+</html>

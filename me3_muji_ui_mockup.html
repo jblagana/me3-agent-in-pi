@@ -1,0 +1,451 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ME3 — muji-like UI (mockup v3)</title>
+<style>
+  :root{
+    --bg:#0b0e13; --bg2:#10141c; --card:#151a24; --card2:#1a2130;
+    --line:#232b3b; --text:#dce3ee; --dim:#8b96a8; --faint:#5a6478;
+    --green:#3ecf8e; --amber:#f5b04c; --blue:#5aa9ff; --purple:#b48cff;
+    --red:#ff6b6b; --cyan:#4cd7d0;
+    --mono:'Cascadia Code','JetBrains Mono',Consolas,monospace;
+  }
+  *{margin:0;padding:0;box-sizing:border-box}
+  body{background:var(--bg);color:var(--text);font:14px/1.55 'Segoe UI',system-ui,sans-serif;height:100vh;overflow:hidden}
+  /* chat thread = exactly half the screen; ME2 panel takes the other half */
+  .app{display:grid;grid-template-columns:50% 50%;height:100vh}
+
+  /* ============ LEFT: muji chat area (50vw) ============ */
+  .chat{display:flex;flex-direction:column;border-right:1px solid var(--line);min-width:0}
+  .chat-top{display:flex;align-items:center;gap:10px;padding:10px 18px;border-bottom:1px solid var(--line);background:var(--bg2)}
+  .chat-top .dot{width:9px;height:9px;border-radius:50%;background:var(--green);box-shadow:0 0 8px var(--green)}
+  .chat-top b{font-size:14px}
+  .chat-top .sub{color:var(--faint);font-size:12px}
+  .chat-top .right{margin-left:auto;display:flex;gap:8px;align-items:center}
+  .pill{font:11px var(--mono);color:var(--dim);border:1px solid var(--line);border-radius:20px;padding:3px 10px;background:var(--card)}
+  .pill.live{color:var(--green);border-color:rgba(62,207,142,.4)}
+
+  .steps{display:flex;gap:6px;padding:8px 18px;border-bottom:1px solid var(--line);background:var(--bg);flex-wrap:wrap}
+  .step{font:11px var(--mono);color:var(--faint);border:1px solid var(--line);border-radius:6px;padding:3px 9px;background:var(--card);display:flex;gap:6px;align-items:center}
+  .step .tick{width:7px;height:7px;border-radius:50%;background:var(--faint)}
+  .step.active{color:var(--amber);border-color:rgba(245,176,76,.5)} .step.active .tick{background:var(--amber);animation:blink 1s infinite}
+  .step.done{color:var(--green);border-color:rgba(62,207,142,.35)} .step.done .tick{background:var(--green)}
+
+  .msgs{flex:1;overflow-y:auto;padding:16px 18px;display:flex;flex-direction:column;gap:12px}
+  .m{max-width:92%;font-size:13.5px}
+  .m .who{font:10px var(--mono);letter-spacing:1px;color:var(--faint);margin-bottom:3px}
+  .m.user{align-self:flex-end;text-align:right}
+  .m.user .body{background:var(--card2);border:1px solid var(--line);border-radius:12px 12px 3px 12px;padding:8px 12px}
+  .m.agent{align-self:flex-start}
+  .m .body{border-radius:3px 12px 12px 12px;padding:9px 12px;border:1px solid var(--line);background:var(--card)}
+
+  /* heard = user bubble (first-mockup style): right-aligned, what the agent heard */
+  .heard{align-self:flex-end;max-width:92%}
+  .heard .tag{font:10px var(--mono);letter-spacing:1px;color:rgba(62,207,142,.7);display:block;margin-bottom:3px;text-align:right}
+  .heard .body{background:rgba(62,207,142,.08);border:1px solid rgba(62,207,142,.35);border-radius:12px 12px 3px 12px;padding:8px 12px;font-style:italic;color:var(--green);font-size:13.5px}
+  .thinking{align-self:flex-start;border-left:3px solid var(--amber);background:rgba(245,176,76,.06);border-radius:0 8px 8px 0;padding:7px 11px;font-size:12.5px;color:var(--dim);font-style:italic;max-width:92%}
+  .thinking .tag{font:10px var(--mono);font-style:normal;letter-spacing:1px;color:var(--amber);display:block;margin-bottom:3px}
+  .tool{align-self:flex-start;font:12px var(--mono);color:var(--purple);background:rgba(180,140,255,.07);border:1px solid rgba(180,140,255,.3);border-radius:8px;padding:6px 11px;display:flex;gap:8px;align-items:center;max-width:92%}
+  .tool .spin{width:10px;height:10px;border:2px solid rgba(180,140,255,.3);border-top-color:var(--purple);border-radius:50%;animation:rot .7s linear infinite;flex:none}
+  .tool.ok{color:var(--green);border-color:rgba(62,207,142,.35);background:rgba(62,207,142,.05)}
+  .tool.ok .spin{display:none}
+  .reply{position:relative}
+  .ttsbar{height:3px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
+  .ttsbar i{display:block;height:100%;background:var(--blue);width:0;transition:width .2s linear}
+  .ttsbar.cut i{background:var(--red)}
+  .barge{align-self:flex-start;font:11px var(--mono);color:var(--red);background:rgba(255,107,107,.08);border:1px solid rgba(255,107,107,.35);border-radius:8px;padding:5px 10px;max-width:92%}
+  .reply.cut .body{opacity:.55;text-decoration:line-through;text-decoration-color:rgba(255,107,107,.6)}
+  .tldr{align-self:flex-start;font:11px var(--mono);color:var(--faint);border-top:1px dashed var(--line);padding-top:6px;max-width:92%}
+  .chips{align-self:flex-start;display:flex;gap:6px;flex-wrap:wrap;max-width:92%}
+  .chips span{font:11px var(--mono);border-radius:14px;padding:3px 10px;border:1px solid var(--line);cursor:pointer}
+  .chips .act{color:var(--green);border-color:rgba(62,207,142,.4)}
+  .chips .plan{color:var(--amber);border-color:rgba(245,176,76,.4)}
+  .cursor::after{content:'▍';animation:blink 1s infinite;color:var(--green)}
+  @keyframes blink{50%{opacity:.2}}
+  @keyframes rot{to{transform:rotate(360deg)}}
+
+  .composer{display:flex;gap:10px;align-items:center;padding:12px 18px;border-top:1px solid var(--line);background:var(--bg2)}
+  .mic{width:40px;height:40px;border-radius:50%;border:2px solid var(--green);background:rgba(62,207,142,.1);color:var(--green);font-size:16px;cursor:pointer;flex:none;transition:all .2s}
+  .mic.think{border-color:var(--amber);background:rgba(245,176,76,.1);color:var(--amber);animation:blink 1s infinite}
+  .mic.talk{border-color:var(--blue);background:rgba(90,169,255,.1);color:var(--blue)}
+  .composer input{flex:1;background:var(--card);border:1px solid var(--line);border-radius:20px;padding:9px 14px;color:var(--text);font-size:13px;outline:none}
+  .composer .hint{font:10px var(--mono);color:var(--faint)}
+
+  /* ============ RIGHT: ME2 panel (50vw) ============ */
+  .panel{display:flex;flex-direction:column;overflow-y:auto;background:var(--bg)}
+  .panel h3{font:11px var(--mono);letter-spacing:1.5px;color:var(--faint);padding:12px 18px 6px}
+  .voice{display:flex;gap:16px;align-items:center;padding:14px 18px 12px;border-bottom:1px solid var(--line);margin-bottom:4px}
+  /* first-mockup ring: dark orb + conic glow sweep around the wrapper */
+  .ringwrap{position:relative;width:52px;height:52px;flex:none;border-radius:50%}
+  .ringwrap::before{content:"";position:absolute;inset:-3px;border-radius:50%;z-index:0;opacity:0;
+    filter:blur(7px);background:conic-gradient(from var(--a),
+    transparent 0deg,var(--green) 42deg,transparent 84deg,
+    transparent 180deg,var(--blue) 222deg,transparent 264deg);transition:opacity .3s}
+  .ringwrap.think::before{background:conic-gradient(from var(--a),
+    transparent 0deg,var(--amber) 42deg,transparent 84deg,
+    transparent 180deg,var(--blue) 222deg,transparent 264deg)}
+  .ringwrap.talk::before{background:conic-gradient(from var(--a),
+    transparent 0deg,var(--blue) 42deg,transparent 84deg,
+    transparent 180deg,var(--green) 222deg,transparent 264deg)}
+  .ringwrap.active{z-index:0}
+  .ringwrap.active::before{opacity:.95;animation:spin 2.4s linear infinite}
+  @keyframes spin{to{--a:360deg}}
+  @property --a{syntax:'<angle>';initial-value:0deg;inherits:false}
+  .ring{width:52px;height:52px;position:relative;z-index:1;border-radius:50%;
+    background:radial-gradient(circle at 35% 35%,var(--card2),#0b0e14 75%);
+    border:2px solid var(--line);display:flex;align-items:center;justify-content:center;font-size:20px}
+  .ringwrap.active .ring{border-color:var(--green)}
+  .ringwrap.think .ring{border-color:var(--amber)}
+  .ringwrap.talk .ring{border-color:var(--blue)}
+  .ring .eq{display:none;gap:2px;align-items:flex-end;height:18px}
+  .ringwrap.active .eq{display:flex}
+  .ring .eq i{width:3px;background:var(--green);border-radius:2px;animation:eq .7s ease-in-out infinite}
+  .ring .eq i:nth-child(2){animation-delay:.15s}.ring .eq i:nth-child(3){animation-delay:.3s}
+  .ring .eq i:nth-child(4){animation-delay:.45s}.ring .eq i:nth-child(5){animation-delay:.2s}
+  @keyframes eq{0%,100%{height:5px}50%{height:18px}}
+  .ringwrap.think .eq i{background:var(--amber)}
+  .ringwrap.talk .eq i{background:var(--blue)}
+  .vinfo{flex:1;min-width:0}
+  .vinfo .st{font:13px var(--mono);letter-spacing:1px}
+  .vinfo .sub{font:11px var(--mono);color:var(--faint);margin-top:3px}
+  .micbar{width:100%;height:5px;background:var(--line);border-radius:3px;margin-top:10px;overflow:hidden}
+  .micbar i{display:block;height:100%;background:var(--green);width:10%;transition:width .1s}
+
+  .lat{padding:0 18px 6px}
+  .lat .row{display:flex;justify-content:space-between;font:10px var(--mono);color:var(--dim);margin:2px 0;align-items:center}
+  .lat .row .v{color:var(--text)}
+  .lat .bar{height:3px;background:var(--line);border-radius:2px;overflow:hidden;margin:1px 0 3px}
+  .lat .bar i{display:block;height:100%;border-radius:2px;width:0;transition:width .5s}
+  .lat .total{border-top:1px dashed var(--line);margin-top:3px;padding-top:3px}
+  .lat .total .row .v{color:var(--cyan);font-size:12px}
+
+  /* ---- ME2 device cards: the 19 phrasebook classes as icon cards;
+         the fired card pulses and carries live state ---- */
+  /* device cards: similar commands merged into one card (MUSIC owns play/vol/next/pause/stop,
+     LIGHTS owns on/off/brightness/color, TIME owns time/timer/alarm, REMINDERS owns create/list) */
+  .devgrid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;padding:0 18px}
+  .dev{border:1px solid var(--line);border-radius:12px;padding:10px 11px 9px;background:var(--card);display:flex;flex-direction:column;gap:5px;transition:all .25s;min-height:74px}
+  .dev .hd{display:flex;align-items:center;gap:8px}
+  .dev .ic{font-size:20px;line-height:1;filter:grayscale(.35)}
+  .dev .nm{font:11px var(--mono);color:var(--dim);letter-spacing:.5px}
+  .dev .st{font:10.5px var(--mono);color:var(--faint);margin-top:auto}
+  .dev .sub{display:flex;flex-wrap:wrap;gap:4px;margin-top:1px}
+  .dev .sub i{font:9px var(--mono);font-style:normal;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:1px 5px;background:var(--card2);transition:all .2s}
+  .dev .sub i.on{color:var(--green);border-color:rgba(62,207,142,.5);background:rgba(62,207,142,.08)}
+  .dev .sub i.run{color:var(--purple);border-color:var(--purple);background:rgba(180,140,255,.12);animation:blink .8s infinite}
+  .dev.hit{border-color:rgba(62,207,142,.55);background:rgba(62,207,142,.07)}
+  .dev.hit .nm{color:var(--green)}
+  .dev.hit .st{color:var(--green)}
+  .dev.hit .ic{filter:none}
+  .dev.run{border-color:var(--purple);background:rgba(180,140,255,.1);animation:blink .8s infinite}
+  .dev.run .nm{color:var(--purple)}
+
+  .cmdlog{padding:2px 18px 10px;font:11px var(--mono);color:var(--dim);display:flex;flex-direction:column;gap:5px;max-height:120px;overflow-y:auto}
+  .cmdlog .c{display:flex;gap:7px;align-items:baseline}
+  .cmdlog .c .t{color:var(--faint);flex:none}
+  .cmdlog .c.run{color:var(--purple)}
+  .cmdlog .c.ok{color:var(--green)}
+  .cmdlog .c.err{color:var(--red)}
+
+  .pipe{margin-top:auto;display:flex;gap:8px;padding:12px 18px;border-top:1px solid var(--line);background:var(--bg2)}
+  .p{flex:1;display:flex;align-items:center;gap:7px;font:11px var(--mono);color:var(--dim);border:1px solid var(--line);border-radius:8px;padding:7px 10px;background:var(--card)}
+  .p .d{width:8px;height:8px;border-radius:50%;background:var(--faint);flex:none}
+  .p.ok .d{background:var(--green);box-shadow:0 0 6px var(--green)}
+  .p.warn .d{background:var(--amber);box-shadow:0 0 6px var(--amber)}
+  .p.err .d{background:var(--red)}
+
+  /* ---- mode pill + topbar buttons ---- */
+  .pill.demo{color:var(--amber);border-color:rgba(245,176,76,.5);background:rgba(245,176,76,.08);animation:blink 2s infinite}
+  .btn{font:11px var(--mono);color:var(--dim);border:1px solid var(--line);border-radius:20px;padding:3px 10px;background:var(--card);cursor:pointer;transition:all .2s}
+  .btn:hover{color:var(--text);border-color:var(--faint)}
+  /* ---- light theme (toggle) ---- */
+  html[data-theme="light"]{--bg:#f4f6fa;--bg2:#eef1f6;--card:#ffffff;--card2:#f0f3f8;--line:#dde3ec;--text:#1a2230;--dim:#5a6678;--faint:#9aa6b6}
+</style>
+</head>
+<body>
+<div class="app">
+
+  <!-- ============ LEFT: muji chat (50vw) ============ -->
+  <div class="chat">
+    <div class="chat-top">
+      <div class="dot"></div><b>me3</b><span class="sub">· Pi · full-duplex voice agent</span>
+      <div class="right">
+        <span class="pill demo" id="p-mode">demo</span>
+        <button class="btn" id="btn-replay" title="replay the scripted turn">↻ demo</button>
+        <button class="btn" id="btn-theme" title="toggle light / dark">◐</button>
+      </div>
+    </div>
+    <div class="steps">
+      <div class="step" data-s="1"><span class="tick"></span>listen</div>
+      <div class="step" data-s="2"><span class="tick"></span>ASR</div>
+      <div class="step" data-s="3"><span class="tick"></span>LLM</div>
+      <div class="step" data-s="4"><span class="tick"></span>tool</div>
+      <div class="step" data-s="5"><span class="tick"></span>TTS</div>
+    </div>
+    <div class="msgs" id="msgs"></div>
+    <div class="composer">
+      <button class="mic" id="mic">🎙</button>
+      <input placeholder="or type… (voice is primary)">
+      <span class="hint">full-duplex · barge-in on</span>
+    </div>
+  </div>
+
+  <!-- ============ RIGHT: ME2 panel (50vw) ============ -->
+  <div class="panel">
+    <h3>VOICE</h3>
+    <div class="voice">
+      <div class="ringwrap active" id="ringwrap"><div class="ring"><span class="eq"><i></i><i></i><i></i><i></i><i></i></span><span id="ringface" style="display:none">🎙</span></div></div>
+      <div class="vinfo">
+        <div class="st" id="vst">listening…</div>
+        <div class="sub" id="vsub">smart turn · barge-in armed</div>
+        <div class="micbar"><i id="miclv"></i></div>
+      </div>
+    </div>
+
+    <h3>LATENCY · LAST TURN</h3>
+    <div class="lat">
+      <div class="row"><span>VAD → ASR final</span><span class="v" id="l-asr">–</span></div><div class="bar"><i id="b-asr" style="background:var(--green)"></i></div>
+      <div class="row"><span>LLM first token</span><span class="v" id="l-llm">–</span></div><div class="bar"><i id="b-llm" style="background:var(--amber)"></i></div>
+      <div class="row"><span>tool exec</span><span class="v" id="l-tool">–</span></div><div class="bar"><i id="b-tool" style="background:var(--purple)"></i></div>
+      <div class="row"><span>TTS first audio</span><span class="v" id="l-tts">–</span></div><div class="bar"><i id="b-tts" style="background:var(--blue)"></i></div>
+      <div class="row total"><span>voice→reply total</span><span class="v" id="l-total">–</span></div>
+    </div>
+
+    <h3>ME2 · DEVICES <span style="opacity:.6">(V3 phrasebook · 19 commands · 8 cards)</span></h3>
+    <div class="devgrid">
+      <div class="dev" id="c-music">
+        <div class="hd"><span class="ic">🎵</span><span class="nm">MUSIC</span></div>
+        <div class="sub"><i id="p-play">play</i><i id="p-volup">vol +</i><i id="p-voldn">vol −</i><i id="p-next">next</i><i id="p-pause">pause</i><i id="p-stop">stop</i></div>
+        <span class="st" id="s-music">stopped</span>
+      </div>
+      <div class="dev hit" id="c-lights">
+        <div class="hd"><span class="ic">💡</span><span class="nm">LIGHTS</span></div>
+        <div class="sub"><i id="p-lon" class="on">on</i><i id="p-loff">off</i><i id="p-bright">dim</i><i id="p-color">color</i></div>
+        <span class="st" id="s-lights">on · 90%</span>
+      </div>
+      <div class="dev" id="c-climate">
+        <div class="hd"><span class="ic">🌡</span><span class="nm">CLIMATE</span></div>
+        <div class="sub"><i id="p-temp">temperature</i></div>
+        <span class="st" id="s-climate">24°C</span>
+      </div>
+      <div class="dev" id="c-weather">
+        <div class="hd"><span class="ic">⛅</span><span class="nm">WEATHER</span></div>
+        <div class="sub"><i id="p-weather">weather</i></div>
+        <span class="st" id="s-weather">–</span>
+      </div>
+      <div class="dev" id="c-time">
+        <div class="hd"><span class="ic">🕒</span><span class="nm">TIME</span></div>
+        <div class="sub"><i id="p-time">time</i><i id="p-timer">timer</i><i id="p-alarm">alarm</i></div>
+        <span class="st" id="s-time">–</span>
+      </div>
+      <div class="dev" id="c-call">
+        <div class="hd"><span class="ic">📞</span><span class="nm">CALL</span></div>
+        <div class="sub"><i id="p-call">call</i></div>
+        <span class="st" id="s-call">–</span>
+      </div>
+      <div class="dev" id="c-msg">
+        <div class="hd"><span class="ic">✉️</span><span class="nm">MESSAGE</span></div>
+        <div class="sub"><i id="p-msg">message</i></div>
+        <span class="st" id="s-msg">–</span>
+      </div>
+      <div class="dev" id="c-rem">
+        <div class="hd"><span class="ic">🗒</span><span class="nm">REMINDERS</span></div>
+        <div class="sub"><i id="p-rem">create</i><i id="p-remlist">list</i></div>
+        <span class="st" id="s-rem">–</span>
+      </div>
+    </div>
+
+    <h3>COMMANDS · LOG</h3>
+    <div class="cmdlog" id="cmdlog">
+      <div class="c ok"><span class="t">11:02:14</span><span>light_on → ok (90%)</span></div>
+    </div>
+
+    <div class="pipe">
+      <div class="p ok"><div class="d"></div>ASR</div>
+      <div class="p warn"><div class="d"></div>LLM</div>
+      <div class="p ok"><div class="d"></div>TTS</div>
+      <div class="p warn"><div class="d"></div>ME2</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const msgs=$('msgs');
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+function scroll(){msgs.scrollTop=msgs.scrollHeight}
+function step(n,mode){
+  document.querySelectorAll('.step').forEach(s=>{
+    const i=+s.dataset.s; s.classList.remove('done','active');
+    if(mode==='done'&&i<=n)s.classList.add('done');
+    if(mode==='active'&&i===n)s.classList.add('active');
+  });
+}
+function add(el){msgs.appendChild(el);scroll();return el}
+function heard(t){const d=document.createElement('div');d.className='heard';d.innerHTML=`<span class="tag">🎧 HEARD</span><div class="body"><span class="cursor"></span></div>`;add(d);
+  const s=d.querySelector('.body span');let i=0;
+  return new Promise(res=>{const iv=setInterval(()=>{s.textContent=t.slice(0,++i);scroll();if(i>=t.length){clearInterval(iv);s.classList.remove('cursor');res()}},28)})}
+function thinking(){const d=document.createElement('div');d.className='thinking';d.innerHTML=`<span class="tag">THINKING</span><span class="cursor"></span>`;add(d);return d.querySelector('span:last-child')}
+async function think(t){const s=thinking();let i=0;
+  for(;i<t.length;i+=3){s.textContent=t.slice(0,i);scroll();await sleep(14)}
+  s.textContent=t;s.classList.remove('cursor');scroll()}
+function tool(name,args){const d=document.createElement('div');d.className='tool';d.innerHTML=`<div class="spin"></div>${name}(${args})`;add(d);return d}
+function toolOk(d,result){d.classList.add('ok');d.innerHTML=`✓ ${d.textContent} → ${result}`}
+function reply(){const d=document.createElement('div');d.className='m agent reply';d.innerHTML=`<div class="who">ME3</div><div class="body"></div><div class="ttsbar"><i></i></div>`;add(d);return d}
+function barge(){const d=document.createElement('div');d.className='barge';d.textContent='⚡ barge-in — TTS ducked, listening';add(d)}
+/* p = sub-chip id (e.g. 'p-play'); the parent card lights up, the chip carries the action */
+function chipRun(p){const c=$(p).closest('.dev');c.classList.remove('hit');c.classList.add('run');$(p).classList.add('run')}
+function chipHit(p,state){const c=$(p).closest('.dev');c.classList.remove('run');c.classList.add('hit');
+  $(p).classList.remove('run');$(p).classList.add('on');
+  const st=c.querySelector('.st');if(state)st.textContent=state}
+function log(cmd,cls){const d=document.createElement('div');d.className='c '+cls;
+  d.innerHTML=`<span class="t">${new Date().toTimeString().slice(0,8)}</span><span>${cmd}</span>`;
+  $('cmdlog').prepend(d)}
+function setVoice(mode,st,sub){
+  const r=$('ringwrap');r.classList.remove('think','talk','active');
+  if(mode==='think')r.classList.add('think');else if(mode==='talk')r.classList.add('talk');else r.classList.add('active');
+  $('vst').textContent=st;$('vsub').textContent=sub;
+  const m=$('mic');m.classList.remove('think','talk');
+  if(mode==='think')m.classList.add('think');if(mode==='talk')m.classList.add('talk')}
+function micLevel(base,amp){let t=0;const iv=setInterval(()=>{t+=.15;$('miclv').style.width=(base+Math.sin(t*7)*amp+Math.random()*15)+'%'},80);return iv}
+function latency(asr,llm,toolMs,tts,total){
+  const max=2500;
+  [['asr',asr],['llm',llm],['tool',toolMs],['tts',tts]].forEach(([k,v])=>{
+    if(v==null)return;$('l-'+k).textContent=v+' ms';$('b-'+k).style.width=Math.min(100,v/max*100)+'%'});
+  $('l-total').textContent=total+' ms'}
+
+async function demo(){
+  // mic ambient
+  const amb=micLevel(15,10);
+
+  // ---- TURN 1: play lofi ----
+  setVoice('listen','listening…','smart turn · barge-in armed');step(1,'active');
+  await sleep(900);
+  step(1,'done');step(2,'active');
+  await heard('play lofi for me');
+  step(2,'done');step(3,'active');setVoice('think','thinking…','qwen3.8-27b · vllm');
+  await think('User wants lofi. Music domain → PLAY_MUSIC with query "lofi". Dispatching to ME2 UI backend :8330.');
+  step(3,'done');step(4,'active');
+  const t1=tool('boots_play_music','"lofi"');chipRun('p-play');log('boots_play_music("lofi")','run');
+  await sleep(700);toolOk(t1,'ok · queue: lofi');chipHit('p-play','lofi · playing');log('play_music → ok (lofi)','ok');
+  step(4,'done');step(5,'active');setVoice('talk','speaking…','piper · 1.7b');
+  const r1=reply();
+  const body1='Sure — lofi is on. Let me know if you want it louder.';
+  let i=0;const bar1=r1.querySelector('.ttsbar i');
+  const speak1=setInterval(()=>{i+=2;body1.textContent='';r1.querySelector('.body').textContent=body1.slice(0,i);bar1.style.width=(i/body1.length*100)+'%';scroll()},45);
+  await sleep(1400);
+
+  // ---- BARGE-IN mid-TTS ----
+  clearInterval(speak1);
+  r1.querySelector('.body').textContent=body1;
+  r1.classList.add('cut');r1.querySelector('.ttsbar').classList.add('cut');
+  bar1.style.background='var(--red)';
+  barge();log('barge-in · TTS ducked','err');
+  setVoice('listen','⚡ barge-in — listening','user interrupted mid-TTS');
+  step(1,'active');
+  await sleep(700);
+  step(1,'done');step(2,'active');
+  await heard('no, play opalite instead');
+  step(2,'done');step(3,'active');setVoice('think','thinking…','qwen3.8-27b · vllm');
+  await think('Correction: swap lofi → opalite. Same PLAY_MUSIC class, new query. Replacing the current track.');
+  step(3,'done');step(4,'active');
+  const t2=tool('boots_play_music','"opalite"');chipRun('p-play');log('boots_play_music("opalite")','run');
+  await sleep(700);toolOk(t2,'ok · replaced lofi');chipHit('p-play','opalite · playing');log('play_music → ok (opalite)','ok');
+  step(4,'done');step(5,'active');setVoice('talk','speaking…','piper · 1.7b');
+  const r2=reply();
+  const body2='Done — opalite is playing now.';
+  let j=0;const bar2=r2.querySelector('.ttsbar i');
+  const speak2=setInterval(()=>{j+=3;r2.querySelector('.body').textContent=body2.slice(0,j);bar2.style.width=(j/body2.length*100)+'%';scroll()},40);
+  await sleep(1100);clearInterval(speak2);bar2.style.width='100%';
+
+  // ---- turn close: benchmark readout (real latency lands via /ui_state in live mode) ----
+  step(5,'done');
+  latency(412,688,704,355,2159);
+  setVoice('listen','listening…','turn complete · barge-in armed');
+  clearInterval(amb);
+}
+
+/* ================= LIVE MODE (served by the Boots UI server) ================
+   Polls /ui_state at ~1 Hz and drives the same components the demo uses, but
+   from real data. ME2 stays OBSERVE-ONLY (cards light when the agent fires a
+   command; nothing here is clickable). On file:// this never runs.           */
+const PHASE_MAP = {
+  idle:{st:'idle',mode:'listen',sub:'waiting for speech'},
+  listening:{st:'listening…',mode:'listen',sub:'vad · barge-in armed'},
+  transcribing:{st:'transcribing',mode:'listen',sub:'asr · finalizing'},
+  thinking:{st:'thinking…',mode:'think',sub:'qwen3.8-27b · vllm'},
+  tool:{st:'running tool…',mode:'listen',sub:'me2-bridge'},
+  speaking:{st:'speaking…',mode:'talk',sub:'tts · streaming'},
+  starting:{st:'starting…',mode:'listen',sub:'booting pipeline'}
+};
+const TOOL_TO_CHIP = {
+  boots_play_music:'p-play', boots_pause_music:'p-pause', boots_resume_music:'p-play',
+  boots_stop_music:'p-stop', boots_next_song:'p-next', boots_set_volume:'p-volup',
+  boots_set_bright:'p-bright', boots_set_color:'p-color', boots_set_temp:'p-temp',
+  boots_set_timer:'p-timer', boots_set_alarm:'p-alarm', boots_get_time:'p-time',
+  boots_get_weather:'p-weather', boots_make_call:'p-call', boots_send_message:'p-msg',
+  boots_create_reminder:'p-rem', boots_list_reminders:'p-remlist'
+};
+let LIVE=false;
+let last={heard:'',thinking:'',response:'',phase:'idle',mic:0,tool:null};
+function setModePill(mode){const p=$('p-mode');if(!p)return;if(mode==='live'){p.className='pill live';p.textContent='live';}else{p.className='pill demo';p.textContent='demo';}}
+function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
+function liveHeard(text){if(!text||text===last.heard)return;const d=document.createElement('div');d.className='heard';d.innerHTML=`<span class="tag">🎧 HEARD</span><div class="body">${escapeHtml(text)}</div>`;add(d);last.heard=text;}
+let thinkEl=null;
+function liveThinking(text){if(!text){if(thinkEl)thinkEl.querySelector('span:last-child').classList.remove('cursor');return;}if(!thinkEl)thinkEl=thinking();const s=thinkEl.querySelector('span:last-child');s.textContent=text;s.classList.add('cursor');scroll();}
+function endThinking(){if(thinkEl){thinkEl.querySelector('span:last-child').classList.remove('cursor');thinkEl=null;}}
+let replyEl=null,replyShown='';
+function liveReply(text){if(!text)return;if(!replyEl)replyEl=reply();if(text!==replyShown){replyShown=text;replyEl.querySelector('.body').textContent=text;replyEl.querySelector('.ttsbar i').style.width='100%';scroll();}}
+function liveTool(name,args){if(!name)return;const t=tool(name,args?' ('+args+')':'');const chip=TOOL_TO_CHIP[name];if(chip&&$(chip))chipRun(chip);return t;}
+async function live(){
+  let s; try { s=await (await fetch('/ui_state')).json(); } catch(e){ return; }
+  LIVE=true; setModePill('live');
+  const m3=s.me3||{}; const ph=m3.phase||'idle'; const pm=PHASE_MAP[ph]||PHASE_MAP.idle;
+  setVoice(pm.mode, pm.st, pm.sub);
+  $('miclv').style.width=Math.round((m3.mic_level||0)*100)+'%';
+  // turn boundary: a new heard starts a fresh turn
+  if(m3.heard && m3.heard!==last.heard){ liveHeard(m3.heard); endThinking(); if(replyEl){replyShown='';replyEl=null;} }
+  if(ph==='thinking' && m3.response){ liveThinking(m3.response); } else if(ph!=='thinking'){ endThinking(); }
+  if(ph==='speaking' && m3.response){ liveReply(m3.response); }
+  if(m3.tool && m3.tool!==last.tool){ liveTool(m3.tool, m3.tool_args); }
+  last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null};
+  if(m3.latency){ const L=m3.latency;
+    if(L.asr!=null){$('l-asr').textContent=L.asr+' ms';$('b-asr').style.width=Math.min(100,L.asr/2500*100)+'%';}
+    if(L.llm!=null){$('l-llm').textContent=L.llm+' ms';$('b-llm').style.width=Math.min(100,L.llm/2500*100)+'%';}
+    if(L.tool!=null){$('l-tool').textContent=L.tool+' ms';$('b-tool').style.width=Math.min(100,L.tool/2500*100)+'%';}
+    if(L.tts!=null){$('l-tts').textContent=L.tts+' ms';$('b-tts').style.width=Math.min(100,L.tts/2500*100)+'%';}
+    if(L.total!=null){$('l-total').textContent=L.total+' ms';}
+  }
+  applyDevices(s);
+}
+function applyDevices(s){
+  const L=s.lamp||{}; const M=s.music||{};
+  if(s.music){ const c=$('c-music'); c.classList.toggle('hit', !!M.playing && !M.paused);
+    if(M.playing && !M.paused) chipRun('p-play');
+    $('s-music').textContent = M.paused? 'paused' : (M.playing? (M.track||'playing') : 'stopped'); }
+  if(s.lamp){ const c=$('c-lights'); c.classList.toggle('hit', !!L.on);
+    if(L.on){ const o=$('p-lon'); if(o)o.classList.add('on'); }
+    $('s-lights').textContent = L.on? ('on · '+Math.round((L.level||0)*100)+'%'+(L.color&&L.color!=='white'?' · '+L.color:'')) : 'off'; }
+  if(s.thermo!=null){ $('s-climate').textContent = Math.round(s.thermo)+'°C'+(s.tmode?(' · '+s.tmode):''); }
+  if(s.weather){ $('s-weather').textContent=(s.weather.icon||'')+' '+s.weather.temp+'° '+(s.weather.condition||''); $('c-weather').classList.add('hit'); }
+  if(s.timer){ $('s-time').textContent = s.timer.done? 'done' : (s.timer.remaining+'s left'); }
+  else { $('s-time').textContent = new Date().toTimeString().slice(0,5); }
+  if(s.speaking){ setVoice('talk','speaking…','tts · streaming'); }
+}
+function startLive(){ if(LIVE) return; live(); setInterval(live,1000); }
+function startDemo(){ setModePill('demo'); demo(); }
+function resetThread(){ msgs.innerHTML=''; last={heard:'',thinking:'',response:'',phase:'idle',mic:0,tool:null}; replyEl=null; replyShown=''; thinkEl=null; }
+$('btn-replay').onclick=function(){ resetThread(); if(LIVE){ startLive(); } else { startDemo(); } };
+$('btn-theme').onclick=function(){ const h=document.documentElement; h.setAttribute('data-theme', h.getAttribute('data-theme')==='light'?'':'light'); };
+// boot: live if served by the Boots UI server (http/https + /ui_state ok), else demo
+(function(){
+  const proto=location.protocol;
+  if(proto==='http:'||proto==='https:'){
+    fetch('/ui_state').then(r=>{ if(r.ok){ startLive(); } else { startDemo(); } }).catch(()=>startDemo());
+  } else { startDemo(); }   // file:// -> scripted demo
+})();
+</script>
+</body>
+</html>

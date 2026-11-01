@@ -1,0 +1,59 @@
+# me3/ — the CODE repo (cloned to the Pi at ~/me3). Holds only what RUNS on the Pi.
+# Records / mockups / design docs live in the PARENT ME3/ repo, NOT here.
+
+# manual snapshot backups (git is the backup now) + editor cruft
+*.pre_*
+*.bkm
+*.bak
+*.orig
+*.swp
+~*
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# models / weights
+*.onnx
+*.pt
+*.safetensors
+*.bin
+models/
+whisper.cpp/
+
+# runtime artifacts (never source)
+*.log
+*.err
+*.nohup
+*.pid
+*.lock
+.env
+*.db
+
+# audio (large, generated/test media)
+*.wav
+*.mp3
+*.flac
+*.ogg
+*.m4a
+*.aiff
+*.pcm
+
+# runtime content dirs (music + generated websites), keep the folders
+bootsui/music/*
+bootsui/sites/*
+!bootsui/music/.gitkeep
+!bootsui/sites/.gitkeep
+
+# OS / editor
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp

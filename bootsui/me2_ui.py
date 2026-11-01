@@ -1,0 +1,1576 @@
+﻿"""ME2 status page — the command UI for the Pi. Stdlib only (http.server).
+
+Serves the UI + the endpoints pi_demo.py POSTs to:
+  GET  /          the handover UI (me2_ui.html next to this file when
+                  present, else the built-in dashboard below)
+  GET  /debug     the built-in dashboard (history table)
+  GET  /state     full JSON (for the dashboard + debugging)
+  GET  /ui_state  the handover §7 data model (1 Hz poll for me2_ui.html)
+  POST /fire      one fired command (JSON from pi_demo)
+  POST /state     {"mode": "idle"|"awake"} heartbeat from pi_demo
+
+Usage (on the Pi, from the package dir):
+  python3 me2_ui.py --dir ~/me2 --port 8330
+  # laptop browser: http://me2pi.local:8330  (or http://192.168.137.9:8330)
+"""
+import argparse
+import json
+import os
+import random
+import re
+import sys
+import tempfile
+import threading
+import time
+from collections import deque
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+import subprocess
+
+LABELS = {
+    # V3 phrasebook (20 classes, src/commands.py) — single source of truth
+    "PLAY_MUSIC": "Play music", "VOLUME_UP": "Volume up",
+    "VOLUME_DOWN": "Volume down", "NEXT": "Next", "PAUSE": "Pause",
+    "STOP": "Stop",
+    "LIGHT_ON": "Lights on", "LIGHT_OFF": "Lights off",
+    "BRIGHTNESS": "Brightness", "COLOR": "Color",
+    "TEMPERATURE": "Temperature",
+    "WEATHER": "Weather", "TIME": "Time",
+    "TIMER": "Timer", "ALARM": "Alarm",
+    "CALL": "Call", "MESSAGE": "Message",
+    "CREATE_REMINDER": "Reminder", "LIST_REMINDERS": "Reminders",
+    "OUT_OF_SCOPE": "Out of scope",
+}
+
+STATE = {
+    "lock": threading.Lock(),
+    "mode": "idle",
+    "mode_ts": time.time(),
+    "last": None,
+    "history": deque(maxlen=30),
+    "total": 0,
+    "started": time.time(),
+    "vcm": None,
+    "wake": None,
+    "last_good": None,  # most recent non-gated fire (drives the done card)
+    "last_dim": None,   # {"old","new"} light level of the last dim_lights
+    "weather": None,    # {"icon","temp","condition","ts"} open-meteo cache
+    "weather_online": False,
+    # Live conversation state pushed by the ME3 voice agent (POST /me3).
+    # phase: idle|listening|transcribing|thinking|tool|speaking
+    "me3": {"phase": "listening", "heard": "", "thinking": "", "response": "",
+            "tool": "", "active": False, "mic": False, "mic_level": 0.0,
+            "last_hb": 0.0, "ts": 0.0},
+}
+
+_PAGE_HTML = None  # me2_ui.html bytes (the handover UI) or None
+_MUJI_HTML = None  # me3_muji_ui_mockup.html bytes (the ME3 observability dashboard)
+
+# ---------------------------------------------------------------- devices
+# The UI process owns the device state (ACTUATION.md: one process, zero
+# cloud). Every /fire is dispatched through the table below; the page
+# re-renders every second and CSS animates the deltas.
+
+SONGS = ["jetlag", "yellow", "finesse", "multo", "baby"]
+# V3 slot taxonomy (src/slots.py): 6 parametric intents x 3 locked values.
+V3_TIMER_SEC = {"10 seconds": 10, "30 seconds": 30, "1 minute": 60}
+V3_ALARM_MARK = {"6 AM": "06:00", "8 AM": "08:00", "9 PM": "21:00"}
+V3_DEG = {"18 degrees": 18, "22 degrees": 22, "26 degrees": 26}
+V3_PCT = {"20 percent": 20, "60 percent": 60, "100 percent": 100}
+V3_COLOR = {"red": "red", "blue": "blue", "green": "green"}
+
+
+def _timer_secs(slot: str) -> int:
+    """V3 TIMER slot -> seconds (10 / 30 / 60)."""
+    return V3_TIMER_SEC.get(slot, 0)
+
+
+def _alarm_mark(slot: str):
+    """V3 ALARM slot -> 'HH:MM' (6 AM / 8 AM / 9 PM)."""
+    return V3_ALARM_MARK.get(slot)
+
+
+def _temp_deg(slot: str):
+    """V3 TEMPERATURE slot -> degrees (18 / 22 / 26)."""
+    return V3_DEG.get(slot)
+
+
+def _bright_pct(slot: str):
+    """V3 BRIGHTNESS slot -> percent (20 / 60 / 100)."""
+    return V3_PCT.get(slot)
+
+
+def _lamp_color(slot: str):
+    """V3 COLOR slot -> lamp color name (red / blue / green)."""
+    return V3_COLOR.get(slot)
+
+
+def _timer_word(slot):
+    """V3 TIMER slot -> done-card display ('0:10' / '0:30' / '1 min')."""
+    s = V3_TIMER_SEC.get(slot, 0)
+    if not s:
+        return None
+    return f"0:{s:02d}" if s < 60 else f"{s // 60} min"
+
+
+def _alarm_word(slot):
+    """V3 ALARM slot -> done-card display ('6:00 AM' / '8:00 AM' / '9:00 PM')."""
+    m = V3_ALARM_MARK.get(slot)
+    if not m:
+        return None
+    h, mm = (int(x) for x in m.split(":"))
+    return f"{h % 12 or 12}:{mm} {'AM' if h < 12 else 'PM'}"
+
+
+def _temp_word(slot):
+    """V3 TEMPERATURE slot -> '22°' (done-card display)."""
+    d = V3_DEG.get(slot)
+    return f"{d}\u00b0" if d is not None else None
+
+
+def _bright_word(slot):
+    """V3 BRIGHTNESS slot -> '60%' (done-card display)."""
+    p = V3_PCT.get(slot)
+    return f"{p}%" if p is not None else None
+
+
+DEV = {
+    "lights": {"on": False, "level": 70, "color": "white"},
+    "timer": None,            # {"until": ts, "secs": n, "mins": n/60, "done": bool}
+    "alarms": [],
+    "temp": {"target": None, "current": 21.5},
+    "music": {"playing": False, "paused": False, "track": None, "vol": 60,
+              "user_paused": False},
+    "reminders": [],
+    "chips": deque(maxlen=6),  # (text, ts)
+    "speaking_until": 0.0,     # TTS self-trigger window (pi_demo guard)
+}
+_LAST_FIRE = {}  # (cmd, slot) -> ts, 0.5 s debounce (was 2 s; speaker has
+# auto echo cancellation — the scaling self-trigger guard is the real
+# double-fire protection, so a fast re-fire of the same command is safe)
+
+
+def add_chip(text: str):
+    DEV["chips"].appendleft((text, time.time()))
+
+
+# ---------------------------------------------------------------- music
+# Real playback (instruction 15, 2026-10-02): the 5 locked songs live in
+# <pkg>/music/<title>.wav (48 kHz mono s16 — the EMEET M1A only accepts
+# its native 48k output) and are streamed by a CHILD PROCESS,
+# me2_music_worker.py (one short-lived process per play segment).
+# Why a child: re-opening ALSA output streams while pi_demo.py holds the
+# M1A mic input intermittently ABORTS PortAudio at C level (assert in
+# PaAlsaStream_Initialize — uncatchable from Python); an in-process
+# player took the whole UI down with it (live-verified 2026-10-02).
+# The worker is expendable: on pause/switch it is SIGTERMed, and a
+# monitor thread maps its exit code to the tile state (0 = natural end,
+# anything else = fail-soft reset). No file / no worker deps / dead
+# device never break the page.
+# NOTE: apply_fire runs under STATE["lock"]; the critical sections here
+# stay short (spawn + wav-header read) and never touch STATE["lock"].
+
+MUSIC_DIR = None  # Path, set in main() from --dir
+import os as _os
+SITES_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "sites")
+_os.makedirs(SITES_DIR, exist_ok=True)
+_M = {"lock": threading.Lock(), "proc": None, "track": None, "sr": 48000,
+      "pos": 0, "t0": 0.0, "dur": 0}
+_DUCK = {"awake": False, "defer": False}
+# awake: True while the wake-duck holds music paused (ack + command window)
+# defer: True when idle arrived but TTS is still playing; the TTS monitor
+#        resumes the music once the reply finishes.
+
+
+def _music_init():
+    """Boot check: report the track count + aplay availability. No audio
+    is touched until the first play (the worker is spawned lazily)."""
+    n = sum(1 for s in SONGS
+            if MUSIC_DIR is not None and (MUSIC_DIR / f"{s}.wav").exists())
+    import shutil
+    aplay_ok = shutil.which("aplay") is not None
+    print(f"music: {n}/{len(SONGS)} tracks in {MUSIC_DIR}"
+          + ("" if aplay_ok else "  (aplay missing — playback off)"),
+          flush=True)
+    espeak = _ESPEAK[0] if isinstance(_ESPEAK, (list, tuple)) else _ESPEAK
+    print(f"speak: espeak-ng "
+          + ("ready" if shutil.which(espeak)
+             else "MISSING — apt install espeak-ng (chip-only answers)"),
+          flush=True)
+    _music_sync_vol_from_hw()
+    # Live sync: the M1A speaker has a physical volume knob — turning it
+    # moves the HW PCM level without touching the tile. A 1 Hz daemon
+    # resyncs the tile when the HW and tile disagree (covers both a
+    # manual knob turn AND a VOLUME fire that pushed the HW). The
+    # render loop writes rng.value from the tile every poll, so the
+    # slider follows automatically.
+    threading.Thread(target=_music_vol_sync_loop, daemon=True).start()
+
+
+def _music_vol_sync_loop() -> None:
+    """1 Hz daemon: resync the tile volume from the M1A HW when they
+    disagree. Fail-soft: on read error the tile keeps its value."""
+    while True:
+        time.sleep(1.0)
+        try:
+            if _music_vol_changed():
+                hw = _music_read_hw_vol()
+                if hw is not None:
+                    DEV["music"]["vol"] = hw
+        except Exception:
+            pass
+
+
+def _music_worker():
+    return Path(__file__).resolve().parent / "me2_music_worker.py"
+
+
+def _music_dev():
+    """Kept for interface compat — the ALSA worker ignores the device
+    index (it hardcodes plughw:CARD=M1A,DEV=0). Always returns None."""
+    return None
+
+
+def _music_meta(path: Path):
+    """(sample_rate, duration_seconds) from the wav header."""
+    import wave
+    with wave.open(str(path), "rb") as wf:
+        sr = wf.getframerate()
+        dur = wf.getnframes() / sr if sr else 0.0
+    return sr, dur
+
+
+def _music_kill():
+    """SIGTERM the running worker (caller holds _M["lock"])."""
+    p, _M["proc"] = _M["proc"], None
+    if p is not None:
+        try:
+            p.terminate()
+        except Exception:
+            pass
+
+
+def _music_spawn(track: str, pos: int):
+    """Spawn the worker for track from sample pos. Caller holds
+    _M["lock"]. Returns True if the process launched."""
+    import subprocess
+    path = MUSIC_DIR / f"{track}.wav"
+    dev = _music_dev()
+    argv = [sys.executable, str(_music_worker()), str(path), str(pos)]
+    if dev is not None:
+        argv.append(str(dev))
+    try:
+        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                stderr=subprocess.DEVNULL)
+    except Exception as e:
+        print(f"music: spawn failed ({track}): {e}", file=sys.stderr)
+        return False
+    _M["proc"] = proc
+    try:
+        _M["sr"], _M["dur"] = _music_meta(path)
+    except Exception:
+        _M["sr"], _M["dur"] = 48000, 0.0
+    _M["t0"] = time.monotonic()
+    return True
+
+
+def _music_monitor(track: str):
+    """Daemon thread: wait for a worker to exit and map it to tile
+    state. exit 0 = natural end; other = the worker died (fail-soft).
+    Never raises."""
+    p = _M["proc"]
+    if p is None:
+        return
+    p.wait()
+    rc = p.returncode
+    with _M["lock"]:
+        stale = (_M["proc"] is not p or _M["track"] != track
+                 or DEV["music"].get("paused"))
+        if not stale:
+            DEV["music"]["playing"] = False
+            DEV["music"]["paused"] = False
+    if stale:
+        return  # paused / replaced — state is owned by that command
+    if rc == 0:
+        add_chip(f"“{track}” finished")
+    else:
+        print(f"music: worker died (rc {rc}) — tile reset", file=sys.stderr)
+        add_chip(f"music: “{track}” stopped (player error)")
+
+
+def _music_play(track: str) -> bool:
+    """Start a track from the top (replacing anything playing). True if
+    the worker launched; state must not claim playing until it does."""
+    with _M["lock"]:
+        if MUSIC_DIR is None or not (MUSIC_DIR / f"{track}.wav").exists():
+            return False
+        _music_kill()
+        _M["track"] = track
+        _M["pos"] = 0
+        if not _music_spawn(track, 0):
+            _M["track"] = None
+            return False
+    threading.Thread(target=_music_monitor, args=(track,),
+                     daemon=True).start()
+    return True
+
+
+def _music_pause() -> bool:
+    """Kill the worker at the current wall-clock position; resume
+    relaunches it from that sample offset."""
+    with _M["lock"]:
+        if _M["proc"] is None or _M["track"] is None:
+            return False
+        _M["pos"] = _M["pos"] + int((time.monotonic() - _M["t0"])
+                                    * _M["sr"])
+        _music_kill()
+    DEV["music"]["paused"] = True
+    return True
+
+
+def _music_resume() -> bool:
+    """Relaunch the worker from the paused sample position."""
+    with _M["lock"]:
+        if _M["track"] is None or MUSIC_DIR is None:
+            return False
+        track = _M["track"]
+        pos = _M["pos"]
+        if not _music_spawn(track, pos):
+            DEV["music"]["paused"] = False
+            return False
+        DEV["music"]["paused"] = False
+    threading.Thread(target=_music_monitor, args=(track,),
+                     daemon=True).start()
+    return True
+
+
+
+def _music_sync_vol_from_hw() -> None:
+    """Read the M1A PCM hardware volume and set the tile to match.
+    Called at boot so the first play comes out at the speaker's actual
+    level, not a stale default. Fail-soft: on any error the tile keeps
+    its default (60)."""
+    try:
+        import re as _re
+        r = subprocess.run(
+            ["amixer", "-c", "M1A", "sget", "PCM"],
+            capture_output=True, text=True, timeout=3,
+        )
+        m = _re.search(r"Playback\s+(\d+)\s+\[(\d+)%\]", r.stdout)
+        if m:
+            hw_vol = int(m.group(2))
+            DEV["music"]["vol"] = hw_vol
+            print(f"music: tile vol synced to hw ({hw_vol}%)", flush=True)
+    except Exception:
+        pass  # amixer missing / M1A gone — keep default
+
+
+def _apply_alsa_volume(vol: int) -> None:
+    """Push the music volume to the M1A ALSA PCM control (0-100 %).
+    Called on every VOLUME_UP / VOLUME_DOWN / SET_VOLUME so the speaker
+    actually changes level, not just the tile readout. Fail-soft: if
+    amixer is missing or the M1A is wedged, the tile state still
+    updates."""
+    try:
+        subprocess.run(
+            ["amixer", "-c", "M1A", "set", "PCM", f"{vol}%"],
+            capture_output=True, timeout=3,
+        )
+    except Exception:
+        pass  # amixer missing / M1A gone — tile still reflects the value
+
+
+def _music_read_hw_vol() -> int | None:
+    """Read the M1A PCM hardware volume (0-100). None on any error
+    (amixer missing / M1A wedged)."""
+    try:
+        r = subprocess.run(
+            ["amixer", "-c", "M1A", "sget", "PCM"],
+            capture_output=True, text=True, timeout=3,
+        )
+        m = re.search(r"Playback\s+(\d+)\s+\[(\d+)%\]", r.stdout)
+        return int(m.group(2)) if m else None
+    except Exception:
+        return None
+
+
+def _music_vol_changed() -> bool:
+    """True if the tile volume and the M1A hardware volume disagree.
+    A manual speaker-knob turn (or a VOLUME fire) moves the HW; the tile
+    only follows if we resync. Fail-soft: on read error, no change."""
+    hw = _music_read_hw_vol()
+    return hw is not None and hw != DEV["music"]["vol"]
+
+# ---------------------------------------------------------------- speak
+# Spoken replies (instruction 16, 2026-10-02): the live v2e model merged
+# ask_time + ask_weather into ONE slot-less `ask_question` class, so
+# Boots can't tell which was asked — it answers BOTH (time + weather).
+# Synthesis runs espeak-ng (apt, offline, robotic but clear) as a CHILD
+# that writes a temp WAV; espeak's 22.05 kHz output is resampled to
+# 48 kHz (the M1A only accepts its native 48k — instruction 15) with a
+# local numpy import (guarded; the venv has it — the worker needs it);
+# playback reuses the crash-isolated me2_music_worker.py child (same
+# rationale as music: the ALSA/PortAudio abort can kill the child,
+# never the UI). Music ducks: pause -> speak -> resume. espeak-ng
+# missing = the chip still answers, voice skipped. piper (natural voice)
+# is the post-defense upgrade: it means an onnxruntime version risk in
+# the shared venv — not on defense eve.
+_ESPEAK = "espeak-ng"  # argv[0]; tests may set [sys.executable, stub.py]
+# TTS self-trigger window (from TTS start): the last wake window that can
+# contain the reply is ~reply (<=4.2 s) + 1 s (wake stride); a real wake
+# just before the reply captures <=3.5 s into it and fires ~3.6 s in —
+# 6.5 s covers both (live-verified 10-02: an 8 s window expired MID-CHAIN
+# and a fake media_control conf 0.995 got through).
+_SPEAK_GUARD_S = 6.5
+_TTS = {"lock": threading.Lock(), "proc": None}
+
+
+def _time_words(t) -> str:
+    """localtime -> 'seven forty two p m' (espeak text; no digits)."""
+    h = t.tm_hour % 12 or 12
+    hw = ["one", "two", "three", "four", "five", "six", "seven",
+          "eight", "nine", "ten", "eleven", "twelve"][h - 1]
+    ap = "a m" if t.tm_hour < 12 else "p m"
+    m = t.tm_min
+    if m == 0:
+        return f"{hw} o'clock {ap}"
+    _ones = ["", "one", "two", "three", "four", "five", "six",
+             "seven", "eight", "nine"]
+    _teens = ["ten", "eleven", "twelve", "thirteen", "fourteen",
+              "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"]
+    _tens = ["", "", "twenty", "thirty", "forty", "fifty"]
+    if m < 10:
+        mw = _ones[m]
+    elif m < 20:
+        mw = _teens[m - 10]
+    else:
+        mw = _tens[m // 10] + (" " + _ones[m % 10] if m % 10 else "")
+    return f"{hw} {mw} {ap}"
+
+
+def _int_words(n) -> str:
+    """0-99 int -> words (weather temp speak text; no digits)."""
+    n = int(round(n))
+    _ones = ["", "one", "two", "three", "four", "five", "six",
+             "seven", "eight", "nine", "ten", "eleven", "twelve",
+             "thirteen", "fourteen", "fifteen", "sixteen", "seventeen",
+             "eighteen", "nineteen"]
+    _tens = ["", "ten", "twenty", "thirty", "forty", "fifty",
+             "sixty", "seventy", "eighty", "ninety"]
+    if n < 20:
+        return _ones[n]
+    return _tens[n // 10] + (" " + _ones[n % 10] if n % 10 else "")
+
+
+def _time_reply():
+    """(chip text, speak text) for ask_time — time only, live local
+    (Pi TZ = Asia/Manila, NTP-synced)."""
+    t = time.localtime()
+    h = t.tm_hour % 12 or 12
+    ap = "AM" if t.tm_hour < 12 else "PM"
+    return (f"{h}:{t.tm_min:02d} {ap}", _time_words(t))
+
+
+def _weather_reply():
+    """(chip text, speak text) for ask_weather — weather only, live
+    open-meteo, spoken with the location name (ME2_LOCATION) so the
+    answer says WHERE the number is from."""
+    w = STATE.get("weather")
+    if w and w.get("temp") is not None and STATE.get("weather_online"):
+        cond = str(w.get("condition") or "all good").strip().capitalize()
+        return (f"{ME2_LOCATION}: {cond}, {w['temp']:.0f}°",
+                f"In {ME2_LOCATION}, {cond}, "
+                f"{_int_words(w['temp'])} degrees")
+    if w and w.get("temp") is not None:
+        # Offline but the last fetch is <=15 min old: the caller speaks
+        # apology + stale-lead clips, then this cached data as the tail.
+        cond = str(w.get("condition") or "all good").strip().capitalize()
+        return (f"{ME2_LOCATION}: {cond}, {w['temp']:.0f}° (15 min old)",
+                f"In {ME2_LOCATION}, {cond}, "
+                f"{_int_words(w['temp'])} degrees")
+    return ("Sorry, no internet connection.",
+            "Sorry, no internet connection.")
+
+
+def _ask_reply():
+    """(chip text, speak text) for the merged ask_question class (current
+    live model): answer BOTH time + weather. The new model ships separate
+    ask_time / ask_weather classes -> handled separately in apply_fire."""
+    chip_t, speak_t = _time_reply()
+    chip_w, speak_w = _weather_reply()
+    return (f"{chip_t}. {chip_w}.", f"{speak_t}. {speak_w}.")
+
+
+def _speak_resample48(path: str) -> str:
+    """espeak-ng outputs 22.05 kHz; the M1A only accepts 48 kHz.
+    Upsample with linear interp (upsample-only -> no aliasing) into a
+    sibling temp wav. Raises on any problem (caller fails soft)."""
+    import wave
+    import numpy as np
+    with wave.open(path, "rb") as wf:
+        sr = wf.getframerate()
+        arr = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16)
+    if sr == 48000 or len(arr) == 0:
+        return path
+    out_path = path + ".48k"
+    n = int(len(arr) * 48000.0 / sr)
+    x = np.linspace(0.0, len(arr) - 1, n)
+    out = np.interp(x, np.arange(len(arr)), arr).astype(np.int16)
+    with wave.open(out_path, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(48000)
+        wf.writeframes(out.tobytes())
+    return out_path
+
+
+EDGE_VOICE = "en-US-RogerNeural"  # cloud TTS (edge-tts, 2026-10-03)
+EDGE_TIMEOUT_S = 12
+
+
+def _speak_synth_edge(text: str):
+    """edge-tts (cloud) -> 48k temp wav path (or None). Never raises.
+    Primary voice: en-US-RogerNeural. Needs internet; on any failure the
+    caller falls back to espeak-ng (offline). MP3 -> 48k mono WAV via
+    miniaudio (in the venv) ??? the M1A worker only plays WAV."""
+    import asyncio
+    import os
+    import wave
+    try:
+        import edge_tts
+        import numpy as np
+    except Exception as e:
+        print(f"speak: edge-tts unavailable: {e}", file=sys.stderr)
+        return None
+    mp3 = str(Path(tempfile.gettempdir()) / "me2_say.mp3")
+    wav = str(Path(tempfile.gettempdir()) / "me2_say_edge.wav")
+    try:
+        async def _run():
+            await asyncio.wait_for(
+                edge_tts.Communicate(text, EDGE_VOICE).save(mp3),
+                timeout=EDGE_TIMEOUT_S)
+        asyncio.run(_run())
+        if not (Path(mp3).exists() and Path(mp3).stat().st_size > 0):
+            return None
+        import miniaudio
+        dec = miniaudio.decode_file(mp3)
+        sr = int(dec.sample_rate)
+        nch = int(getattr(dec, "nchannels", 1))
+        frames = np.frombuffer(dec.samples, dtype=np.int16)
+        if nch > 1 and len(frames):
+            frames = frames.reshape(-1, nch).mean(axis=1)  # stereo -> mono
+        if sr != 48000 and len(frames):
+            n = int(len(frames) * 48000.0 / sr)
+            x = np.linspace(0.0, len(frames) - 1, n)
+            frames = np.interp(x, np.arange(len(frames)), frames)
+        i16 = frames.astype(np.int16)
+        with wave.open(wav, "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(48000)
+            wf.writeframes(i16.tobytes())
+        return wav
+    except Exception as e:
+        print(f"speak: edge-tts failed ({e}) ??? falling back to espeak-ng",
+              file=sys.stderr)
+        return None
+
+
+def _speak_synth(text: str):
+    """48k temp wav path (or None). Never raises. Primary: edge-tts
+    (en-US-RogerNeural, cloud); fallback: espeak-ng (offline, robotic)."""
+    p = _speak_synth_edge(text)
+    if p is not None:
+        return p
+    import subprocess
+    wav = str(Path(tempfile.gettempdir()) / "me2_say.wav")
+    prefix = _ESPEAK if isinstance(_ESPEAK, (list, tuple)) else [_ESPEAK]
+    try:
+        r = subprocess.run(
+            [*prefix, "-v", "en-us", "-s", "175", "-w", wav, text],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            timeout=10)
+        if r.returncode == 0 and Path(wav).exists():
+            return _speak_resample48(wav)
+    except Exception as e:
+        print(f"speak: synth failed: {e}", file=sys.stderr)
+    return None
+
+
+# ---------------------------------------------------------------- clips
+# Pre-recorded reply clips (en-US-RogerNeural, 48k mono s16 WAVs in
+# ./clips/, generated 2026-10-05): instant, offline, zero synth latency.
+# Every command fires its clip first; a missing clip file degrades to the
+# plain-TTS fallback, never to silence.
+CLIP_DIR = Path(__file__).resolve().parent / "clips"
+CLIP = {
+    "PLAY_MUSIC": "play_music", "PAUSE": "pause", "RESUME": "resume",
+    "NEXT": "next", "STOP": "stop", "VOLUME_UP": "volume_up",
+    "VOLUME_DOWN": "volume_down", "LIGHT_ON": "light_on",
+    "LIGHT_OFF": "light_off", "CALL": "call", "MESSAGE": "message",
+    "OUT_OF_SCOPE": "oos", "TIME": "time_lead", "WEATHER": "weather_lead",
+    "BRIGHTNESS": {"20 percent": "brightness_20",
+                   "60 percent": "brightness_60",
+                   "100 percent": "brightness_100"},
+    "COLOR": {"red": "color_red", "blue": "color_blue",
+              "green": "color_green"},
+    "TEMPERATURE": {"18 degrees": "temp_18", "22 degrees": "temp_22",
+                    "26 degrees": "temp_26"},
+    "TIMER": {"10 seconds": "timer_10", "30 seconds": "timer_30",
+              "1 minute": "timer_60"},
+    "ALARM": {"6 AM": "alarm_6am", "8 AM": "alarm_8am",
+              "9 PM": "alarm_9pm"},
+    "CREATE_REMINDER": {"drink water": "reminder_drink",
+                        "study": "reminder_study",
+                        "exercise": "reminder_exercise"},
+}
+
+
+def _clip_name(cmd: str, slot: str) -> str | None:
+    """(cmd, slot) -> main clip base name (no .wav), or None => plain TTS."""
+    m = CLIP.get(cmd)
+    if m is None:
+        return None
+    if isinstance(m, dict):
+        return m.get(slot)
+    return m
+
+
+def _clip_path(name: str) -> str | None:
+    p = CLIP_DIR / f"{name}.wav"
+    return str(p) if p.exists() else None
+
+
+def _speak_spawn(segs: list, est_s: float) -> bool:
+    """Play segs = [(wav_path | None, text | None), ...] in order through
+    the M1A worker (None wav = synthesize text via edge-tts/espeak at
+    spawn time). Music ducks; the self-trigger guard scales with the
+    estimated total reply length (clips are 1.5-3.5 s each; a 2-clip
+    reply + TTS tail runs past the old fixed 6.5 s window)."""
+    import subprocess
+    wavs = []
+    for wav, text in segs:
+        if wav is None:
+            wav = _speak_synth(text)
+            if wav is None:
+                return False
+        wavs.append(wav)
+    with _TTS["lock"]:
+        p = _TTS["proc"]
+        if p is not None and p.poll() is None:
+            return False  # already talking — don't stack replies
+        ducked = False
+        if DEV["music"]["playing"] and not DEV["music"]["paused"]:
+            ducked = _music_pause()
+        dev = _music_dev()
+        argv = [sys.executable, str(_music_worker()), *wavs, "0"]
+        if dev is not None:
+            argv.append(str(dev))
+        try:
+            proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL)
+        except Exception as e:
+            print(f"speak: spawn failed: {e}", file=sys.stderr)
+            if ducked:
+                _music_resume()
+            return False
+        _TTS["proc"] = proc
+        STATE["speaking_until"] = time.time() + max(
+            _SPEAK_GUARD_S, est_s + 2.5)
+    threading.Thread(target=_speak_monitor, args=(ducked,),
+                     daemon=True).start()
+    return True
+
+
+def _clip_dur_s(path: str) -> float:
+    try:
+        import wave
+        with wave.open(path, "rb") as wf:
+            return wf.getnframes() / float(wf.getframerate())
+    except Exception:
+        return 2.0
+
+
+def speak_clips(names: list, tail: str | None = None) -> bool:
+    """Pre-recorded reply: play the named clips (base names, no .wav) in
+    order, then an optional TTS tail (live data: time / weather). Every
+    named clip missing from disk => plain TTS of the tail (old behavior);
+    nothing to say => no voice (chip only). Called from apply_fire
+    (STATE["lock"] held). Never raises."""
+    try:
+        paths = [_clip_path(n) for n in names if n]
+        if names and not all(paths):
+            paths = []  # partial clip set => full TTS fallback
+        segs = [(p, None) for p in paths]
+        est = sum(_clip_dur_s(p) for p in paths)
+        if tail:
+            segs.append((None, tail))
+            est += 4.5
+        if not segs:
+            return False
+        return _speak_spawn(segs, est)
+    except Exception as e:
+        print(f"speak_clips: {e}", file=sys.stderr)
+        return False
+
+
+def speak(text: str) -> bool:
+    """Plain TTS reply out loud on the M1A (kept for future free-text
+    answers). Same duck/guard/monitor machinery as speak_clips()."""
+    return _speak_spawn([(None, text)], 4.5)
+
+
+def _speak_monitor(ducked: bool):
+    """Daemon thread: wait for the TTS worker, clear the slot, resume the
+    ducked music. Two paths: (a) speak() ducked the music itself (boss
+    said a command while music was playing, no wake-duck), (b) the
+    wake-duck paused the music and the /state idle handler deferred the
+    resume to this monitor (TTS was still playing when idle arrived).
+    Never raises."""
+    p = _TTS["proc"]
+    if p is None:
+        return
+    p.wait()
+    with _TTS["lock"]:
+        if _TTS["proc"] is p:
+            _TTS["proc"] = None
+    should_resume = ducked or _DUCK.get("defer")
+    if (should_resume and DEV["music"].get("paused")
+            and not DEV["music"].get("user_paused") and _M["proc"] is None):
+        if not _music_resume():
+            DEV["music"]["paused"] = False
+        else:
+            _DUCK["awake"] = False
+            _DUCK["defer"] = False
+    if p.returncode != 0:
+        print(f"speak: worker died (rc {p.returncode}) — reply not spoken",
+              file=sys.stderr)
+
+
+def apply_fire(f: dict) -> str:
+    """Dispatch one fire (V3, 20 classes) to device state. Returns outcome.
+
+    V3 phrasebook (src/commands.py): 19 intents + OUT_OF_SCOPE rejection.
+    Slot-bearing (PARAMETRIC, src/slots.py): TIMER / ALARM / TEMPERATURE /
+    BRIGHTNESS / COLOR / CREATE_REMINDER — each with 3 locked values.
+    """
+    now = time.time()
+    cmd = f.get("cmd")
+    slot = f.get("slot")
+    conf = f.get("conf", 0.0)
+
+    if cmd == "OUT_OF_SCOPE":
+        # Learned rejection (20th class) — the model's no-action path.
+        # Distinct from the confidence gate: the MODEL said "not a command".
+        add_chip(f"out of scope ({conf:.2f})")
+        speak_clips([_clip_name(cmd, slot)])
+        return "oos"
+    if conf < 0.50:  # confidence gate (ACTUATION)
+        add_chip(f"heard something ({conf:.2f}) — below gate")
+        return "gated"
+    if cmd != "SET_VOLUME" and now - _LAST_FIRE.get((cmd, slot), 0.0) < 0.5:
+        return "debounced"
+    _LAST_FIRE[(cmd, slot)] = now
+
+    # --- music control ---
+    if cmd == "PLAY_MUSIC":
+        m = DEV["music"]
+        track = random.choice(SONGS)
+        if m["playing"] and not m["paused"] and track == m["track"]:
+            return "noop"  # same-song repeat (ACTUATION)
+        m.update(playing=True, paused=False, track=track, user_paused=False)
+        _DUCK.update(awake=False, defer=False)  # new track, fresh state
+        if not _music_play(track):  # real audio (instruction 15)
+            m["playing"] = False  # fail-soft: don't claim it's playing
+            add_chip(f"music: no audio for “{track}”")
+        else:
+            speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "VOLUME_UP":
+        DEV["music"]["vol"] = min(100, DEV["music"]["vol"] + 20)
+        _apply_alsa_volume(DEV["music"]["vol"])
+        add_chip(f"volume {DEV['music']['vol']}")
+        speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "VOLUME_DOWN":
+        DEV["music"]["vol"] = max(0, DEV["music"]["vol"] - 20)
+        _apply_alsa_volume(DEV["music"]["vol"])
+        add_chip(f"volume {DEV['music']['vol']}")
+        speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "SET_VOLUME":
+        # UI slider: set the M1A HW volume to the exact value. The
+        # 1 Hz sync loop keeps the tile in lockstep with the HW.
+        try:
+            v = int(slot)
+        except (TypeError, ValueError):
+            v = DEV["music"]["vol"]
+        v = max(0, min(100, v))
+        DEV["music"]["vol"] = v
+        _apply_alsa_volume(v)
+        add_chip(f"volume {v}")
+    elif cmd == "NEXT":
+        m = DEV["music"]
+        if not m["track"]:
+            add_chip("nothing playing yet")
+        else:
+            nxt = (SONGS[(SONGS.index(m["track"]) + 1) % len(SONGS)]
+                   if m["track"] in SONGS else random.choice(SONGS))
+            m.update(playing=True, paused=False, track=nxt)
+            _music_play(nxt)
+            speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "PAUSE":
+        # ONE-WAY (2026-10-03): "pause music" always stops, never resumes.
+        # It was a toggle before — the wake-duck pauses the music on "hey
+        # boots", so a spoken "pause" then hit the resume branch and PLAYED
+        # the music (reproduced live: play -> awake/duck -> pause => playing).
+        # To bring it back, say "resume music" (RESUME below).
+        # user_paused stops the idle-handler's auto-resume (which is meant
+        # only for the wake-duck, not a deliberate user pause).
+        m = DEV["music"]
+        if m["playing"] and not m["paused"]:
+            _music_pause()
+            m.update(playing=False, paused=True, user_paused=True)
+            speak_clips([_clip_name(cmd, slot)])
+        elif m["paused"]:
+            m.update(playing=False, user_paused=True)
+            speak_clips([_clip_name(cmd, slot)])
+        else:
+            add_chip("nothing to pause")
+            speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "RESUME":
+        # "resume music" — relaunch from the paused sample offset.
+        m = DEV["music"]
+        if m["track"] and not (m["playing"] and not m["paused"]):
+            if _music_resume():
+                m.update(playing=True, paused=False, user_paused=False)
+                _DUCK.update(awake=False, defer=False)
+                speak_clips([_clip_name(cmd, slot)])
+            else:
+                m.update(paused=False, user_paused=False)
+                add_chip("nothing to resume")
+        else:
+            add_chip("nothing to resume")
+    elif cmd == "STOP":
+        m = DEV["music"]
+        if m["track"]:
+            with _M["lock"]:
+                _music_kill()
+                _M["track"] = None
+                _M["pos"] = 0
+            m.update(playing=False, paused=False, track=None, user_paused=False)
+            speak_clips([_clip_name(cmd, slot)])
+        else:
+            add_chip("nothing playing")
+    # --- lighting ---
+    elif cmd == "LIGHT_ON":
+        L = DEV["lights"]; L["on"] = True
+        if not L["level"]:
+            L["level"] = 70
+        speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "LIGHT_OFF":
+        DEV["lights"]["on"] = False
+        speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "BRIGHTNESS":
+        p = _bright_pct(slot)
+        if p is not None:
+            L = DEV["lights"]; L["on"] = True; L["level"] = p
+            speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "COLOR":
+        c = _lamp_color(slot)
+        if c:
+            L = DEV["lights"]; L["color"] = c; L["on"] = True
+            speak_clips([_clip_name(cmd, slot)])
+    # --- temperature ---
+    elif cmd == "TEMPERATURE":
+        d = _temp_deg(slot)
+        if d is not None:
+            DEV["temp"]["target"] = d
+            speak_clips([_clip_name(cmd, slot)])
+    # --- information ---
+    elif cmd == "TIME":
+        # Pre-record lead-in (Roger) + TTS tail (live clock).
+        chip, speak_text = _time_reply()
+        add_chip(chip)
+        speak_clips([_clip_name(cmd, slot)], tail=speak_text)
+    elif cmd == "WEATHER":
+        chip, speak_text = _weather_reply()
+        add_chip(chip)
+        if STATE.get("weather_online"):
+            # All-TTS reply (2026-10-06): no lead clip, no glue — weather
+            # is internet-dependent anyway, so the TTS round-trip is
+            # already in the path. speak_text carries the location itself
+            # ("In UP Diliman, sunny, 29 degrees") — no prefix here.
+            speak_clips([], tail=speak_text)
+        else:
+            # Offline: default clip only — no glue, no stale tail.
+            speak_clips(["no_internet"])
+    # --- timers & alarms ---
+    elif cmd == "TIMER":
+        secs = _timer_secs(slot)
+        if secs:
+            DEV["timer"] = {"until": now + secs, "secs": secs,
+                            "mins": secs / 60.0, "done": False}
+            speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "ALARM":
+        mark = _alarm_mark(slot)
+        if mark and mark not in DEV["alarms"]:
+            DEV["alarms"].append(mark)
+            DEV["alarms"].sort()
+            DEV["alarms"] = DEV["alarms"][:20]
+            speak_clips([_clip_name(cmd, slot)])
+    # --- communication ---
+    elif cmd == "CALL":
+        add_chip("dialing…")
+        speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "MESSAGE":
+        add_chip("opening messages…")
+        speak_clips([_clip_name(cmd, slot)])
+    # --- reminders (structured: {text, done, ts}) ---
+    elif cmd == "CREATE_REMINDER":
+        if slot:
+            if not any(r["text"] == slot for r in DEV["reminders"]):
+                DEV["reminders"].insert(0,
+                    {"text": slot, "done": False, "ts": time.time()})
+                DEV["reminders"] = DEV["reminders"][:20]
+                speak_clips([_clip_name(cmd, slot)])
+    elif cmd == "LIST_REMINDERS":
+        open_r = [r["text"] for r in DEV["reminders"] if not r["done"]]
+        add_chip("reminders: " + (", ".join(open_r) if open_r else "none") + "…")
+    else:
+        add_chip(f"unhandled command: {cmd}")
+    return "fired"
+
+
+def dev_view(now: float) -> dict:
+    """Server-side view of device state for /state (with expiries)."""
+    t = DEV["timer"]
+    if t and not t["done"] and now >= t["until"]:
+        t["done"] = True
+        add_chip(f"timer's up ({t['secs']} s)")
+    remaining = None
+    frac = None
+    if t:
+        left = max(0.0, t["until"] - now)
+        remaining = int(left)
+        frac = 1.0 - (left / (t["mins"] * 60.0)) if t["mins"] else 1.0
+    cur = DEV["temp"]["current"]
+    tgt = DEV["temp"]["target"]
+    mode = "idle"
+    if tgt is not None:
+        mode = "heating" if tgt > cur + 0.25 else \
+            ("cooling" if tgt < cur - 0.25 else "holding")
+    m = DEV["music"]
+    return {
+        "lights": dict(DEV["lights"]),
+        "timer": ({"remaining": remaining, "frac": round(frac, 4),
+                   "done": t["done"], "mins": t["mins"],
+                   "secs": t.get("secs", int(t["mins"] * 60))}
+                  if t else None),
+        "alarms": list(DEV["alarms"]),
+        "temp": {"current": round(cur, 1), "target": tgt, "mode": mode},
+        "music": {**m, "eq": m["playing"] and not m["paused"]},
+        "reminders": [dict(r) for r in DEV["reminders"]],
+        "chips": [(c, ts) for c, ts in DEV["chips"] if now - ts < 60],
+    }
+
+
+def load_meta(pkg_dir: Path):
+    try:
+        m = json.loads((pkg_dir / "meta.json").read_text())
+        STATE["vcm"] = {"model": m.get("model"),
+                        "classes": len(m.get("classes", []))}
+    except Exception:
+        pass
+    try:
+        w = json.loads((pkg_dir / "wake_meta.json").read_text())
+        STATE["wake"] = {"model": w.get("model"),
+                         "threshold": w.get("threshold")}
+    except Exception:
+        pass
+
+
+def state_json() -> dict:
+    with STATE["lock"]:
+        return {
+            "mode": STATE["mode"], "mode_ts": STATE["mode_ts"],
+            "last": STATE["last"],
+            "history": list(STATE["history"]),
+            "total": STATE["total"],
+            "started": STATE["started"],
+            "vcm": STATE["vcm"], "wake": STATE["wake"],
+            "dev": dev_view(time.time()),
+            "now": time.time(),
+        }
+
+
+# ---------------------------------------------------------------- weather
+# open-meteo, stdlib only, 15-min cache. Fail-soft: no internet (Pi on a
+# phone hotspot) -> last good value, or None until the first success.
+# Location is BOSS-SET, not geocoded (Opt 1, 2026-10-06): the exact point
+# is hardcoded here (UP Diliman campus) and overridable via env vars
+# ME2_LOCATION / ME2_LAT / ME2_LON. The name is spoken back in the reply
+# so the answer is specific about WHERE the number is from.
+ME2_LOCATION = os.environ.get("ME2_LOCATION", "UP Diliman")
+WMO = {0: ("☀️", "clear"), 1: ("🌤️", "mainly clear"),
+       2: ("⛅", "partly cloudy"), 3: ("☁️", "overcast"),
+       45: ("🌫️", "fog"), 48: ("🌫️", "rime fog"),
+       51: ("🌦️", "light drizzle"), 53: ("🌦️", "drizzle"),
+       55: ("🌧️", "heavy drizzle"), 56: ("🌧️", "freezing drizzle"),
+       57: ("🌧️", "freezing drizzle"),
+       61: ("🌦️", "light rain"), 63: ("🌧️", "rain"),
+       65: ("🌧️", "heavy rain"), 66: ("🌧️", "freezing rain"),
+       67: ("🌧️", "freezing rain"),
+       71: ("🌨️", "light snow"), 73: ("🌨️", "snow"),
+       75: ("❄️", "heavy snow"), 77: ("❄️", "snow grains"),
+       80: ("🌦️", "showers"), 81: ("🌧️", "showers"),
+       82: ("⛈️", "heavy showers"), 85: ("🌨️", "snow showers"),
+       86: ("❄️", "snow showers"),
+       95: ("⛈️", "thunderstorm"), 96: ("⛈️", "thunderstorm"),
+       99: ("⛈️", "thunderstorm + hail")}
+
+
+def _weather_fetch():
+    import urllib.request
+    # Exact campus point (14.6532, 121.0806) — the geocoder would return
+    # Quezon City's centroid, not the campus; boss-set, env-overridable.
+    lat = os.environ.get("ME2_LAT", "14.6532")   # UP Diliman, Quezon City
+    lon = os.environ.get("ME2_LON", "121.0806")
+    url = ("https://api.open-meteo.com/v1/forecast"
+           f"?latitude={lat}&longitude={lon}"
+           "&current=temperature_2m,weather_code")
+    with urllib.request.urlopen(url, timeout=6) as r:
+        d = json.loads(r.read().decode())
+    cur = d["current"]
+    icon, cond = WMO.get(int(cur["weather_code"]), ("🌡️", "unknown"))
+    STATE["weather"] = {"icon": icon,
+                        "temp": round(float(cur["temperature_2m"])),
+                        "condition": cond, "ts": time.time()}
+    STATE["weather_online"] = True
+
+
+def _weather_loop():
+    while True:
+        try:
+            _weather_fetch()
+        except Exception:
+            STATE["weather_online"] = False  # no internet / rate limit
+        time.sleep(900)
+
+
+def _ui_music(dev: dict) -> dict:
+    """Music tile payload for /ui_state: track, playing, plus the
+    progress-bar data (elapsed seconds, duration, fraction 0..1).
+    The UI derives its equalizer animation from `playing` and the bar
+    width from `fraction` — both are server-authoritative so the tile
+    can't drift from the worker. While paused the bar HOLDS its position
+    (the frozen sample offset), it does not snap to zero."""
+    m = dev["music"]
+    playing = bool(m["eq"])
+    with _M["lock"]:
+        track_loaded = _M["track"] is not None
+        dur = _M["dur"] if track_loaded else 0.0
+        sr = _M["sr"]
+        if playing and _M["proc"] is not None and _M["proc"].poll() is None:
+            # live — advance from the segment start (mirrors _music_progress)
+            elapsed = _M["pos"] / sr + (time.monotonic() - _M["t0"])
+        elif track_loaded:  # paused — freeze at the stored sample offset
+            elapsed = _M["pos"] / sr if sr else 0.0
+        else:
+            elapsed = 0.0
+        if dur <= 0:
+            frac = 0.0
+        else:
+            frac = max(0.0, min(1.0, elapsed / dur))
+            elapsed = min(elapsed, dur)
+    return {"track": m["track"] or "nothing playing",
+            "playing": playing,
+            "paused": bool(m.get("paused")) and not playing,
+            "elapsed": round(elapsed, 1),
+            "duration": round(dur, 1),
+            "fraction": round(frac, 4),
+            "vol": int(m.get("vol", 60))}
+
+
+def ui_state_json() -> dict:
+    """The handover §7 data model for pi/me2_ui.html (1 Hz poll)."""
+    now = time.time()
+    with STATE["lock"]:
+        mode = STATE["mode"]
+        mode_ts = STATE["mode_ts"]
+        last_good = STATE["last_good"]
+        last_dim = STATE.get("last_dim")
+        weather = STATE.get("weather")
+        dev = dev_view(now)
+    if mode == "awake":
+        umode = "awake"                       # "Listening…" + edge glow
+    elif mode == "reject":
+        umode = "reject" if now - mode_ts < 8.0 else "idle"
+    elif last_good is not None and now - last_good.get("ts", 0) < 60.0:
+        umode = "done"
+    else:
+        umode = "idle"
+    ulast = None
+    if last_good:
+        ulast = {"cmd": last_good.get("cmd"),
+                 "conf": last_good.get("conf"),
+                 "latency": last_good.get("e2e_ms", last_good.get("infer_ms"))}
+        ulast["slot"] = last_good.get("slot")
+        # done-card display formats (V3: '0:30' / '8:00 AM' / '22°' / '60%')
+        disp = {"TIMER": _timer_word, "ALARM": _alarm_word,
+                "TEMPERATURE": _temp_word,
+                "BRIGHTNESS": _bright_word}.get(last_good.get("cmd"))
+        if disp:
+            w = disp(last_good.get("slot") or "")
+            if w:
+                ulast["slot"] = w
+        if last_good.get("slot_margin") is not None:
+            ulast["slotMargin"] = last_good["slot_margin"]
+        if last_good.get("slot_alt"):
+            ulast["slotAlt"] = last_good["slot_alt"]
+    t = dev["timer"]
+    if t and not t["done"]:
+        timer = {"remaining": t["remaining"],
+                 "frac_left": round(1.0 - t["frac"], 4), "done": False}
+    elif t:
+        timer = {"remaining": 0, "frac_left": 0.0, "done": True}
+    else:
+        timer = None
+    p = dev["temp"]
+    tmode = (p["mode"] + " → " + str(p["target"]) + "°") \
+        if p["target"] is not None else "idle"
+    return {
+        "mode": umode,
+        "last": ulast,
+        "lamp": {"on": dev["lights"]["on"], "level": dev["lights"]["level"],
+                 "color": dev["lights"]["color"]},
+        "thermo": p["current"],
+        "tmode": tmode,
+        "timer": timer,
+        "alarms": dev["alarms"],
+        "music": _ui_music(dev),
+        "notes": [c for c, _ts in dev["chips"]],
+        "reminders": dev["reminders"],
+        "weather": weather,
+        "speaking": time.time() < STATE.get("speaking_until", 0.0),
+        "slotPrompt": None, "candidates": None, "retries": None,
+        "me3": STATE["me3"],
+    }
+
+
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, fmt, *args):  # quiet
+        pass
+
+    def _send(self, code: int, body: bytes, ctype: str):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        if self.path in ("/", "/index.html"):
+            self._send(200, _PAGE_HTML if _PAGE_HTML is not None
+                       else PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/muji":
+            # ME3 observability dashboard (muji-styled chat + inspector).
+            # Served from me3_muji_ui_mockup.html next to this file when present.
+            if _MUJI_HTML is not None:
+                self._send(200, _MUJI_HTML, "text/html; charset=utf-8")
+            else:
+                self._send(404, b"muji dashboard not found (drop me3_muji_ui_mockup.html next to me2_ui.py)", "text/plain")
+        elif self.path == "/debug":
+            self._send(200, PAGE.encode(), "text/html; charset=utf-8")
+        elif self.path == "/state":
+            self._send(200, json.dumps(state_json()).encode(),
+                       "application/json")
+        elif self.path == "/ui_state":
+            self._send(200, json.dumps(ui_state_json()).encode(),
+                       "application/json")
+        elif self.path.startswith("/site/"):
+            # Serve a generated website (write_website tool) from the sites/ dir.
+            name = self.path[len("/site/"):]
+            # Security: only allow a single .html filename, no traversal.
+            if (name and not name.startswith("/") and ".." not in name
+                    and "/" not in name and name.endswith(".html")):
+                p = os.path.join(SITES_DIR, os.path.basename(name))
+                if os.path.isfile(p):
+                    try:
+                        with open(p, "rb") as fh:
+                            data = fh.read()
+                        self._send(200, data, "text/html; charset=utf-8")
+                        return
+                    except Exception:
+                        pass
+            self._send(404, b"site not found", "text/plain")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length", 0))
+        try:
+            obj = json.loads(self.rfile.read(n) or b"{}")
+        except json.JSONDecodeError:
+            self._send(400, b"bad json", "text/plain")
+            return
+        if self.path == "/fire":
+            with STATE["lock"]:
+                outcome = apply_fire(obj)
+                STATE["last"] = obj
+                STATE["history"].appendleft(obj)
+                STATE["total"] += 1
+                if outcome == "gated":
+                    STATE["mode"] = "reject"  # red RETRY card, decays in 8 s
+                else:
+                    STATE["last_good"] = obj
+                    STATE["mode"] = "idle"
+                STATE["mode_ts"] = time.time()
+            self._send(200, f"ok:{outcome}".encode(), "text/plain")
+        elif self.path == "/me3":
+            # Live conversation state from the ME3 voice agent:
+            # {"phase","heard","thinking","response","tool","active"}
+            phase = obj.get("phase")
+            if phase not in ("idle", "listening", "transcribing", "thinking",
+                             "tool", "speaking"):
+                self._send(400, b"bad phase", "text/plain")
+                return
+            with STATE["lock"]:
+                m3 = STATE["me3"]
+                m3["phase"] = phase
+                m3["heard"] = (obj.get("heard") or m3["heard"])[:300]
+                m3["thinking"] = (obj.get("thinking") or "")[:300]
+                m3["response"] = (obj.get("response") or m3["response"])[:400]
+                m3["tool"] = (obj.get("tool") or "")[:120]
+                m3["mic"] = bool(obj.get("mic", False))
+                m3["active"] = bool(obj.get("active", False))
+                if obj.get("hb") or True:
+                    m3["last_hb"] = time.time()   # any push = agent is alive
+                m3["ts"] = time.time()
+            self._send(200, b"ok", "text/plain")
+        elif self.path == "/me3mic":
+            lvl = obj.get("mic_level", 0.0)
+            try:
+                lvl = max(0.0, min(1.0, float(lvl)))
+            except Exception:
+                lvl = 0.0
+            with STATE["lock"]:
+                STATE["me3"]["mic_level"] = lvl
+                STATE["me3"]["last_hb"] = time.time()  # mic activity => alive
+            self._send(200, b"ok", "text/plain")
+        elif self.path == "/state":
+            mode = obj.get("mode")
+            if mode in ("idle", "awake"):
+                with STATE["lock"]:
+                    STATE["mode"] = mode
+                    STATE["mode_ts"] = time.time()
+                    m = DEV["music"]
+                    if mode == "awake":
+                        # Wake duck: silence the music so the ack beep and
+                        # the command capture are clean (pi_demo holds the
+                        # M1A mic; music on the same device would bleed in).
+                        if m["playing"] and not m["paused"]:
+                            if _music_pause():
+                                _DUCK["awake"] = True
+                    elif _DUCK["awake"]:
+                        # Idle after a wake: resume the ducked music — but only
+                        # if the pause was the WAKE-DUCK, not a deliberate user
+                        # "pause" (user_paused). A user pause must STAY paused
+                        # until "resume music". If a TTS reply is still playing,
+                        # defer to its monitor (it resumes when the reply ends).
+                        if m.get("user_paused"):
+                            _DUCK["awake"] = False  # user owns the pause now
+                        elif _TTS["proc"] is not None and _TTS["proc"].poll() is None:
+                            _DUCK["defer"] = True
+                        elif m["paused"] and _M["proc"] is None:
+                            if _music_resume():
+                                _DUCK["awake"] = False
+                            else:
+                                m["paused"] = False
+                                _DUCK["awake"] = False
+            self._send(200, b"ok", "text/plain")
+        elif self.path == "/reminders":
+            # Toggle a reminder's done state by index (UI checkbox).
+            # Body: {"index": <int>, "done": <bool>}
+            idx = obj.get("index")
+            try:
+                idx = int(idx)
+            except (TypeError, ValueError):
+                self._send(400, b"bad index", "text/plain")
+                return
+            with STATE["lock"]:
+                if 0 <= idx < len(DEV["reminders"]):
+                    DEV["reminders"][idx]["done"] = bool(obj.get("done", True))
+                    self._send(200, b"ok", "text/plain")
+                else:
+                    self._send(404, b"no such reminder", "text/plain")
+        else:
+            self._send(404, b"not found", "text/plain")
+
+
+PAGE = r"""<!doctype html>
+<html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BOOTS · ME2</title>
+<style>
+:root{--bg:#0d1117;--card:#161b22;--line:#21262d;--tx:#e6edf3;
+--dim:#8b949e;--blue:#58a6ff;--green:#3fb950;--amber:#d29922}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);min-height:100vh;
+font:16px/1.5 -apple-system,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;
+display:flex;justify-content:center;padding:28px 16px}
+main{width:100%;max-width:640px}
+header{display:flex;align-items:center;gap:10px;margin-bottom:18px}
+.lamp{width:12px;height:12px;border-radius:50%;background:var(--blue);
+box-shadow:0 0 10px var(--blue)}
+.lamp.awake{background:var(--green);box-shadow:0 0 14px var(--green);
+animation:pulse .9s infinite}
+@keyframes pulse{50%{opacity:.35}}
+h1{font-size:15px;letter-spacing:.22em;font-weight:600;color:var(--dim)}
+.mode{margin-left:auto;font-size:12px;letter-spacing:.14em;color:var(--blue)}
+.mode.awake{color:var(--green)}
+#clock{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+.card{background:var(--card);border:1px solid var(--line);
+border-radius:14px;padding:22px;margin-bottom:16px}
+.k{font-size:11px;letter-spacing:.18em;color:var(--dim);margin-bottom:8px}
+.cmd{font-size:30px;font-weight:650}
+.slot{font-size:20px;color:var(--blue);margin-top:2px}
+.slot.none{color:var(--dim);font-size:15px}
+.bar{height:8px;background:#21262d;border-radius:4px;margin-top:14px;
+overflow:hidden}
+.bar i{display:block;height:100%;background:var(--blue);
+border-radius:4px;transition:width .3s}
+.meta{display:flex;gap:18px;margin-top:12px;font-size:13px;color:var(--dim);
+font-variant-numeric:tabular-nums;flex-wrap:wrap}
+.meta b{color:var(--tx);font-weight:550}
+.empty{color:var(--dim);font-size:15px;padding:14px 0}
+table{width:100%;border-collapse:collapse;font-size:14px}
+td{padding:7px 6px;border-top:1px solid var(--line);
+font-variant-numeric:tabular-nums;white-space:nowrap}
+td:first-child{color:var(--dim);font-size:12.5px}
+td.sl{color:var(--blue)}
+td.cf{text-align:right}
+td.cf.lo{color:var(--amber)}
+h2{font-size:12px;letter-spacing:.16em;color:var(--dim);margin:20px 0 10px}
+footer{color:var(--dim);font-size:12.5px;margin-top:18px;line-height:1.7}
+footer b{color:var(--tx);font-weight:550}
+.tiles{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.tile{background:var(--card);border:1px solid var(--line);border-radius:14px;
+padding:14px 16px;transition:border-color .5s,box-shadow .5s}
+.tile.flash{border-color:var(--blue);box-shadow:0 0 18px rgba(88,166,255,.25)}
+.tk{font-size:10.5px;letter-spacing:.16em;color:var(--dim);margin-bottom:8px}
+.lampdot{width:52px;height:52px;border-radius:50%;background:#21262d;
+border:2px solid var(--line);transition:all .55s;margin:2px 0 10px}
+.lampdot.on{background:radial-gradient(circle at 35% 35%,#ffe9b0,#ffb84d 65%,#e08b00);
+border-color:#ffb84d;box-shadow:0 0 28px rgba(255,184,77,.55)}
+.lvl{height:6px;background:#21262d;border-radius:3px;overflow:hidden}
+.lvl i{display:block;height:100%;background:var(--amber);border-radius:3px;
+transition:width .7s}
+.lvltext{font-size:12px;color:var(--dim);margin-top:6px;
+font-variant-numeric:tabular-nums}
+.ring{width:62px;height:62px;border-radius:50%;display:flex;align-items:center;
+justify-content:center;margin:0 auto 8px;background:#21262d}
+.ring b{width:46px;height:46px;border-radius:50%;background:var(--card);
+display:flex;align-items:center;justify-content:center;font-size:13px;
+font-variant-numeric:tabular-nums}
+.big{font-size:22px;font-weight:650;font-variant-numeric:tabular-nums}
+.big.mid{font-size:16px}
+.sub{font-size:12.5px;color:var(--dim);margin-top:4px}
+.chiprow{display:flex;flex-wrap:wrap;gap:6px;min-height:24px}
+.chip{background:#1f2937;border:1px solid var(--line);color:var(--tx);
+border-radius:999px;padding:3px 10px;font-size:12.5px;animation:pop .4s}
+.chip.faded{color:var(--dim)}
+@keyframes pop{0%{transform:scale(.6);opacity:0}100%{transform:scale(1);opacity:1}}
+.eq{display:flex;gap:3px;align-items:flex-end;height:18px;margin-top:8px}
+.eq i{width:4px;background:var(--blue);border-radius:2px;height:25%;
+transition:height .3s}
+.eq.playing i{animation:eq 1s infinite ease-in-out}
+.eq.playing i:nth-child(2){animation-delay:.2s}
+.eq.playing i:nth-child(3){animation-delay:.4s}
+.eq.playing i:nth-child(4){animation-delay:.15s}
+@keyframes eq{0%,100%{height:25%}50%{height:100%}}
+.dim{color:var(--dim)}
+</style></head><body><main>
+<header><span class="lamp" id="lamp"></span><h1>BOOTS</h1>
+<span class="mode" id="mode">BOOTING…</span>
+<span id="clock"></span></header>
+<div class="card"><div class="k">LAST COMMAND</div>
+<div id="last"><div class="empty">waiting — say “Hey boots”, then speak
+your command</div></div></div>
+<h2>DEVICES</h2>
+<div class="tiles">
+<div class="tile" id="t-lamp"><div class="tk">LIGHTS</div>
+<div class="lampdot" id="lampdot"></div>
+<div class="lvl"><i id="lvlbar" style="width:0%"></i></div>
+<div class="lvltext" id="lvltext">off</div></div>
+<div class="tile" id="t-timer"><div class="tk">TIMER</div>
+<div class="ring" id="tring"><b id="ttext">—</b></div>
+<div class="sub" id="tsub"></div></div>
+<div class="tile" id="t-alarm"><div class="tk">ALARMS</div>
+<div class="chiprow" id="alarms"><span class="chip faded">none</span></div></div>
+<div class="tile" id="t-temp"><div class="tk">CLIMATE</div>
+<div class="big" id="tcur">21.5°</div>
+<div class="sub" id="tmode">idle</div></div>
+<div class="tile" id="t-music"><div class="tk">MUSIC</div>
+<div class="big mid dim" id="mtrack">nothing playing</div>
+<div class="eq" id="meq"><i></i><i></i><i></i><i></i></div></div>
+<div class="tile" id="t-notes"><div class="tk">NOTES</div>
+<div class="chiprow" id="notes"><span class="chip faded">—</span></div></div>
+</div>
+<h2>HISTORY · <span id="total">0</span> FIRES</h2>
+<div class="card" style="padding:6px 14px">
+<table><tbody id="hist"></tbody></table></div>
+<footer id="foot"></footer>
+</main>
+<script>
+const LABELS={PLAY_MUSIC:"Play music",VOLUME_UP:"Volume up",
+VOLUME_DOWN:"Volume down",NEXT:"Next",PAUSE:"Pause",STOP:"Stop",
+LIGHT_ON:"Lights on",LIGHT_OFF:"Lights off",BRIGHTNESS:"Brightness",
+COLOR:"Color",TEMPERATURE:"Temperature",WEATHER:"Weather",TIME:"Time",
+TIMER:"Timer",ALARM:"Alarm",CALL:"Call",MESSAGE:"Message",
+CREATE_REMINDER:"Reminder",LIST_REMINDERS:"Reminders",
+OUT_OF_SCOPE:"Out of scope"};
+const esc=s=>String(s??"").replace(/[&<>"]/g,
+c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+function fmt(t){return new Date(t*1000).toLocaleTimeString([],
+{hour12:false});}
+let prevSig=null;
+function flash(id,changed){
+ const el=document.getElementById(id);
+ if(changed){el.classList.remove('flash');void el.offsetWidth;
+ el.classList.add('flash');}
+}
+function renderDev(d){
+ const sig={
+  lights:d.lights,
+  timer:d.timer?{has:1,mins:d.timer.mins,done:d.timer.done}:null,
+  alarms:d.alarms,
+  temp:{t:d.temp.target,m:d.temp.mode},
+  music:d.music,
+  notes:JSON.stringify([(d.chips||[])[0]||(null),d.reminders])
+ };
+ const chg=k=>{const a=JSON.stringify(sig[k]);
+  return !prevSig||a!==JSON.stringify(prevSig[k]);};
+ const L=d.lights;
+ document.getElementById('lampdot').className=
+  'lampdot'+(L.on?' on':'');
+ document.getElementById('lvlbar').style.width=(L.on?L.level:0)+'%';
+ document.getElementById('lvltext').textContent=
+  L.on?L.level+'%':'off';
+ flash('t-lamp',chg('lights'));
+ const T=d.timer,rg=document.getElementById('tring'),
+       tt=document.getElementById('ttext');
+ if(T){
+  const m=Math.floor(T.remaining/60),ss=T.remaining%60;
+  tt.textContent=T.done?'00:00':(m+':'+String(ss).padStart(2,'0'));
+  rg.style.background='conic-gradient('+(T.done?'var(--green)':'var(--blue)')
+   +' '+Math.round((T.done?1:T.frac)*360)+'deg, #21262d 0deg)';
+  document.getElementById('tsub').textContent=
+   T.done?'time’s up':(T.mins+' min set');
+ }else{
+  tt.textContent='—';rg.style.background='#21262d';
+  document.getElementById('tsub').textContent='';
+ }
+ flash('t-timer',chg('timer'));
+ const ar=document.getElementById('alarms');
+ ar.innerHTML=d.alarms.length
+  ?d.alarms.map(a=>'<span class="chip">'+a+'</span>').join('')
+  :'<span class="chip faded">none</span>';
+ flash('t-alarm',chg('alarms'));
+ const P=d.temp;
+ document.getElementById('tcur').textContent=P.current+'°';
+ document.getElementById('tmode').textContent=P.target!=null
+  ?P.mode+' → '+P.target+'°':'idle';
+ flash('t-temp',chg('temp'));
+ const M=d.music,mt=document.getElementById('mtrack');
+ if(M.track){
+  mt.textContent=M.track+(M.paused?' · paused':'');
+  mt.className='big mid';
+ }else{
+  mt.textContent='nothing playing';mt.className='big mid dim';
+ }
+ document.getElementById('meq').className='eq'+(M.eq?' playing':'');
+ flash('t-music',chg('music'));
+ const nt=document.getElementById('notes');
+ let h=(d.chips||[]).map(x=>'<span class="chip">'+esc(x[0])+'</span>').join('');
+ h+=(d.reminders||[]).map(r=>'<span class="chip'+(r.done?' faded':'')+'">'+esc(r.text)+'</span>').join('');
+ nt.innerHTML=h||'<span class="chip faded">—</span>';
+ flash('t-notes',chg('notes'));
+ prevSig=sig;
+}
+async function tick(){
+ let s; try{s=await (await fetch("/state")).json();}catch(e){return;}
+ renderDev(s.dev);
+ const lamp=document.getElementById("lamp"),
+       mode=document.getElementById("mode");
+ const awake=s.mode==="awake";
+ lamp.className="lamp"+(awake?" awake":"");
+ mode.className="mode"+(awake?" awake":"");
+ mode.textContent=awake?"SPEAK NOW":"LISTENING";
+ document.getElementById("clock").textContent=fmt(s.now);
+ document.getElementById("total").textContent=s.total;
+ const L=document.getElementById("last");
+ if(s.last){
+  const l=s.last,cf=Math.round((l.conf??0)*100);
+  L.innerHTML=`<div class="cmd">${esc(LABELS[l.cmd]||l.cmd)}</div>`+
+   (l.slot?`<div class="slot">“${esc(l.slot)}”</div>`
+          :`<div class="slot none">no slot</div>`)+
+   `<div class="bar"><i style="width:${cf}%"></i></div>`+
+   `<div class="meta"><span>conf <b>${l.conf??.0}</b></span>`+
+   (l.e2e_ms?`<span>wake→fire <b>${l.e2e_ms} ms</b></span>`:``)+
+   (l.infer_ms?`<span>infer <b>${l.infer_ms} ms</b></span>`:``)+
+   (l.wake_conf?`<span>wake <b>${l.wake_conf}</b></span>`:``)+
+   `<span>at <b>${fmt(l.ts||s.now)}</b></span></div>`;
+ }
+ document.getElementById("hist").innerHTML=(s.history||[]).map(h=>{
+  const cf=Math.round((h.conf??0)*100);
+  return `<tr><td>${fmt(h.ts||s.now)}</td>`+
+   `<td>${esc(LABELS[h.cmd]||h.cmd)}</td>`+
+   `<td class="sl">${h.slot?esc(h.slot):"—"}</td>`+
+   `<td class="cf${cf<70?" lo":""}">${cf}%</td></tr>`;
+ }).join("");
+ const v=s.vcm||{},w=s.wake||{};
+ document.getElementById("foot").innerHTML=
+  (v.model?`<b>vcm</b> ${esc(v.model)} (${v.classes} classes)<br>`:``)+
+  (w.model?`<b>wake</b> ${esc(w.model)} “hey boots” (thr ${w.threshold})<br>`:``)+
+  `say <b>“Hey boots”</b>, then speak your command`;
+}
+tick(); setInterval(tick,1000);
+</script></body></html>
+"""
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dir", default=".",
+                    help="Pi payload dir (for meta.json / wake_meta.json)")
+    ap.add_argument("--port", type=int, default=8330)
+    ap.add_argument("--host", default="0.0.0.0")
+    args = ap.parse_args()
+
+    global _PAGE_HTML, _MUJI_HTML, MUSIC_DIR
+    load_meta(Path(args.dir))
+    MUSIC_DIR = Path(args.dir) / "music"
+    _music_init()
+    html = Path(args.dir) / "me2_ui.html"
+    if html.exists():
+        _PAGE_HTML = html.read_bytes()
+        print(f"UI page: {html} (handover UI)", flush=True)
+    # ME3 observability dashboard (muji) -> served at /muji. Look next to the
+    # script first (bootsui/ is where it lives on the Pi), then in --dir.
+    for cand in (Path(__file__).with_name("me3_muji_ui_mockup.html"),
+                 Path(args.dir) / "me3_muji_ui_mockup.html"):
+        if cand.exists():
+            _MUJI_HTML = cand.read_bytes()
+            print(f"MUJI dashboard: {cand} (served at /muji)", flush=True)
+            break
+    threading.Thread(target=_weather_loop, daemon=True).start()
+    srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    print(f"ME2 UI: http://{args.host}:{args.port}  (package dir {args.dir})",
+          flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("bye")
+
+
+if __name__ == "__main__":
+    main()
