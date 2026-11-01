@@ -1,0 +1,45 @@
+# ME3 voice agent — Python requirements (for the Pi's venv:  python3 -m venv .venv && . .venv/bin/activate)
+#
+# Install:  pip install -r requirements.txt
+#
+# These mirror the working ~/me3/.venv (TECHNICAL_RECORD §7.3 + §6.3 + D19).
+# Pin the core audio/LLM stack to the exact versions the Pi runs so a fresh
+# venv behaves identically; the rest just need to be present.
+#
+# Notes:
+#   - `mcp==1.30.0` is pinned (D19): latest 1.x that imports FastMCP against
+#     pydantic 2.14.1. Do NOT bump to mcp 2.x (renames FastMCP -> MCPServer)
+#     or downgrade to 1.2.0 (pydantic 2.14 import error).
+#   - pydantic is NOT pinned here on purpose: it is pulled transitively by
+#     pipecat/mcp. If a fresh install breaks, pin `pydantic==2.14.1`.
+#   - whisper.cpp is a NATIVE build, NOT a pip package (see start_whisper_server.sh
+#     and TECHNICAL_RECORD §7.3). It is NOT in this file.
+#   - Spotify MCP is a NODE package (@novalux12/spotify-mcp), not Python (see
+#     TECHNICAL_RECORD §7.3 step 6). NOT in this file.
+
+# --- core voice pipeline (Pipecat) ---
+pipecat-ai==1.12.0
+
+# --- audio: capture / playback / VAD ---
+numpy<2.3            # pipecat 1.12 + onnxruntime 1.24 need numpy < 2.3
+onnxruntime==1.24.4   # Silero VAD runs on this
+sounddevice==0.5.6    # PortAudio mic/speaker I/O
+soundfile==0.13.0
+pyaudio==0.2.14       # needs the system PortAudio lib (apt: libportaudio2)
+webrtcvad-wheels==2.0.14
+
+# --- LLM / TTS / ASR clients (remote DGX3 voice mode) ---
+aiohttp               # async HTTP to the DGX3 Qwen2-Audio / Qwen3-TTS servers
+requests
+
+# --- offline TTS fallback (ME3_VOICE=local) ---
+piper-tts==1.8.0
+
+# --- Boots UI server (bootsui/me2_ui.py) optional TTS engine ---
+edge-tts
+
+# --- MCP servers (boots-web + boots-ui) — see D19 ---
+mcp==1.30.0
+
+# --- logging ---
+loguru
