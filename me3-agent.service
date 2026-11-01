@@ -1,0 +1,27 @@
+[Unit]
+# ME3 voice agent (the "brain"). Runs ~/me3/agent.py.
+#
+# It needs:
+#   - the EMEET M1A USB mic plugged in (exits cleanly with "NO MICROPHONE FOUND"
+#     otherwise — systemd will keep retrying per Restart=).
+#   - VPN up for remote voice (DGX3 Qwen2-Audio ASR / Qwen3-TTS). ME3_VOICE=local
+#     falls back to local whisper.cpp + Piper if the VPN is down.
+Description=ME3 voice agent (pipecat; ASR/LLM/TTS, drives the Boots UI on :8330)
+After=network-online.target me2-ui.service openvpn-sharc.service
+Wants=network-online.target me2-ui.service
+# ME3_VOICE: remote (default, DGX3 over VPN) or local (whisper.cpp + Piper).
+Environment=ME3_VOICE=remote
+Environment=ME3_NOISE_FLOOR_RMS=0.006
+
+[Service]
+Type=simple
+User=jan
+WorkingDirectory=/home/jan/me3
+ExecStart=/home/jan/me3/.venv/bin/python /home/jan/me3/agent.py
+Restart=always
+RestartSec=8
+StandardOutput=append:/home/jan/me3/agent.log
+StandardError=append:/home/jan/me3/agent.log
+
+[Install]
+WantedBy=multi-user.target
