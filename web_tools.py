@@ -31,32 +31,56 @@ import re
 import html as _html
 import urllib.parse
 import urllib.request
+import urllib.error
 
 USER_AGENT = "BootsVoiceAgent/1.0 (Raspberry Pi; contact: jan)"
 TIMEOUT = float(os.environ.get("WEB_TOOL_TIMEOUT", "8.0"))
 
 
-def _get(url: str, headers=None, timeout=None) -> str:
-    """GET a URL, return the body as text. Fail-soft (returns '' on error)."""
+def _get(url: str, headers=None, timeout=None, retries: int = 2) -> str:
+    """GET a URL, return the body as text. Fail-soft (returns '' on error).
+
+    Retries on transient failures and sets a real User-Agent so content hosts
+    (Wikipedia) don't 403 the default urllib agent. Returns '' on any error so
+    callers can degrade gracefully instead of hanging the pipeline."""
     h = {"User-Agent": USER_AGENT, "Accept": "application/json, text/plain, */*"}
     if headers:
         h.update(headers)
-    req = urllib.request.Request(url, headers=h)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout or TIMEOUT) as r:
-            return r.read().decode("utf-8", errors="replace")
-    except Exception:
-        return ""
+    to = timeout or TIMEOUT
+    last = ""
+    for _ in range(max(1, retries)):
+        req = urllib.request.Request(url, headers=h)
+        try:
+            with urllib.request.urlopen(req, timeout=to) as r:
+                return r.read().decode("utf-8", errors="replace")
+        except urllib.error.HTTPError as e:
+            # 4xx = permanent (bot-blocked / not found) -> stop retrying.
+            if 400 <= e.code < 500:
+                last = ""
+                break
+            last = ""
+        except Exception:
+            last = ""
+        import time as _t
+        _t.sleep(0.4)
+    return last
 
 
 # ---------------------------------------------------------------------------
 # web_search -- Wikipedia opensearch -> REST summary extract
 # ---------------------------------------------------------------------------
 def _web_search(query: str) -> str:
-    """Search the web (via Wikipedia) for `query`, return a spoken summary."""
+    """Search the web (via Wikipedia) for `query`, return a spoken summary.
+
+    Fail-soft and BOUNDED: every network call has a timeout + bounded retries,
+    and if Wikipedia is unreachable/blocked we return a short spoken apology
+    (never a hang), so the voice pipeline is never left wedged on 'Running
+    tool: web_search'."""
     q = (query or "").strip()
     if not q:
         return "I need a search term. What should I look up?"
+
+    blocked = False
 
     # 1) Find candidate article titles + URLs via MediaWiki opensearch.
     api = ("https://en.wikipedia.org/w/api.php?action=opensearch&search="
@@ -64,7 +88,9 @@ def _web_search(query: str) -> str:
            + "&limit=5&namespace=0&format=json&redirects=resolve")
     body = _get(api)
     candidates = []  # list of (title, url)
-    if body:
+    if not body:
+        blocked = True
+    else:
         try:
             data = json.loads(body)
             titles = data[1] if len(data) > 1 else []
@@ -73,7 +99,7 @@ def _web_search(query: str) -> str:
                 u = urls[i] if i < len(urls) else ""
                 candidates.append((t, u))
         except Exception:
-            pass
+            blocked = True
 
     # 2) Fetch the top candidate's REST summary (clean plain-text extract).
     if candidates:
@@ -102,6 +128,11 @@ def _web_search(query: str) -> str:
         except Exception:
             pass
 
+    # Bounded, speakable failure — the pipeline keeps moving.
+    if blocked:
+        return ("I couldn't reach Wikipedia from here right now "
+                "(the connection may be blocked). Try again in a moment, "
+                "or give me a specific web address to open.")
     return (f"I couldn't find a clear result for '{q}' right now. "
             "Try a more specific topic, or give me a web address to open.")
 
@@ -148,10 +179,133 @@ def _fetch_url(url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# check_weather -- current weather via Open-Meteo (no key, no bot-gate).
+#   Geocoding + forecast are both free, keyless, and JSON. Location order:
+#   (1) an explicit place name -> geocoded; (2) stored GPS from the dashboard
+#   (~/.me3_location.json, written by the UI's /location endpoint, or "gps");
+#   (3) a default home location (UP Diliman) so it always works.
+# ---------------------------------------------------------------------------
+_GPS_FILE = os.path.join(os.path.expanduser("~"), ".me3_location.json")
+# Default home = UP Diliman (matches the ME2 tile). lat, lon, label.
+_HOME_LOCATION = (14.6534, 121.0673, "UP Diliman")
+
+# WMO weather-code -> short spoken condition. (Open-Meteo "weathercode" group.)
+_WMO = {
+    0: "clear sky", 1: "mainly clear", 2: "partly cloudy", 3: "overcast",
+    45: "fog", 48: "depositing rime fog",
+    51: "light drizzle", 53: "drizzle", 55: "heavy drizzle",
+    56: "light freezing drizzle", 57: "heavy freezing drizzle",
+    61: "light rain", 63: "rain", 65: "heavy rain",
+    66: "light freezing rain", 67: "heavy freezing rain",
+    71: "light snow", 73: "snow", 75: "heavy snow", 77: "snow grains",
+    80: "light rain showers", 81: "rain showers", 82: "heavy rain showers",
+    85: "light snow showers", 86: "heavy snow showers",
+    95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
+}
+
+
+def _geocode(name: str):
+    """Resolve a place name to (lat, lon, label) via Open-Meteo geocoding.
+    Returns (None, None, None) on failure."""
+    try:
+        url = ("https://geocoding-api.open-meteo.com/v1/search?name="
+               + urllib.parse.quote(name) + "&count=1&language=en&format=json")
+        body = _get(url, timeout=TIMEOUT)
+        if not body:
+            return None, None, None
+        data = json.loads(body)
+        results = data.get("results") or []
+        if not results:
+            return None, None, None
+        r = results[0]
+        label = r.get("name") or name
+        adm = [x for x in (r.get("admin2"), r.get("admin1")) if x]
+        if adm:
+            label = label + ", " + ", ".join(adm[:1])
+        return r.get("latitude"), r.get("longitude"), label
+    except Exception:
+        return None, None, None
+
+
+def _resolve_location(location: str):
+    """Decide which (lat, lon, label) to fetch weather for. See the block
+    comment above for the resolution order. Always returns a 3-tuple."""
+    loc = (location or "").strip()
+    # (2) explicit GPS request or a stored GPS file.
+    if loc.lower() in ("gps", "here", "my location", "current location"):
+        try:
+            if os.path.exists(_GPS_FILE):
+                with open(_GPS_FILE, encoding="utf-8") as f:
+                    g = json.load(f)
+                lat, lon = float(g["lat"]), float(g["lon"])
+                return lat, lon, (g.get("name") or "your saved location")
+        except Exception:
+            pass
+        # No saved GPS -> fall through to default home.
+    # (1) an explicit place name.
+    if loc:
+        lat, lon, label = _geocode(loc)
+        if lat is not None and lon is not None:
+            return lat, lon, label
+        # Unresolvable name: try to geocode as a plain city, else fail-soft home.
+    # (3) default home.
+    return _HOME_LOCATION
+
+
+def _check_weather(location: str = "") -> str:
+    """Current weather for a place. Returns a speakable summary string."""
+    lat, lon, name = _resolve_location(location)
+    if lat is None or lon is None:
+        return "I couldn't figure out that location. Try a city name, or say 'here' to use your saved location."
+    try:
+        url = (f"https://api.open-meteo.com/v1/forecast?latitude={lat}&longitude={lon}"
+               "&current=temperature_2m,apparent_temperature,relative_humidity_2m,"
+               "weather_code,wind_speed_10m,is_day&daily=temperature_2m_max,"
+               "temperature_2m_min,precipitation_probability_max&timezone=auto&forecast_days=1")
+        body = _get(url, timeout=TIMEOUT)
+        if not body:
+            return f"I couldn't reach the weather service for {name}. Please try again."
+        data = json.loads(body)
+        cur = data.get("current") or {}
+        daily = data.get("daily") or {}
+        t_now = cur.get("temperature_2m")
+        feels = cur.get("apparent_temperature")
+        code = cur.get("weather_code")
+        cond = _WMO.get(code, "unremarkable")
+        wind = cur.get("wind_speed_10m")
+        parts = [f"It's {t_now} degrees in {name} right now."]
+        if cond and cond != "unremarkable":
+            parts.append(cond.capitalize() + ".")
+        if feels is not None:
+            parts.append(f"It feels like {feels} degrees.")
+        if wind is not None:
+            parts.append(f"Wind is about {wind} kilometres per hour.")
+        tmax = (daily.get("temperature_2m_max") or [None])[0]
+        tmin = (daily.get("temperature_2m_min") or [None])[0]
+        pmax = (daily.get("precipitation_probability_max") or [None])[0]
+        extras = []
+        if tmax is not None and tmin is not None:
+            extras.append(f"high {tmax} and low {tmin}")
+        if pmax is not None:
+            extras.append(f"{pmax} percent chance of rain")
+        if extras:
+            parts.append("Today: " + ", ".join(extras) + ".")
+        return " ".join(parts)
+    except Exception as e:
+        return f"I hit a problem checking the weather ({e!r}). Please try again."
+
+
+# ---------------------------------------------------------------------------
 # Canonical tool specs (same shape as me2_ui_mcp.TOOL_SPECS)
 # (name, description, params) -- params is the OpenAI JSON-schema "properties".
 # ---------------------------------------------------------------------------
 TOOL_SPECS = [
+    ("check_weather",
+     "Get the CURRENT weather (temperature, conditions, wind) for a place. Use "
+     "when the user asks about the weather, the temperature, or whether it will "
+     "rain. Pass an optional location (a city name, or 'here' to use the "
+     "location the user shared); leave it empty for the default home.",
+     {"location": {"type": "string"}}),
     ("web_search",
      "Search the web for information about a topic or question. Use this when "
      "the user asks a factual question, asks you to look something up, or wants "
@@ -175,6 +329,8 @@ TOOL_SPECS = [
 def dispatch(tool: str, **kw) -> str:
     """Execute a web tool. Returns a string the LLM can speak back to the user."""
     try:
+        if tool == "check_weather":
+            return _check_weather(kw.get("location", ""))
         if tool == "web_search":
             return _web_search(kw.get("query", ""))
         if tool == "fetch_url":
@@ -300,6 +456,11 @@ except Exception:
 mcp = None
 if HAVE_MCP:
     mcp = FastMCP("boots-web")
+
+    @mcp.tool()
+    def check_weather(location: str = "") -> str:
+        """Get the current weather (temp, conditions, wind) for a place."""
+        return _check_weather(location)
 
     @mcp.tool()
     def web_search(query: str) -> str:

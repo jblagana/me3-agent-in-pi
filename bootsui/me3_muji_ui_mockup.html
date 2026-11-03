@@ -293,7 +293,7 @@ async function think(t){const s=thinking();let i=0;
   s.textContent=t;s.classList.remove('cursor');scroll()}
 function tool(name,args){const d=document.createElement('div');d.className='tool';d.innerHTML=`<div class="spin"></div>${name}(${args})`;add(d);return d}
 function toolOk(d,result){d.classList.add('ok');d.innerHTML=`✓ ${d.textContent} → ${result}`}
-function reply(){const d=document.createElement('div');d.className='m agent reply';d.innerHTML=`<div class="who">ME3</div><div class="body"></div><div class="ttsbar"><i></i></div>`;add(d);return d}
+function reply(){const d=document.createElement('div');d.className='m agent reply';d.innerHTML=`<div class="who">BOOTS</div><div class="body"></div>`;add(d);scroll();return d}
 function barge(){const d=document.createElement('div');d.className='barge';d.textContent='⚡ barge-in — TTS ducked, listening';add(d)}
 /* p = sub-chip id (e.g. 'p-play'); the parent card lights up, the chip carries the action */
 function chipRun(p){const c=$(p).closest('.dev');c.classList.remove('hit');c.classList.add('run');$(p).classList.add('run')}
@@ -334,14 +334,14 @@ async function demo(){
   const r1=reply();
   const body1='Sure — lofi is on. Let me know if you want it louder.';
   let i=0;const bar1=r1.querySelector('.ttsbar i');
-  const speak1=setInterval(()=>{i+=2;body1.textContent='';r1.querySelector('.body').textContent=body1.slice(0,i);bar1.style.width=(i/body1.length*100)+'%';scroll()},45);
+  const speak1=setInterval(()=>{i+=2;body1.textContent='';r1.querySelector('.body').textContent=body1.slice(0,i);if(bar1)bar1.style.width=(i/body1.length*100)+'%';scroll()},45);
   await sleep(1400);
 
   // ---- BARGE-IN mid-TTS ----
   clearInterval(speak1);
   r1.querySelector('.body').textContent=body1;
-  r1.classList.add('cut');r1.querySelector('.ttsbar').classList.add('cut');
-  bar1.style.background='var(--red)';
+  r1.classList.add('cut');const tb1=r1.querySelector('.ttsbar');if(tb1)tb1.classList.add('cut');
+  if(bar1)bar1.style.background='var(--red)';
   barge();log('barge-in · TTS ducked','err');
   setVoice('listen','⚡ barge-in — listening','user interrupted mid-TTS');
   step(1,'active');
@@ -357,8 +357,8 @@ async function demo(){
   const r2=reply();
   const body2='Done — opalite is playing now.';
   let j=0;const bar2=r2.querySelector('.ttsbar i');
-  const speak2=setInterval(()=>{j+=3;r2.querySelector('.body').textContent=body2.slice(0,j);bar2.style.width=(j/body2.length*100)+'%';scroll()},40);
-  await sleep(1100);clearInterval(speak2);bar2.style.width='100%';
+  const speak2=setInterval(()=>{j+=3;r2.querySelector('.body').textContent=body2.slice(0,j);if(bar2)bar2.style.width=(j/body2.length*100)+'%';scroll()},40);
+  await sleep(1100);clearInterval(speak2);if(bar2)bar2.style.width='100%';
 
   // ---- turn close: benchmark readout (real latency lands via /ui_state in live mode) ----
   step(5,'done');
@@ -397,7 +397,7 @@ let thinkEl=null;
 function liveThinking(text){if(!text){if(thinkEl)thinkEl.querySelector('span:last-child').classList.remove('cursor');return;}if(!thinkEl)thinkEl=thinking();const s=thinkEl.querySelector('span:last-child');s.textContent=text;s.classList.add('cursor');scroll();}
 function endThinking(){if(thinkEl){thinkEl.querySelector('span:last-child').classList.remove('cursor');thinkEl=null;}}
 let replyEl=null,replyShown='';
-function liveReply(text){if(!text)return;if(!replyEl)replyEl=reply();if(text!==replyShown){replyShown=text;replyEl.querySelector('.body').textContent=text;replyEl.querySelector('.ttsbar i').style.width='100%';scroll();}}
+function liveReply(text){if(!text)return;if(!replyEl)replyEl=reply();if(text!==replyShown){replyShown=text;replyEl.querySelector('.body').textContent=text;scroll();}}
 function liveTool(name,args){if(!name)return;const t=tool(name,args?' ('+args+')':'');const chip=TOOL_TO_CHIP[name];if(chip&&$(chip))chipRun(chip);return t;}
 async function live(){
   let s; try { s=await (await fetch('/ui_state')).json(); } catch(e){ return; }
@@ -408,7 +408,14 @@ async function live(){
   // turn boundary: a new heard starts a fresh turn
   if(m3.heard && m3.heard!==last.heard){ liveHeard(m3.heard); endThinking(); if(replyEl){replyShown='';replyEl=null;} }
   if(ph==='thinking' && m3.response){ liveThinking(m3.response); } else if(ph!=='thinking'){ endThinking(); }
-  if(ph==='speaking' && m3.response){ liveReply(m3.response); }
+  // Reply bubble: render the LLM's spoken reply as soon as it's present. It is
+  // no longer gated strictly on phase==='speaking' -- by the time the 1 s poll
+  // fires the StatusIndicator has usually already flipped phase back to
+  // 'listening' (TTS finished), so a phase gate made the reply bubble never
+  // appear. liveReply() reuses replyEl and only updates it when the text
+  // changes (text!==replyShown), and it is reset on each new turn (above), so
+  // this stays correct.
+  if(m3.response && m3.response!==last.response){ liveReply(m3.response); }
   if(m3.tool && m3.tool!==last.tool){ liveTool(m3.tool, m3.tool_args); }
   last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null};
   if(m3.latency){ const L=m3.latency;

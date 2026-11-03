@@ -59,8 +59,8 @@ STATE = {
     # Live conversation state pushed by the ME3 voice agent (POST /me3).
     # phase: idle|listening|transcribing|thinking|tool|speaking
     "me3": {"phase": "listening", "heard": "", "thinking": "", "response": "",
-            "tool": "", "active": False, "mic": False, "mic_level": 0.0,
-            "last_hb": 0.0, "ts": 0.0},
+            "tool": "", "tool_args": "", "active": False, "mic": False,
+            "mic_level": 0.0, "last_hb": 0.0, "ts": 0.0},
 }
 
 _PAGE_HTML = None  # me2_ui.html bytes (the handover UI) or None
@@ -1169,8 +1169,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path in ("/", "/index.html"):
-            self._send(200, _PAGE_HTML if _PAGE_HTML is not None
-                       else PAGE.encode(), "text/html; charset=utf-8")
+            # The ME3 observability dashboard (/muji) is the primary UI. The
+            # older handover dashboard is preserved at /debug.
+            self.send_response(302)
+            self.send_header("Location", "/muji")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         elif self.path == "/muji":
             # ME3 observability dashboard (muji-styled chat + inspector).
             # Served from me3_muji_ui_mockup.html next to this file when present.
@@ -1236,14 +1241,35 @@ class Handler(BaseHTTPRequestHandler):
             with STATE["lock"]:
                 m3 = STATE["me3"]
                 m3["phase"] = phase
+                # heard: the transcript arrives via _push_heard_to_ui (a separate,
+                # reliable POST); the agent's frame-pushes send empty heard, so we
+                # PRESERVE the last non-empty heard. (obj.get(...) or m3[...]).
                 m3["heard"] = (obj.get("heard") or m3["heard"])[:300]
-                m3["thinking"] = (obj.get("thinking") or "")[:300]
-                m3["response"] = (obj.get("response") or m3["response"])[:400]
-                m3["tool"] = (obj.get("tool") or "")[:120]
+                # thinking/response: the agent's REAL pushes (from
+                # _me3_push/_me3_push_now/_me3_push_state) always include these
+                # keys -- INCLUDING an explicit empty string on turn reset /
+                # LLMFullResponseStart. We must HONOR empty (clear the bubble)
+                # rather than keep the stale previous value. BUT the 2s
+                # liveness heartbeat omits these keys entirely (it only sends
+                # hb/active/phase), so we only touch thinking/response/tool when
+                # the key is actually PRESENT in the payload (via a sentinel).
+                _absent = object()
+                if obj.get("thinking", _absent) is not _absent:
+                    m3["thinking"] = (obj.get("thinking") or "")[:300]
+                if obj.get("response", _absent) is not _absent:
+                    m3["response"] = (obj.get("response") or "")[:400]
+                if obj.get("tool", _absent) is not _absent:
+                    m3["tool"] = (obj.get("tool") or "")[:120]
+                # tool_args: what the LLM passed to the tool (e.g. query=...). Only
+                # updated by a real push (the heartbeat omits these keys).
+                if obj.get("tool_args", _absent) is not _absent:
+                    m3["tool_args"] = (obj.get("tool_args") or "")[:400]
                 m3["mic"] = bool(obj.get("mic", False))
-                m3["active"] = bool(obj.get("active", False))
-                if obj.get("hb") or True:
-                    m3["last_hb"] = time.time()   # any push = agent is alive
+                # active = agent alive (any push, incl. the 2s heartbeat) OR a
+                # non-idle phase. A heartbeat omits 'active', so treat its
+                # presence (last_hb set below) as "alive".
+                m3["active"] = bool(obj.get("hb") or obj.get("active") or phase != "idle")
+                m3["last_hb"] = time.time()   # any push = agent is alive
                 m3["ts"] = time.time()
             self._send(200, b"ok", "text/plain")
         elif self.path == "/me3mic":
@@ -1255,6 +1281,33 @@ class Handler(BaseHTTPRequestHandler):
             with STATE["lock"]:
                 STATE["me3"]["mic_level"] = lvl
                 STATE["me3"]["last_hb"] = time.time()  # mic activity => alive
+            self._send(200, b"ok", "text/plain")
+        elif self.path == "/location":
+            # Browser-shared GPS (the dashboard's "use my location" pin). The
+            # Pi has no built-in GPS, so the dashboard's geolocation feeds it
+            # here; we persist it to ~/.me3_location.json which the voice
+            # agent's check_weather tool reads (GPS fallback for weather).
+            lat = obj.get("lat")
+            lon = obj.get("lon")
+            try:
+                lat = None if lat is None else float(lat)
+                lon = None if lon is None else float(lon)
+            except (TypeError, ValueError):
+                self._send(400, b"bad coords", "text/plain")
+                return
+            if lat is None or lon is None:
+                self._send(400, b"missing lat/lon", "text/plain")
+                return
+            import os as _os, json as _json
+            gps_file = _os.path.join(_os.path.expanduser("~"), ".me3_location.json")
+            try:
+                with open(gps_file, "w", encoding="utf-8") as f:
+                    _json.dump({"lat": lat, "lon": lon,
+                                "name": obj.get("name") or "",
+                                "ts": time.time()}, f)
+            except Exception as e:
+                self._send(500, f"save failed: {e!r}".encode(), "text/plain")
+                return
             self._send(200, b"ok", "text/plain")
         elif self.path == "/state":
             mode = obj.get("mode")
