@@ -80,24 +80,72 @@ V3_PCT = {"20 percent": 20, "60 percent": 60, "100 percent": 100}
 V3_COLOR = {"red": "red", "blue": "blue", "green": "green"}
 
 
+def _free_secs(slot):
+    """any "N seconds" / "N min(utes)" / bare "N" -> seconds (V3 keys still work)."""
+    if slot in V3_TIMER_SEC:
+        return V3_TIMER_SEC[slot]
+    t = str(slot or "").lower()
+    m = re.search(r"(\d+)\s*(minute|min|sec|second|s|\bmin\b|\bsec\b)?", t)
+    if not m:
+        return 0
+    n = int(m.group(1)); unit = (m.group(2) or "").lower()
+    return n * 60 if unit.startswith("min") else n
+
+
 def _timer_secs(slot: str) -> int:
-    """V3 TIMER slot -> seconds (10 / 30 / 60)."""
-    return V3_TIMER_SEC.get(slot, 0)
+    """TIMER slot -> seconds (any duration; V3 keys fast-path)."""
+    return _free_secs(slot)
+
+
+def _free_mark(slot):
+    """any "H AM/PM" / "H:MM AM/PM" / "HH:MM" -> "HH:MM" (V3 keys still work)."""
+    if slot in V3_ALARM_MARK:
+        return V3_ALARM_MARK[slot]
+    t = str(slot or "").upper()
+    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?", t)
+    if not m:
+        return None
+    h = int(m.group(1)); mm = int(m.group(2) or 0); ap = m.group(3)
+    if ap == "PM" and h < 12:
+        h += 12
+    if ap == "AM" and h == 12:
+        h = 0
+    if ap is None and h <= 7:
+        pass  # naive "6" treated as PM-ish morning? keep as-is (h:00)
+    return f"{h % 24:02d}:{mm:02d}"
 
 
 def _alarm_mark(slot: str):
-    """V3 ALARM slot -> 'HH:MM' (6 AM / 8 AM / 9 PM)."""
-    return V3_ALARM_MARK.get(slot)
+    """ALARM slot -> 'HH:MM' (any time; V3 keys fast-path)."""
+    return _free_mark(slot)
+
+
+def _free_deg(slot):
+    """any "N degrees" / "N" -> int degrees (V3 keys still work)."""
+    if slot in V3_DEG:
+        return V3_DEG[slot]
+    m = re.search(r"(\d+)", str(slot or ""))
+    return int(m.group(1)) if m else None
 
 
 def _temp_deg(slot: str):
-    """V3 TEMPERATURE slot -> degrees (18 / 22 / 26)."""
-    return V3_DEG.get(slot)
+    """TEMPERATURE slot -> degrees (any value; V3 keys fast-path)."""
+    return _free_deg(slot)
+
+
+def _free_pct(slot):
+    """any "N percent" / "N%" / "N" -> int 0-100 (V3 keys still work)."""
+    if slot in V3_PCT:
+        return V3_PCT[slot]
+    m = re.search(r"(\d+)", str(slot or ""))
+    if not m:
+        return None
+    return max(0, min(100, int(m.group(1))))
 
 
 def _bright_pct(slot: str):
-    """V3 BRIGHTNESS slot -> percent (20 / 60 / 100)."""
-    return V3_PCT.get(slot)
+    """BRIGHTNESS slot -> percent (any value; V3 keys fast-path)."""
+    return _free_pct(slot)
 
 
 def _lamp_color(slot: str):
@@ -1362,7 +1410,7 @@ class Handler(BaseHTTPRequestHandler):
 PAGE = r"""<!doctype html>
 <html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>BOOTS · ME2</title>
+<title>ME3 · Boots v2</title>
 <style>
 :root{--bg:#0d1117;--card:#161b22;--line:#21262d;--tx:#e6edf3;
 --dim:#8b949e;--blue:#58a6ff;--green:#3fb950;--amber:#d29922}
@@ -1442,7 +1490,7 @@ transition:height .3s}
 @keyframes eq{0%,100%{height:25%}50%{height:100%}}
 .dim{color:var(--dim)}
 </style></head><body><main>
-<header><span class="lamp" id="lamp"></span><h1>BOOTS</h1>
+<header><span class="lamp" id="lamp"></span><h1>ME3 · Boots v2</h1>
 <span class="mode" id="mode">BOOTING…</span>
 <span id="clock"></span></header>
 <div class="card"><div class="k">LAST COMMAND</div>

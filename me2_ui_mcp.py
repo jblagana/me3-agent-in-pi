@@ -61,16 +61,16 @@ TOOL_SPECS = [
                             {"level": {"type": "integer", "minimum": 0, "maximum": 100}}),
     ("boots_lights",        "Turn the lights on or off.",
                             {"action": {"type": "string", "enum": ["on", "off"]}}),
-    ("boots_set_bright",    "Set the light brightness.",
-                            {"level": {"type": "string", "enum": V3["BRIGHTNESS"]}}),
-    ("boots_set_color",     "Set the light color.",
-                            {"color": {"type": "string", "enum": V3["COLOR"]}}),
-    ("boots_set_timer",     "Set a countdown timer.",
-                            {"duration": {"type": "string", "enum": V3["TIMER"]}}),
-    ("boots_set_alarm",     "Set an alarm.",
-                            {"time": {"type": "string", "enum": V3["ALARM"]}}),
-    ("boots_set_temperature", "Set the room temperature.",
-                            {"degrees": {"type": "string", "enum": V3["TEMPERATURE"]}}),
+    ("boots_set_bright",    "Set the light brightness to any level from 0 to 100 percent.",
+                            {"level": {"type": "string"}}),
+    ("boots_set_color",     "Set the light color (any color name).",
+                            {"color": {"type": "string"}}),
+    ("boots_set_timer",     "Set a countdown timer for any duration.",
+                            {"duration": {"type": "string"}}),
+    ("boots_set_alarm",     "Set an alarm for any time of day.",
+                            {"time": {"type": "string"}}),
+    ("boots_set_temperature", "Set the room temperature to any target.",
+                            {"degrees": {"type": "string"}}),
     ("boots_set_reminder",  "Set a reminder.",
                             {"text": {"type": "string"}}),
     ("boots_make_call",     "Place a phone call.",
@@ -100,6 +100,57 @@ TOOL_TO_FIRE = {
 
 
 
+import re as _re
+
+
+def _pct(slot):
+    '''free-form -> int 0-100 (first number), clamped. None if no number.'''
+    m = _re.search(r'\d+', str(slot or ''))
+    if not m: return None
+    return max(0, min(100, int(m.group())))
+
+
+def _num(slot):
+    m = _re.search(r'\d+', str(slot or ''))
+    return int(m.group()) if m else None
+
+
+def _confirm(cmd, slot):
+    '''Value-specific, speakable confirmation the LLM reads back.'''
+    try:
+        if cmd == 'BRIGHTNESS':
+            p = _pct(slot)
+            return f'Brightness set to {p} percent.' if p is not None else 'Brightness updated.'
+        if cmd == 'TEMPERATURE':
+            d = _num(slot)
+            return f'Temperature set to {d} degrees.' if d is not None else 'Temperature updated.'
+        if cmd == 'SET_VOLUME':
+            v = _num(slot)
+            return f'Volume set to {v} percent.' if v is not None else 'Volume updated.'
+        if cmd == 'COLOR':
+            c = (slot or '').strip()
+            return f'Light color set to {c}.' if c else 'Light color updated.'
+        if cmd == 'TIMER':
+            c = (slot or '').strip()
+            return f'Timer set for {c}.' if c else 'Timer set.'
+        if cmd == 'ALARM':
+            c = (slot or '').strip()
+            return f'Alarm set for {c}.' if c else 'Alarm set.'
+        if cmd == 'LIGHT_ON':
+            return 'Lights on.'
+        if cmd == 'LIGHT_OFF':
+            return 'Lights off.'
+        if cmd == 'CREATE_REMINDER':
+            c = (slot or '').strip()
+            return f'Reminder set: {c}.' if c else 'Reminder set.'
+        if cmd == 'CALL':
+            c = (slot or '').strip()
+            return f'Calling {c}.' if c else 'Calling.'
+    except Exception:
+        pass
+    return f'{cmd} done.'
+
+
 def _fire(cmd: str, slot=None) -> str:
     """POST one command to the Boots UI server (:8330/fire). Returns outcome.
 
@@ -114,7 +165,7 @@ def _fire(cmd: str, slot=None) -> str:
     try:
         with urllib.request.urlopen(req, timeout=BOOTS_UI_TIMEOUT) as r:
             r.read()
-        return f"OK: {cmd}"
+        return _confirm(cmd, slot)
     except Exception:
         return OFFLINE_MSG
 
