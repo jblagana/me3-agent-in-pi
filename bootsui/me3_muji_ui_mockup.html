@@ -275,7 +275,14 @@
 const $=id=>document.getElementById(id);
 const msgs=$('msgs');
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
-function scroll(){msgs.scrollTop=msgs.scrollHeight}
+// Sticky auto-scroll: follow new content ONLY if the user is already near the
+// bottom of the thread (so it auto-scrolls by default but never yanks them back
+// when they've scrolled up to read older messages). Scroll after layout via
+// requestAnimationFrame so growing bubbles (streaming text) still reach the end.
+let stickBottom=true;
+msgs.addEventListener('scroll',()=>{stickBottom=(msgs.scrollHeight-msgs.scrollTop-msgs.clientHeight)<48});
+function scroll(force){if(force||stickBottom)requestAnimationFrame(()=>{msgs.scrollTop=msgs.scrollHeight})}
+function pinBottom(){stickBottom=true;scroll(true)}
 function step(n,mode){
   document.querySelectorAll('.step').forEach(s=>{
     const i=+s.dataset.s; s.classList.remove('done','active');
@@ -283,7 +290,7 @@ function step(n,mode){
     if(mode==='active'&&i===n)s.classList.add('active');
   });
 }
-function add(el){msgs.appendChild(el);scroll();return el}
+function add(el){msgs.appendChild(el);scroll();if(el.classList&&el.classList.contains('heard'))pinBottom();return el}
 function heard(t){const d=document.createElement('div');d.className='heard';d.innerHTML=`<span class="tag">🎧 HEARD</span><div class="body"><span class="cursor"></span></div>`;add(d);
   const s=d.querySelector('.body span');let i=0;
   return new Promise(res=>{const iv=setInterval(()=>{s.textContent=t.slice(0,++i);scroll();if(i>=t.length){clearInterval(iv);s.classList.remove('cursor');res()}},28)})}
@@ -443,7 +450,7 @@ function applyDevices(s){
 }
 function startLive(){ if(LIVE) return; live(); setInterval(live,1000); }
 function startDemo(){ setModePill('demo'); demo(); }
-function resetThread(){ msgs.innerHTML=''; last={heard:'',thinking:'',response:'',phase:'idle',mic:0,tool:null}; replyEl=null; replyShown=''; thinkEl=null; }
+function resetThread(){ msgs.innerHTML=''; last={heard:'',thinking:'',response:'',phase:'idle',mic:0,tool:null}; replyEl=null; replyShown=''; thinkEl=null; stickBottom=true; }
 $('btn-replay').onclick=function(){ resetThread(); if(LIVE){ startLive(); } else { startDemo(); } };
 $('btn-theme').onclick=function(){ const h=document.documentElement; h.setAttribute('data-theme', h.getAttribute('data-theme')==='light'?'':'light'); };
 // boot: live if served by the Boots UI server (http/https + /ui_state ok), else demo

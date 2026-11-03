@@ -634,10 +634,22 @@ async def _spotify_handler(params):
 async def _web_handler(params):
     """Route a web tool call to web_tools.dispatch(). ASYNC (pipecat 1.12 awaits
     the handler). Offloaded to a thread so network calls never block the event
-    loop. Returns a string the LLM can speak back to the user."""
+    loop. Returns a string the LLM can speak back to the user.
+
+    `params` is pipecat 1.12's FunctionCallParams dataclass -- it exposes
+    .function_name and .arguments (NOT a dict). The old dict-style
+    params.get("name") raised AttributeError, so check_weather (and every web
+    tool) crashed before running and the LLM got no result to speak."""
     import asyncio
-    tool = params.get("name") if isinstance(params, dict) else None
-    args = params.get("arguments", {}) if isinstance(params, dict) else {}
+    try:
+        tool = getattr(params, "function_name", None) or (params.get("name") if isinstance(params, dict) else None)
+        args = getattr(params, "arguments", None)
+        if args is None and isinstance(params, dict):
+            args = params.get("arguments", {})
+        args = dict(args or {})
+    except Exception:
+        args = {}
+        tool = None
     if not tool:
         return "I couldn't run that web action."
     return await asyncio.to_thread(web.dispatch, tool, **args)
