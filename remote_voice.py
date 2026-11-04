@@ -20,17 +20,28 @@ import numpy as np
 
 from loguru import logger
 
-from pipecat.frames.frames import Frame, TranscriptionFrame, TTSAudioRawFrame, ErrorFrame
+from pipecat.frames.frames import (Frame, TranscriptionFrame, InterimTranscriptionFrame,
+                                   TTSAudioRawFrame, ErrorFrame)
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.services.stt_service import SegmentedSTTService
 from pipecat.services.tts_service import TTSService
 
 # --- Config (overridable via env) -----------------------------------------
+# ASR/TTS provider: "groq" (default) or "dgx3" (legacy DGX3 Qwen2-Audio/Qwen3-TTS).
+# Groq ASR uses the OpenAI-compatible /v1/audio/transcriptions (Whisper) endpoint;
+# DGX3 uses /v1/chat/completions with an input_audio content part.
+ASR_PROVIDER = os.environ.get("ME3_ASR_PROVIDER", "groq")
+# Groq (OpenAI-compatible) credentials + endpoints.
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY",
+                              "***REMOVED-GROQ-KEY***")
+GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
+ASR_MODEL = os.environ.get("ME3_ASR_MODEL", "whisper-large-v3-turbo")
+# DGX3 (legacy fallback for TTS / ASR)
 DGX3_HOST = os.environ.get("ME3_DGX3_HOST", "10.153.60.233")
 ASR_BASE_URL = os.environ.get("ME3_ASR_BASE_URL", f"http://{DGX3_HOST}:8000/v1")
 TTS_BASE_URL = os.environ.get("ME3_TTS_BASE_URL", f"http://{DGX3_HOST}:8001/v1")
 DGX3_API_KEY = os.environ.get("ME3_DGX3_API_KEY",
                               "***REMOVED-DGX3-KEY***")
-ASR_MODEL = os.environ.get("ME3_ASR_MODEL", "Qwen/Qwen2-Audio-7B-Instruct")
 TTS_MODEL = os.environ.get("ME3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 TTS_VOICE = os.environ.get("ME3_TTS_VOICE", "vivian")
 # TTS_SAMPLE_RATE: the rate we hand to the pipeline / welcome path. The DGX3
@@ -38,7 +49,7 @@ TTS_VOICE = os.environ.get("ME3_TTS_VOICE", "vivian")
 # with HTTP 400), so _synthesize resamples 24 kHz -> TTS_SAMPLE_RATE with soxr.
 TTS_SAMPLE_RATE = int(os.environ.get("ME3_TTS_SAMPLE_RATE", "48000"))
 TTS_NATIVE_SR = int(os.environ.get("ME3_TTS_NATIVE_SR", "24000"))  # DGX3 output rate
-NOISE_FLOOR_RMS = float(os.environ.get("ME3_NOISE_FLOOR_RMS", "0.006"))
+NOISE_FLOOR_RMS = float(os.environ.get("ME3_NOISE_FLOOR_RMS", "0.004"))
 
 # --- Lead-in silence (USB first-chunk loss) --------------------------------
 # The EMEET M1A USB output drops the head of every freshly-opened stream
@@ -125,12 +136,75 @@ class Qwen2AudioSTTService(SegmentedSTTService):
         )
         logger.info(f"[asr-dgx3] Qwen2-Audio ASR ready ({ASR_BASE_URL})")
 
+    # FIX (LLM never receives transcript): pipecat 1.12's SegmentedSTTService
+    # pushes the TranscriptionFrame from a background _segment_task. In this
+    # deployment that downstream push lands in the next processor's queue but is
+    # not reliably run, so the frame never reaches the user_aggregator and the
+    # LLM errors with "No user query found" (Boots never replies). We therefore
+    # deliver each TranscriptionFrame directly to the downstream
+    # user_aggregator via the processor chain, bypassing the tapped
+    # StatusIndicator. We do NOT also run the normal super().push_frame for the
+    # transcript, to avoid delivering the user turn twice.
+    async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
+        if direction == FrameDirection.DOWNSTREAM and isinstance(
+                frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            try:
+                # Walk the processor chain: self -> status -> user_aggregator.
+                nxt = getattr(self, "_next", None)
+                for _ in range(3):
+                    if nxt is None:
+                        break
+                    if type(nxt).__name__ == "LLMUserAggregator":
+                        await nxt.queue_frame(frame, FrameDirection.DOWNSTREAM)
+                        return  # delivered; skip the unreliable normal push
+                    nxt = getattr(nxt, "_next", None)
+            except Exception as e:
+                logger.debug(f"[asr-dgx3] aggregator re-deliver failed: {e!r}")
+        await super().push_frame(frame, direction)
+
     def _transcribe_sync(self, wav_b64: str) -> str:
-        """Blocking call to DGX3 ASR. Run via asyncio.to_thread."""
+        """Blocking ASR call. Run via asyncio.to_thread.
+
+        Provider "groq" (default): POST the raw WAV to the OpenAI-compatible
+        Groq /v1/audio/transcriptions (Whisper) endpoint as multipart/form-data.
+        Provider "dgx3" (legacy): POST a chat/completions request with an
+        input_audio content part to the DGX3 Qwen2-Audio service.
+        """
+        import json
+        import urllib.request
+        if ASR_PROVIDER == "groq":
+            return self._transcribe_groq(wav_b64)
+        return self._transcribe_dgx3(wav_b64)
+
+    @staticmethod
+    def _transcribe_groq(wav_b64: str) -> str:
+        """Groq Whisper via /v1/audio/transcriptions.
+
+        Uses the `requests` client (openai SDK's dependency, already in the
+        venv) instead of urllib: Groq's Cloudflare edge (WAF "error 1010")
+        bans urllib's browser signature on the multipart ASR upload, while
+        `requests` passes. Returns the transcript text (may be empty)."""
+        import base64
+        import requests
+        wav_bytes = base64.b64decode(wav_b64)
+        r = requests.post(
+            GROQ_BASE_URL + "/audio/transcriptions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+            files={"file": ("segment.wav", wav_bytes, "audio/wav")},
+            data={"model": ASR_MODEL},
+            timeout=60,
+        )
+        if r.status_code != 200:
+            raise RuntimeError(f"Groq ASR HTTP {r.status_code}: {r.text[:200]}")
+        return (r.json().get("text") or "").strip()
+
+    @staticmethod
+    def _transcribe_dgx3(wav_b64: str) -> str:
+        """Legacy DGX3 Qwen2-Audio ASR via /v1/chat/completions."""
         import json
         import urllib.request
         body = {
-            "model": ASR_MODEL,
+            "model": "Qwen/Qwen2-Audio-7B-Instruct",
             "messages": [{
                 "role": "user",
                 "content": [
@@ -183,10 +257,43 @@ class Qwen2AudioSTTService(SegmentedSTTService):
             text = _clean_transcript(text)
             if text:
                 logger.info(f"[asr-dgx3] transcript: {text!r}")
+                # FIX (UI "heard" bubble): pipecat 1.12's SegmentedSTTService
+                # pushes the TranscriptionFrame from a background _segment_task,
+                # and that downstream push is not reliably delivered to the next
+                # processor (it lands in the process queue but is not run), so
+                # StatusIndicator/LLM never saw the transcript. We therefore push
+                # the transcript straight to the Boots UI here (where we have the
+                # value in hand), guaranteeing the user bubble + heard field.
+                self._push_heard_to_ui(text)
                 yield TranscriptionFrame(text, "", "dgx3")
         except Exception as e:
             logger.error(f"[asr-dgx3] transcription failed: {e!r}")
             yield ErrorFrame(error=f"DGX3 ASR failure: {e!r}")
+
+    def _push_heard_to_ui(self, text: str):
+        """Push the transcript to the Boots UI (me3.heard) in a background thread.
+
+        The pipecat TranscriptionFrame push is unreliable in 1.12 (see run_stt),
+        so we update the UI directly from the value we already have. Best-effort:
+        never raises into the ASR path.
+        """
+        try:
+            import json as _j, os as _os, threading as _t, urllib.request as _u
+            base = _os.environ.get("ME3_BOOTSUI", "http://127.0.0.1:8330")
+
+            def _go():
+                try:
+                    body = {"heard": text[:300], "phase": "listening"}
+                    req = _u.Request(base + "/me3", data=_j.dumps(body).encode("utf-8"),
+                                     headers={"Content-Type": "application/json"}, method="POST")
+                    with _u.urlopen(req, timeout=0.4) as r:
+                        r.read()
+                except Exception:
+                    pass
+
+            _t.Thread(target=_go, daemon=True).start()
+        except Exception:
+            pass
 
     async def cleanup(self):
         if self._client is not None:
