@@ -756,7 +756,6 @@ async function demo(){
   let i=0;const bar1=r1.querySelector('.ttsbar i');
   const speak1=setInterval(()=>{i+=2;body1.textContent='';r1.querySelector('.body').textContent=body1.slice(0,i);if(bar1)bar1.style.width=(i/body1.length*100)+'%';scroll()},45);
   await sleep(1400);
-  cotRow('reply',body1,'reply');
 
   // ---- BARGE-IN mid-TTS ----
   clearInterval(speak1);
@@ -788,7 +787,6 @@ async function demo(){
   // ---- turn close: benchmark readout (real latency lands via /ui_state in live mode) ----
   step(5,'done');
   latency(412,688,704,355,2159);
-  cotRow('reply',body2,'reply');
   cotDone('boots_play_music · 2159 ms');   // demo settle (live mode settles on the latency push)
   setVoice('listen','listening…','turn complete · barge-in armed');
   clearInterval(amb);
@@ -1073,10 +1071,8 @@ async function live(){
   // updates when the text changes; replyEl is reset on each new turn
   // (boundary check above), so one bubble per turn.
   liveReply(m3.response, m3.ts);
-  // CoT reply row: the turn's FINAL text, once. Only when the turn is OUT
-  // (idle/speaking) — during thinking AND tool phases m3.response still
-  // carries the in-flight text, which belongs in the think row.
-  if((ph==='idle'||ph==='speaking') && m3.response && !last.cotReply){ last.cotReply=true; cotRow('reply',m3.response,'reply'); }
+  // No CoT reply row (boss, 2026-11-05): the CoT box keeps only think + tool
+  // rows — the reply already lives in the chat thread bubble.
   if(m3.tool_seq)lastToolSeq=Math.max(lastToolSeq,m3.tool_seq);  // poll-side render marker (SSE sets it too)
   last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null,tool_seq:m3.tool_seq||0,ts:m3.ts||0,cotTotal:last.cotTotal,cotReply:last.cotReply};
   { const L=m3.latency||{};   // null = reset to "–" (turn cleared/in flight)
