@@ -537,11 +537,25 @@ def _install_reply_tap(llm):
                     # phase is safe.
                     _me3_push_state(_LAST_STATUS.get("phase", "thinking"), reply, reply)
             elif isinstance(frame, LLMFullResponseEndFrame):
-                # Finalize: keep whatever was streamed (or the seeded tool phrase
-                # if this was a pure function-call turn with no text).
-                reply = "".join(reply_buf).strip() or _RECENT_TEXT.get("reply") or ""
+                # Finalize: keep whatever was streamed. Fall back to the seeded
+                # tool phrase ONLY when the LLM produced no text (a pure
+                # function-call turn) — the old `or _RECENT_TEXT["reply"]`
+                # could clobber a real reply with the tool phrase if a
+                # FunctionCallResultFrame raced in.
+                reply = "".join(reply_buf).strip()
+                if not reply:
+                    reply = _RECENT_TEXT.get("reply") or ""
                 _RECENT_TEXT["reply"] = reply
                 _RECENT_TEXT["thinking"] = ""  # done; stop the thinking spinner text
+                # Push phase="speaking" at LLM end (2026-11-06): the server
+                # appends a history turn on the speaking->non-speaking
+                # transition, and with the real-phase text pushes above the
+                # phase never reached "speaking" before the turn ended
+                # (TTSStartedFrame's push raced the 2.5s idle timer) -> voice
+                # turns never landed in chat history. The LLM end IS the turn
+                # end for UI purposes; TTSStartedFrame pushes "speaking" again
+                # (no-op) and BotStoppedSpeaking's idle push performs the
+                # speaking->listening transition that finalizes the append.
                 _me3_push_state("speaking", "", reply)
             elif isinstance(frame, FunctionCallResultFrame):
                 result = str(getattr(frame, "result", "") or "").strip()
