@@ -139,7 +139,15 @@ logger.info("components imported")
 _USE_ANSI = sys.stdout.isatty() and os.environ.get("ME3_NO_STATUS", "0") != "1"
 _LAST_STATUS = {"phase": None}
 _RECENT_TEXT = {"transcript": None, "reply": None, "tool": None, "tool_args": None,
-                "thinking": None}
+                "thinking": None, "tool_result": None}
+# Monotonic LLM round counter (2026-11-06): bumped at every
+# LLMFullResponseStartFrame. Pushed to the UI as cot_round so the CoT box
+# gets ONE think row per LLM round (a tool turn has 2+ rounds: plan, then
+# post-tool deliberation) — the 1 Hz poll can't detect round boundaries
+# itself (the agent clears 'thinking' at round end, so a sub-1s round is
+# invisible to it). Global counter (never reset): the UI keys on CHANGE,
+# and it resets its own marker at each turn boundary.
+_LLM_ROUND = {"n": 0}
 
 # Human-readable "Boots is doing X" phrases for tool calls. Groq's Qwen often
 # responds to a command with a pure function call (NO text tokens), so without
@@ -213,6 +221,8 @@ def _me3_push(phase: str, label: str = "") -> None:
         "response": (_RECENT_TEXT.get("reply") or "")[:400],
         "tool": (_RECENT_TEXT.get("tool") or "")[:120],
         "tool_args": (_RECENT_TEXT.get("tool_args") or "")[:400],
+        "cot_round": _LLM_ROUND["n"],
+        "tool_result": (_RECENT_TEXT.get("tool_result") or "")[:200],
         "active": phase != "idle",
     }
 
@@ -329,6 +339,7 @@ class StatusIndicator(FrameProcessor):
             _RECENT_TEXT["tool"] = None
             _RECENT_TEXT["tool_args"] = None
             _RECENT_TEXT["thinking"] = None
+            _RECENT_TEXT["tool_result"] = None
             self._reply_buf = []
             self._thinking_buf = []
             self._mic_active = True
@@ -351,6 +362,7 @@ class StatusIndicator(FrameProcessor):
             _RECENT_TEXT["tool"] = None
             _RECENT_TEXT["tool_args"] = None
             _RECENT_TEXT["thinking"] = None
+            _RECENT_TEXT["tool_result"] = None
             self._reply_buf = []
             self._thinking_buf = []
             self._me3_push_now()
@@ -362,6 +374,10 @@ class StatusIndicator(FrameProcessor):
             self._clear_idle_timer()
             self._reply_buf = []
             self._thinking_buf = []
+            # NOTE: the LLM-round counter (_LLM_ROUND) is bumped in
+            # _install_reply_tap's observer (the reliable hook for every LLM
+            # round in pipecat 1.12) — NOT here, or the round would count
+            # double (both StatusIndicator and the tap see the frame).
             self._set("thinking", "Thinking... (LLM generating reply)")
         # NOTE: LLMTextFrame / LLMFullResponseEndFrame / FunctionCallResultFrame
         # are handled by _install_reply_tap's on_after_push_frame event handler on
@@ -471,6 +487,8 @@ def _me3_push_state(phase: str, thinking: str, reply: str) -> None:
                 "response": (reply or "")[:400],
                 "tool": (_RECENT_TEXT.get("tool") or "")[:120],
                 "tool_args": (_RECENT_TEXT.get("tool_args") or "")[:400],
+                "cot_round": _LLM_ROUND["n"],
+                "tool_result": (_RECENT_TEXT.get("tool_result") or "")[:200],
                 "mic": False, "active": True}
         def _go():
             try:
@@ -521,6 +539,13 @@ def _install_reply_tap(llm):
                 reply_buf.clear()
                 _RECENT_TEXT["reply"] = ""
                 _RECENT_TEXT["thinking"] = ""  # start a fresh reply; stop tool phrase
+                # New LLM round (2026-11-06): bumped HERE (the tap sees every
+                # LLM round in pipecat 1.12, unlike StatusIndicator). The UI's
+                # CoT box keys its think rows on this number — one row per
+                # round (plan, post-tool, ...), and a sub-1s round is still
+                # counted because the number is what the poll sees, not the
+                # (cleared) thinking text.
+                _LLM_ROUND["n"] += 1
                 _me3_push_state(_LAST_STATUS.get("phase", "thinking"), "", "")
             elif isinstance(frame, LLMTextFrame):
                 reply_buf.append(frame.text or "")
@@ -566,6 +591,12 @@ def _install_reply_tap(llm):
                 elif fname:
                     _RECENT_TEXT["reply"] = _tool_phrase(fname)
                 _RECENT_TEXT["thinking"] = ""
+                # Dedicated tool_result field (2026-11-06): the UI flips the
+                # voice tool chip green + settles the card on THIS. It can't
+                # sniff 'response' — the final reply can be IDENTICAL to the
+                # tool result ("Lights are on, boo." is both).
+                if result and result not in ("IN_PROGRESS", "OK"):
+                    _RECENT_TEXT["tool_result"] = result
                 _me3_push_state(_LAST_STATUS.get("phase", "tool"), "",
                                 _RECENT_TEXT.get("reply") or "")
                 logger.info(f"[me3] tool result {fname!r}: {result[:80]!r}")

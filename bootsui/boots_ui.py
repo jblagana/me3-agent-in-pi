@@ -72,6 +72,7 @@ STATE = {
     "me3": {"phase": "listening", "heard": "", "thinking": "", "response": "",
             "tool": "", "tool_args": "", "tool_result": "", "tool_ms": 0,
             "tool_seq": 0, "turn": 0,
+            "cot": "", "cot_round": 0,   # last non-empty thinking per round
             "active": False, "mic": False,
             "mic_level": 0.0, "last_hb": 0.0, "ts": 0.0},
 }
@@ -1268,6 +1269,15 @@ def ui_state_json() -> dict:
 # is a voice proxy — one pipeline, one context). A voice turn is detected as
 # complete when its phase leaves "speaking" with a response present.
 _VOICE_LAST = {"phase": None, "heard": None}
+# Voice CoT round tracking (2026-11-06): the Pi agent's tap pushes the LLM's
+# streamed text as 'thinking' and then CLEARS it ("" on LLMFullResponseEnd /
+# FunctionCallResult). With a 1 Hz poll, a fast round (sub-1s) is missed
+# entirely, and even a caught one vanishes from the CoT box on the next poll.
+# Fix: the server keeps the LAST non-empty thinking per round in m3['cot']
+# (survives the clear) and counts rounds (m3['cot_round']) — a new round
+# starts on empty->non-empty (or a tool call). The UI keys its think row on
+# cot_round, exactly like the typed path keys on the SSE stream.
+_VOICE_ROUND = {"prev": "", "round": 0, "first": True, "t0": 0.0}
 
 def _append_turn(heard: str, response: str) -> None:
     """Append one completed turn (user text + assistant reply) to the shared
@@ -1828,6 +1838,12 @@ class Handler(BaseHTTPRequestHandler):
                 _new_heard = (obj.get("heard") or m3["heard"])[:300]
                 if _new_heard and _new_heard != m3["heard"]:
                     m3["turn"] = m3.get("turn", 0) + 1
+                    # New turn: drop the PREVIOUS turn's tool result so the
+                    # UI's seq-keyed path can't re-flip the old chip green
+                    # (the agent clears its own tool_result on a new
+                    # utterance, but a crashed/late agent could leave it).
+                    m3["tool_result"] = ""
+                    m3["tool_ms"] = 0
                 m3["phase"] = phase
                 # heard: the transcript arrives via _push_heard_to_ui (a separate,
                 # reliable POST); the agent's frame-pushes send empty heard, so we
@@ -1843,11 +1859,62 @@ class Handler(BaseHTTPRequestHandler):
                 # the key is actually PRESENT in the payload (via a sentinel).
                 _absent = object()
                 if obj.get("thinking", _absent) is not _absent:
-                    m3["thinking"] = (obj.get("thinking") or "")[:300]
+                    _nt = (obj.get("thinking") or "")[:300]
+                    m3["thinking"] = _nt
+                    # CoT round tracking (see _VOICE_ROUND above): the agent
+                    # (2026-11-06) pushes its OWN round number (cot_round,
+                    # bumped at LLMFullResponseStart) — authoritative; fall
+                    # back to local empty->non-empty detection for older
+                    # agents. The last non-empty text is kept in m3['cot'] so
+                    # the 1 Hz poll can't miss a fast round and the row
+                    # survives the agent's end-of-round clear.
+                    if obj.get("cot_round", _absent) is not _absent \
+                            and obj.get("cot_round"):
+                        if int(obj["cot_round"]) != m3.get("cot_round", 0):
+                            m3["cot_round"] = int(obj["cot_round"])
+                            _VOICE_ROUND["t0"] = time.time()
+                    elif _nt and not _VOICE_ROUND["prev"]:
+                        m3["cot_round"] = m3.get("cot_round", 0) + 1
+                        _VOICE_ROUND["t0"] = time.time()
+                    if _nt:
+                        m3["cot"] = _nt
+                    _VOICE_ROUND["prev"] = _nt
+                # tool_result: the agent's FunctionCallResultFrame tap pushes
+                # it in a DEDICATED field (2026-11-06) — content-sniffing the
+                # response was rejected: the final reply can be IDENTICAL to
+                # the tool result ("Lights are on, boo." is both), so only an
+                # explicit field is unambiguous. This is what flips the voice
+                # chip green + settles the card.
+                if obj.get("tool_result", _absent) is not _absent:
+                    m3["tool_result"] = (obj.get("tool_result") or "")[:200]
+                    if m3["tool_result"]:
+                        m3["tool_ms"] = int((time.time() - _VOICE_ROUND.get("t0", time.time())) * 1000) \
+                            if _VOICE_ROUND.get("t0") else 0
                 if obj.get("response", _absent) is not _absent:
                     m3["response"] = (obj.get("response") or "")[:400]
                 if obj.get("tool", _absent) is not _absent:
-                    m3["tool"] = (obj.get("tool") or "")[:120]
+                    _ntool = (obj.get("tool") or "")[:120]
+                    _nargs = (obj.get("tool_args") or "")[:400] \
+                        if obj.get("tool_args", _absent) is not _absent \
+                        else m3.get("tool_args") or ""
+                    # VOICE TOOL CHIPS (2026-11-06): the Pi agent pushes tool +
+                    # tool_args but never a tool_seq (that was typed-chat only),
+                    # so the UI's seq-keyed chip path never fired for voice
+                    # turns — no chip, no green settle, no CoT tool row. Detect
+                    # the START of a new tool call here (name+args differ from
+                    # what's stored) and bump the SAME seq the typed path uses:
+                    # result="" at start, the agent's later result push flips
+                    # it green. (The agent never pushes a separate "tool done"
+                    # event — the result arrives with the next LLM text push.)
+                    _new_call = bool(_ntool) and (_ntool != _prev_tool
+                                                  or _nargs != (m3.get("tool_args") or ""))
+                    if _new_call:
+                        m3["tool_seq"] = m3.get("tool_seq", 0) + 1
+                        m3["tool_result"] = ""
+                        m3["tool_ms"] = 0
+                    m3["tool"] = _ntool
+                    if _ntool:
+                        m3["tool_args"] = _nargs
                 # tool_args: what the LLM passed to the tool (e.g. query=...). Only
                 # updated by a real push (the heartbeat omits these keys).
                 if obj.get("tool_args", _absent) is not _absent:

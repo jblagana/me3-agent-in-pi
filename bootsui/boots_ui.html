@@ -862,6 +862,11 @@ function liveReply(text,ts,turnId){
 // tool_seq is a server-side monotonic counter (one per call) so multiple
 // tools per turn each get their own chip and nothing re-renders.
 let lastToolSeq=0,lastToolEl=null;
+// Voice CoT round marker (2026-11-06): the server counts LLM rounds in
+// m3.cot_round (a tool call starts a new one); a change forces a fresh
+// think row (cotThinkLen=Infinity). Reset to 0 at each turn boundary so
+// the new turn's first round always fires.
+let voiceCotRound=0,lastCotText='';
 // Card currently pulsing purple (in-flight tool call). Settled on reply,
 // takeover by a new call, turn boundary (clearPulse), or the 20s timeout.
 let inFlight=null,inFlightT=0,inFlightMin=0,settleTimer=null;
@@ -1013,6 +1018,8 @@ async function live(){
     liveHeard(m3.heard); endThinking(); clearPulse();  // new turn: latest-call pulse is stale
     if(replyEl){replyShown='';replyEl=null;} renderedTs=0; renderedTurn=0;
     cotReset();                                        // new turn: CoT streams fresh
+    voiceCotRound=0;                                   // new turn: first round fires
+    lastCotText='';                                    // new turn: CoT text restarts
     last.cotReply=false;
     last.cotTotal=null;   // the PREVIOUS turn's latency total must not re-fire
     // the settle on the first poll of the new turn (m3.latency lingers until
@@ -1032,7 +1039,20 @@ async function live(){
   // Applied on CHANGE (not phase): a fast turn can finish its LLM round
   // before the next 1 Hz poll, so the thinking text lands while phase is
   // already 'idle' — phase-gating would drop it entirely.
-  if(m3.thinking && m3.thinking!==last.thinking){ cotThink(m3.thinking); }
+  // VOICE (2026-11-06): the Pi agent CLEARS thinking at each round end, so
+  // the poll-side m3.thinking vanishes between rounds and fast rounds are
+  // missed entirely. The server now keeps the last non-empty text per round
+  // in m3.cot and counts rounds in m3.cot_round (a tool call also starts a
+  // new round). A round change forces a FRESH think row (cotThinkLen=Infinity
+  // makes cotThink append instead of overwrite); m3.cot keeps the row's text
+  // visible after the agent's clear. Typed turns leave m3.cot empty — the
+  // SSE handler drives them, m3.thinking is the poll fallback.
+  const cotText=m3.thinking||m3.cot||'';
+  if(m3.cot && m3.cot_round!==voiceCotRound){ voiceCotRound=m3.cot_round; cotThinkLen=Infinity; }
+  // Compare against LAST RENDERED text (not last.thinking): m3.thinking
+  // vanishes on the agent's end-of-round clear, so last.thinking would
+  // re-fire the row every poll once m3.cot takes over.
+  if(cotText && cotText!==lastCotText){ lastCotText=cotText; cotThink(cotText); }
   // (the orange in-thread THINKING bubble is GONE — the CoT box is the
   //  thinking surface; typed turns stream it via /chat_stream SSE, voice
   //  turns via this poll. liveThinking/endThinking removed.)
