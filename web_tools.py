@@ -1,21 +1,22 @@
 #!/usr/bin/env python3
-# Boots  -- Web tools (real FastMCP server + native function-calling layer).
+# Boots  -- Web tools (TOOL_SPECS + dispatch; MCP facade lives in mcp_server.py).
 #
-# Two tools the voice agent can use:
+# Tools the voice agent can use:
 #   1. web_search   -- "search the web for X" -> Wikipedia opensearch + REST
 #                      summary extract (reliable, no API key, no bot-gate).
 #   2. fetch_url    -- "look at this webpage / read X" -> fetch a URL and return
 #                      its readable text (for a specific page the user names).
+#   3. check_weather / write_website -- weather lookup + simple site builder.
 #
-# ARCHITECTURE (mirrors me2_ui_mcp.py, see its D11 note):
-#   * This file is BOTH a standalone FastMCP server (`python3 web_tools.py`
-#     runs `mcp.run()`) AND a plain module the agent imports for its native
-#     FunctionSchema layer (`from web_tools import TOOL_SPECS, dispatch`).
-#   * agent.py cannot host pipecat 1.12's MCPService on this stack, so the
-#     RUNNING voice agent calls dispatch() directly via FunctionSchema handlers.
-#     The FastMCP server is real and runnable -- it satisfies the classwork
-#     "build & run your MCP servers (on RPi)" requirement and can be demoed
-#     standalone with `mcp dev` or a standard MCP client.
+# ARCHITECTURE (mirrors me2_tools.py, see its D11 note):
+#   * This file is a plain module: TOOL_SPECS + dispatch(). The agent imports
+#     it for its native FunctionSchema layer; mcp_server.py imports it for the
+#     unified MCP facade (one process, all tools, stdio transport).
+#   * agent.py cannot host pipecat 1.12's MCPService on this stack (D11), so
+#     the RUNNING voice agent calls dispatch() directly via FunctionSchema
+#     handlers. The classwork "build & run your MCP servers (on RPi)"
+#     requirement is satisfied by mcp_server.py, runnable standalone with
+#     `python3 mcp_server.py` or any MCP client / `mcp dev`.
 #
 # Why Wikipedia for "web search" (no key, no bot-gate):
 #   DuckDuckGo's HTML endpoint is bot-gated from the Pi's IP (CAPTCHA wall).
@@ -67,18 +68,79 @@ def _get(url: str, headers=None, timeout=None, retries: int = 2) -> str:
 
 
 # ---------------------------------------------------------------------------
-# web_search -- Wikipedia opensearch -> REST summary extract
+# Tavily -- real web search (primary when a key is available)
+# ---------------------------------------------------------------------------
+def _tavily_key() -> str:
+    """Tavily key: TAVILY_API_KEY env first, else Windows Credential Manager
+    (same store muji uses: target 'muji', key 'tavily_api_key')."""
+    k = os.environ.get("TAVILY_API_KEY", "").strip()
+    if k:
+        return k
+    try:
+        import keyring
+        k = keyring.get_password("muji", "tavily_api_key") or ""
+    except Exception:
+        k = ""
+    return k.strip()
+
+
+def _tavily_search(query: str, max_results: int = 4) -> str:
+    """One bounded Tavily search -> spoken summary. Returns '' on any failure
+    (the caller then falls back to Wikipedia)."""
+    key = _tavily_key()
+    if not key:
+        return ""
+    try:
+        req = urllib.request.Request(
+            "https://api.tavily.com/search",
+            data=json.dumps({
+                "api_key": key,
+                "query": query,
+                "max_results": max_results,
+                "search_depth": "basic",
+                "include_answer": True,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as r:
+            data = json.loads(r.read().decode("utf-8", "replace"))
+        answer = (data.get("answer") or "").strip()
+        results = data.get("results") or []
+        bits = []
+        for res in results[:max_results]:
+            title = (res.get("title") or "").strip()
+            url = (res.get("url") or "").strip()
+            content = (res.get("content") or "").strip()[:300]
+            if title or content:
+                bits.append(f"{title}. {content} ({url})")
+        if answer:
+            return f"Here's what I found about {query}: {answer[:500]}"
+        if bits:
+            return f"Here's what I found about {query}: " + " ".join(bits)[:800]
+        return ""
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# web_search -- Tavily (primary) -> Wikipedia opensearch fallback
 # ---------------------------------------------------------------------------
 def _web_search(query: str) -> str:
-    """Search the web (via Wikipedia) for `query`, return a spoken summary.
+    """Search the web (Tavily first, Wikipedia fallback) for `query`.
 
     Fail-soft and BOUNDED: every network call has a timeout + bounded retries,
-    and if Wikipedia is unreachable/blocked we return a short spoken apology
-    (never a hang), so the voice pipeline is never left wedged on 'Running
-    tool: web_search'."""
+    and if both sources are unreachable/blocked we return a short spoken
+    apology (never a hang), so the voice pipeline is never left wedged on
+    'Running tool: web_search'."""
     q = (query or "").strip()
     if not q:
         return "I need a search term. What should I look up?"
+
+    # 0) Tavily (real web index) when a key is available (env or keyring).
+    tav = _tavily_search(q)
+    if tav:
+        return tav
 
     blocked = False
 
@@ -128,7 +190,7 @@ def _web_search(query: str) -> str:
         except Exception:
             pass
 
-    # Bounded, speakable failure — the pipeline keeps moving.
+    # Bounded, speakable failure â€” the pipeline keeps moving.
     if blocked:
         return ("I couldn't reach Wikipedia from here right now "
                 "(the connection may be blocked). Try again in a moment, "
@@ -241,7 +303,9 @@ def _resolve_location(location: str):
                 return lat, lon, (g.get("name") or "your saved location")
         except Exception:
             pass
-        # No saved GPS -> fall through to default home.
+        # No saved GPS -> default home. Do NOT fall through to _geocode:
+        # the geocoder resolves the literal word "here" to Hères, France.
+        return _HOME_LOCATION
     # (1) an explicit place name.
     if loc:
         lat, lon, label = _geocode(loc)
@@ -296,15 +360,15 @@ def _check_weather(location: str = "") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Canonical tool specs (same shape as me2_ui_mcp.TOOL_SPECS)
+# Canonical tool specs (same shape as me2_tools.TOOL_SPECS)
 # (name, description, params) -- params is the OpenAI JSON-schema "properties".
 # ---------------------------------------------------------------------------
 TOOL_SPECS = [
     ("check_weather",
      "Get the CURRENT weather (temperature, conditions, wind) for a place. Use "
      "when the user asks about the weather, the temperature, or whether it will "
-     "rain. Pass an optional location (a city name, or 'here' to use the "
-     "location the user shared); leave it empty for the default home.",
+     "rain. Pass a location only when the user names a place (a city name); "
+     "leave it empty otherwise — never guess or pass 'here'.",
      {"location": {"type": "string"}}),
     ("web_search",
      "Search the web for information about a topic or question. Use this when "
@@ -316,13 +380,35 @@ TOOL_SPECS = [
      "Use when the user says 'open', 'read', or 'look at' a particular webpage.",
      {"url": {"type": "string"}}),
     ("write_website",
-     "Build a simple website about a topic and serve it in a browser. Use when "
-     "the user asks you to 'make', 'create', 'build', or 'write' a website/webpage/"
-     "web page about something. You will be given the topic, a title, and a "
-     "description; returns the URL where the page can be opened.",
+     "Build a modern website about a topic and serve it in a browser. Use when "
+     "the user asks you to 'make', 'create', 'build', or 'write' a website/"
+     "webpage/web page about something. YOU write the content: set "
+     "description to a short lede (1-2 sentences) and sections to 4-6 "
+     "sections, each with a heading, a body paragraph (2-4 sentences of real "
+     "prose), and 2-4 key points. The tool renders them into a themed page "
+     "with a sticky outline and returns the URL. Pick a hue (0-360) that fits "
+     "the topic's mood (e.g. 195 ocean, 35 bakery, 265 space, 120 forest, 0 "
+     "red-alert) so the page's theme matches the subject; leave empty to "
+     "auto-pick. Set publish=true ONLY when the user explicitly asks to "
+     "publish/host it publicly on GitHub; otherwise leave it false.",
      {"topic": {"type": "string"},
       "title": {"type": "string"},
-      "description": {"type": "string"}}),
+      "description": {"type": "string"},
+      "sections": {"type": "array",
+                   "items": {"type": "object",
+                             "properties": {
+                                 "heading": {"type": "string"},
+                                 "body": {"type": "string"},
+                                 "points": {"type": "array",
+                                            "items": {"type": "string"}}},
+                             "required": ["heading", "body"]}},
+      "sources": {"type": "array",
+                  "items": {"type": "object",
+                            "properties": {
+                                "title": {"type": "string"},
+                                "url": {"type": "string"}}}},
+      "hue": {"type": "integer"},
+      "publish": {"type": "boolean"}}),
 ]
 
 
@@ -337,7 +423,10 @@ def dispatch(tool: str, **kw) -> str:
             return _fetch_url(kw.get("url", ""))
         if tool == "write_website":
             return _write_website(kw.get("topic", ""), kw.get("title", ""),
-                                  kw.get("description", ""))
+                                  kw.get("description", ""),
+                                  kw.get("hue"), kw.get("publish", False),
+                                  sections=kw.get("sections"),
+                                  sources=kw.get("sources"))
         return f"I don't know how to do '{tool}'."
     except Exception as e:
         # Fail-soft: never crash the agent on a web error.
@@ -345,7 +434,7 @@ def dispatch(tool: str, **kw) -> str:
 
 
 # ---------------------------------------------------------------------------
-# write_website -- generate a simple HTML page and serve it on the Boots UI
+# write_website -- adaptive-theme site builder + optional GitHub Pages publish
 # ---------------------------------------------------------------------------
 import time as _time
 
@@ -356,79 +445,295 @@ SITES_DIR = os.environ.get("WEBSITES_DIR",
 _SITE_HOST = os.environ.get("WEBSITE_HOST", "192.168.1.3")
 _SITE_PORT = os.environ.get("WEBSITE_PORT", "8330")
 
+# GitHub Pages publish (opt-in via publish=true).
+_GH_REPO = os.environ.get("WEBSITE_GH_REPO", "jblagana/boots-sites")
+_GH_PAGES = os.environ.get("WEBSITE_PAGES_URL",
+                           "https://jblagana.github.io/boots-sites")
+_GH_CACHE = os.environ.get("WEBSITE_GH_CACHE",
+                           os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        ".gh_boots_sites"))
+
 
 def _slugify(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return s or "site"
 
 
-def _write_website(topic: str, title: str, description: str) -> str:
-    """Generate a simple, self-contained HTML page and save it to SITES_DIR.
+def _hue_for(topic: str, hue=None) -> int:
+    """Pick the theme hue: explicit (validated) > deterministic hash of topic."""
+    try:
+        h = int(hue)
+        if 0 <= h <= 360:
+            return h % 360
+    except (TypeError, ValueError):
+        pass
+    return sum(ord(c) for c in (topic or "site").lower()) % 360
 
-    Returns a spoken message with the URL the user can open in a browser.
-    The page is a clean single-file site (inline CSS) about the given topic,
-    built from the LLM-provided title/description.
-    """
+
+def _esc(s: str) -> str:
+    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def _render_site(title: str, topic: str, description: str, hue: int,
+                 sections=None, sources=None) -> str:
+    """Modern single-file page: one hue drives the whole palette (HSL vars).
+
+    Content is LLM-authored: `sections` is a list of {heading, body,
+    points[]} and `sources` a list of {title, url}. When sections are empty
+    the page falls back to a lede-only layout (never a blank page)."""
+    desc = (description or "").strip() or (
+        "A page about " + (topic or "this topic") +
+        ", generated by the Boots voice agent on a Raspberry Pi.")
+
+    # --- normalize sections -------------------------------------------------
+    secs = []
+    for i, s in enumerate(sections or []):
+        if not isinstance(s, dict):
+            continue
+        h = (s.get("heading") or "").strip()
+        b = (s.get("body") or "").strip()
+        pts = [p.strip() for p in (s.get("points") or [])
+               if isinstance(p, str) and p.strip()][:6]
+        if not h and not b:
+            continue
+        secs.append({"id": "s" + str(i + 1),
+                     "heading": h or ("Section " + str(i + 1)),
+                     "body": b, "points": pts})
+
+    toc = "\n".join(
+        f'      <a href="#{s["id"]}">{_esc(s["heading"])}</a>' for s in secs)
+    toc_nav = (f'<nav class="toc"><span class="toc-label">Outline</span>'
+               f'<div class="toc-links">{toc}</div></nav>'
+               if secs else "")
+
+    if secs:
+        cards = []
+        for s in secs:
+            pts = ("\n        <ul>\n"
+                   + "\n".join(f"          <li>{_esc(p)}</li>" for p in s["points"])
+                   + "\n        </ul>" if s["points"] else "")
+            body = (f'\n        <p>{_esc(s["body"])}</p>' if s["body"] else "")
+            cards.append(f'    <section class="sec" id="{s["id"]}">'
+                         f'\n      <h2>{_esc(s["heading"])}</h2>'
+                         f"{body}{pts}\n    </section>")
+        body_html = "\n".join(cards)
+    else:
+        body_html = (f'    <section class="sec" id="s1">'
+                     f'\n      <h2>About</h2>\n      <p>{_esc(desc)}</p>'
+                     f'\n    </section>')
+
+    srcs = [s for s in (sources or [])
+            if isinstance(s, dict) and (s.get("url") or s.get("title"))][:10]
+    if srcs:
+        def _src_li(s):
+            if s.get("url"):
+                label = _esc(s.get("title") or s["url"])
+                return '      <li><a href="' + _esc(s["url"]) + '">' + label + "</a></li>"
+            return "      <li>" + _esc(s.get("title") or "") + "</li>"
+        items = "\n".join(_src_li(s) for s in srcs)
+        sources_html = (f'  <section class="sec sources" id="sources">'
+                        f'\n    <h2>Sources</h2>\n    <ol>\n{items}\n    </ol>\n  </section>')
+    else:
+        sources_html = ""
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{_esc(title)}</title>
+<style>
+:root {{
+  --h: {hue};
+  --bg: hsl(var(--h) 25% 7%);
+  --surface: hsl(var(--h) 20% 11%);
+  --line: hsl(var(--h) 30% 24%);
+  --ink: hsl(var(--h) 15% 92%);
+  --muted: hsl(var(--h) 12% 62%);
+  --accent: hsl(var(--h) 85% 62%);
+  --accent-soft: hsl(var(--h) 85% 62% / .14);
+}}
+* {{ box-sizing: border-box; }}
+html {{ scroll-behavior: smooth; }}
+body {{
+  margin: 0; background: var(--bg); color: var(--ink); line-height: 1.65;
+  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+}}
+.hero {{
+  position: relative; overflow: hidden; text-align: center;
+  padding: 96px 24px 72px; border-bottom: 1px solid var(--line);
+}}
+.hero::before {{
+  content: ""; position: absolute; inset: -40% -10% auto; height: 160%;
+  background: radial-gradient(ellipse at 50% 0%,
+              hsl(var(--h) 85% 60% / .22), transparent 60%);
+  pointer-events: none;
+}}
+.eyebrow {{
+  display: inline-block; font-size: .8rem; letter-spacing: .18em;
+  text-transform: uppercase; color: var(--accent);
+  border: 1px solid var(--line); border-radius: 999px;
+  padding: 6px 14px; margin-bottom: 22px; background: var(--accent-soft);
+}}
+.hero h1 {{
+  margin: 0 auto 14px; max-width: 18ch; font-size: clamp(2.4rem, 6vw, 4.2rem);
+  line-height: 1.08; letter-spacing: -0.025em; font-weight: 750;
+}}
+.hero p {{
+  margin: 0 auto; max-width: 56ch; color: var(--muted); font-size: 1.05rem;
+}}
+.hero .rule {{
+  width: 72px; height: 3px; margin: 30px auto 0; border-radius: 2px;
+  background: linear-gradient(90deg, var(--accent), transparent);
+}}
+main {{ max-width: 880px; margin: 0 auto; padding: 48px 20px 24px; }}
+.grid {{
+  display: grid; gap: 18px; grid-template-columns: 1fr;
+}}
+@media (min-width: 720px) {{ .grid {{ grid-template-columns: 1fr 1fr; }} }}
+.card {{
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; padding: 26px;
+}}
+.card h2 {{
+  margin: 0 0 10px; font-size: 1.12rem; letter-spacing: -0.01em;
+  color: var(--accent);
+}}
+.card p, .card li {{ color: var(--muted); }}
+.card ul {{ margin: 0; padding-left: 18px; }}
+.card li {{ margin-bottom: 6px; }}
+main {{
+  max-width: 720px; margin: 0 auto; padding: 36px 24px 8px;
+}}
+.toc {{
+  position: sticky; top: 0; z-index: 5;
+  display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
+  padding: 12px 0; margin-bottom: 26px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: blur(6px);
+  border-bottom: 1px solid var(--line);
+}}
+.toc-label {{
+  font-size: .72rem; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--muted); margin-right: 6px;
+}}
+.toc-links {{ display: flex; flex-wrap: wrap; gap: 4px 14px; }}
+.toc-links a {{
+  color: var(--muted); text-decoration: none; font-size: .88rem;
+  padding: 2px 0; border-bottom: 1px solid transparent;
+}}
+.toc-links a:hover {{ color: var(--accent); border-bottom-color: var(--accent); }}
+.sec {{
+  margin-bottom: 34px; scroll-margin-top: 64px;
+}}
+.sec h2 {{
+  margin: 0 0 10px; font-size: 1.35rem; letter-spacing: -0.015em;
+  color: var(--ink);
+}}
+.sec p {{ color: var(--muted); margin: 0 0 12px; }}
+.sec ul {{
+  margin: 0; padding: 0; list-style: none;
+  display: grid; gap: 8px;
+}}
+.sec li {{
+  color: var(--muted); font-size: .95rem;
+  padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px;
+  background: var(--surface);
+}}
+.sec li::before {{
+  content: ""; display: inline-block; width: 7px; height: 7px;
+  border-radius: 50%; background: var(--accent);
+  margin-right: 10px; vertical-align: middle;
+}}
+.sources ol {{ padding-left: 20px; }}
+.sources li {{
+  background: none; border: none; padding: 0; margin-bottom: 6px;
+  font-size: .88rem;
+}}
+.sources li::before {{ display: none; }}
+footer {{
+  text-align: center; padding: 40px 20px 56px; color: var(--muted);
+  font-size: .85rem; border-top: 1px solid var(--line); margin-top: 32px;
+}}
+a {{ color: var(--accent); }}
+</style>
+</head>
+<body>
+  <header class="hero">
+    <span class="eyebrow">{_esc(topic or "Boots site")}</span>
+    <h1>{_esc(title)}</h1>
+    <p>{_esc(desc)}</p>
+    <div class="rule"></div>
+  </header>
+  <main>
+{toc_nav}
+{body_html}
+{sources_html}
+  </main>
+  <footer>Generated by Boots &middot; Raspberry Pi &middot; {_esc(_time.strftime('%Y-%m-%d %H:%M'))}</footer>
+</body>
+</html>"""
+
+
+def _gh_publish(slug: str, html: str) -> str:
+    """Opt-in: commit the page to the GitHub Pages repo and push.
+
+    Returns a spoken status line. Fail-soft: any git/network error becomes a
+    spoken message, never an exception. Uses the machine's git credential
+    manager for auth (no token in code)."""
+    import subprocess, shutil
+    if not shutil.which("git"):
+        return "I couldn't publish it publicly (git isn't available on this machine)."
+
+    def _git(*args, cwd=None, timeout=90):
+        return subprocess.run(["git", *args], cwd=cwd, timeout=timeout,
+                              capture_output=True, text=True)
+
+    try:
+        if not os.path.isdir(os.path.join(_GH_CACHE, ".git")):
+            r = _git("clone", f"https://github.com/{_GH_REPO}.git", _GH_CACHE)
+            if r.returncode != 0:
+                return ("I couldn't reach the GitHub publish repo "
+                        f"({_GH_REPO}) to publish the page.")
+        r = _git("-C", _GH_CACHE, "pull", "--rebase", "origin", "HEAD")
+        # pull may fail on a brand-new empty repo; that's fine, keep going.
+        with open(os.path.join(_GH_CACHE, slug + ".html"), "w", encoding="utf-8") as f:
+            f.write(html)
+        r = _git("-C", _GH_CACHE, "add", slug + ".html")
+        r = _git("-C", _GH_CACHE, "commit", "-m", f"Boots: {slug}")
+        if r.returncode != 0 and "nothing to commit" not in (r.stdout + r.stderr):
+            return f"I hit a problem publishing the page ({(r.stderr or r.stdout).strip()[:120]})."
+        r = _git("-C", _GH_CACHE, "push", "origin", "HEAD")
+        if r.returncode != 0:
+            return (f"I couldn't push the page to GitHub ({(r.stderr or r.stdout).strip()[:120]}). "
+                    "It's still live on the LAN.")
+        return (f"It's also been published to GitHub Pages at "
+                f"{_GH_PAGES}/{slug}.html - it goes live in a couple of minutes.")
+    except subprocess.TimeoutExpired:
+        return "Publishing to GitHub took too long, so I stopped. It's still live on the LAN."
+    except Exception as e:
+        return f"Publishing to GitHub failed ({e!r}). It's still live on the LAN."
+
+
+def _write_website(topic: str, title: str, description: str,
+                   hue=None, publish=False, sections=None, sources=None) -> str:
+    """Generate an adaptive-theme page, save to SITES_DIR, optionally publish.
+
+    Content is LLM-authored (sections/sources); the tool only renders and
+    serves. Returns a spoken message with the LAN URL (always) and, when
+    publish is true, the GitHub Pages URL."""
     topic = (topic or "").strip()
     title = (title or "").strip() or topic or "Untitled page"
     description = (description or "").strip()
     if not topic and not description:
         return "Tell me what the website should be about and I'll build it."
 
-    # Sanitize for HTML.
-    def esc(s):
-        return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
-
+    h = _hue_for(topic, hue)
     slug = _slugify(title or topic) + "-" + str(int(_time.time() * 1000) % 100000)
     os.makedirs(SITES_DIR, exist_ok=True)
     path = os.path.join(SITES_DIR, slug + ".html")
 
-    # Build a simple but presentable single-file page.
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{esc(title)}</title>
-<style>
-  :root {{ --ink:#1a1a2e; --accent:#4361ee; --bg:#f7f8fc; }}
-  * {{ box-sizing:border-box; }}
-  body {{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-         color:var(--ink); background:var(--bg); line-height:1.6; }}
-  header {{ background:linear-gradient(135deg,#4361ee,#3a0ca3); color:#fff;
-          padding:48px 24px; text-align:center; }}
-  header h1 {{ margin:0 0 8px; font-size:2.2rem; }}
-  header p {{ margin:0; opacity:.9; }}
-  main {{ max-width:720px; margin:32px auto; padding:0 20px; }}
-  .card {{ background:#fff; border-radius:12px; padding:24px; margin-bottom:20px;
-         box-shadow:0 2px 12px rgba(0,0,0,.06); }}
-  .card h2 {{ margin-top:0; color:var(--accent); }}
-  footer {{ text-align:center; padding:24px; color:#888; font-size:.9rem; }}
-  a {{ color:var(--accent); }}
-</style>
-</head>
-<body>
-  <header>
-    <h1>{esc(title)}</h1>
-    <p>{esc(topic)}</p>
-  </header>
-  <main>
-    <div class="card">
-      <h2>About</h2>
-      <p>{esc(description) if description else "This is a simple website generated by the Boots voice agent on a Raspberry Pi. It demonstrates the agent's ability to build and serve basic web pages."}</p>
-    </div>
-    <div class="card">
-      <h2>Highlights</h2>
-      <ul>
-        <li>Built and served live by the Boots ME3 full-duplex voice agent.</li>
-        <li>Generated on command via the <code>write_website</code> MCP tool.</li>
-        <li>Single self-contained HTML file (no external dependencies).</li>
-      </ul>
-    </div>
-  </main>
-  <footer>Generated by Boots &middot; Raspberry Pi &middot; {esc(_time.strftime('%Y-%m-%d %H:%M'))}</footer>
-</body>
-</html>"""
+    html = _render_site(title, topic, description, h,
+                        sections=sections, sources=sources)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
@@ -436,52 +741,18 @@ def _write_website(topic: str, title: str, description: str) -> str:
         return f"I couldn't save the website file ({e!r})."
 
     url = f"http://{_SITE_HOST}:{_SITE_PORT}/site/{slug}.html"
-    return (f"Done! I built a simple website about {topic or title} and saved it. "
-            f"You can open it in your browser at {url}")
+    n_sec = len([s for s in (sections or [])
+                 if isinstance(s, dict) and ((s.get("heading") or "").strip()
+                                             or (s.get("body") or "").strip())])
+    msg = (f"Done! I built a website about {topic or title} with {n_sec} "
+           f"{'section' if n_sec == 1 else 'sections'} and saved it. "
+           f"You can open it in your browser at {url}")
+    if publish:
+        msg += " " + _gh_publish(slug, html)
+    return msg
 
 
-
-# ---------------------------------------------------------------------------
-# Real FastMCP server (standalone) -- satisfies the classwork "build & run
-# your MCP servers (on RPi)" requirement. Run it with:  python3 web_tools.py
-# (or `mcp dev` / point any MCP client at it). The agent uses dispatch() above
-# because pipecat 1.12's MCPService is incompatible on this stack (D11).
-# ---------------------------------------------------------------------------
-try:
-    from mcp.server.fastmcp import FastMCP
-    HAVE_MCP = True
-except Exception:
-    HAVE_MCP = False
-
-mcp = None
-if HAVE_MCP:
-    mcp = FastMCP("boots-web")
-
-    @mcp.tool()
-    def check_weather(location: str = "") -> str:
-        """Get the current weather (temp, conditions, wind) for a place."""
-        return _check_weather(location)
-
-    @mcp.tool()
-    def web_search(query: str) -> str:
-        """Search the web (Wikipedia) for a topic and return a short summary."""
-        return _web_search(query)
-
-    @mcp.tool()
-    def fetch_url(url: str) -> str:
-        """Open a specific web page and return its readable text."""
-        return _fetch_url(url)
-
-    @mcp.tool()
-    def write_website(topic: str, title: str, description: str) -> str:
-        """Build a simple website about a topic and return its served URL."""
-        return _write_website(topic, title, description)
-
-
-if __name__ == "__main__":
-    if HAVE_MCP and mcp:
-        mcp.run()
-    else:
-        print("FastMCP not available; use this file via the agent's function-calling layer.",
-              file=sys.stderr)
-
+# NOTE: the standalone FastMCP server that used to live here was removed -
+# the canonical MCP server is mcp_server.py (one process, all tools).
+# This module is consumed via its TOOL_SPECS + dispatch() by both the agent
+# (direct function-calling, D11) and mcp_server.py (MCP facade).

@@ -1,0 +1,29 @@
+[Unit]
+# Boots UI server on :8330 — now the ME3 observability UI.
+#
+# This unit used to run the ME2-stack server from /home/jan/me2/me2_ui.py.
+# It now runs the ME3 copy (cloned to ~/me3) which is a strict superset:
+#   /fire (wake + agent tools), /me3 + /me3mic (agent live state),
+#   /ui_state (1 Hz poll), and the NEW /muji dashboard.
+#
+# Reuses the existing ~/me2/.venv (the UI is stdlib + the same runtime deps),
+# so no reinstall is needed when the code is updated via git.
+#
+# ROLLBACK (old ME2 server): change ExecStart back to
+#   /home/jan/me2/.venv/bin/python /home/jan/me2/me2_ui.py --dir /home/jan/me2 --port 8330
+Description=Boots UI server (port 8330, ME3 /muji observability dashboard)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=jan
+WorkingDirectory=/home/jan/me3/bootsui
+ExecStart=/home/jan/me3/.venv/bin/python /home/jan/me3/bootsui/me2_ui.py --dir /home/jan/me3/bootsui --port 8330
+Restart=always
+RestartSec=3
+StandardOutput=append:/home/jan/me3/bootsui/ui.log
+StandardError=append:/home/jan/me3/bootsui/ui.log
+
+[Install]
+WantedBy=multi-user.target

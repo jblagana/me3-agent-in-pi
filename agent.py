@@ -117,7 +117,7 @@ from pipecat.processors.frame_processor import FrameProcessor
 
 # make sibling modules importable regardless of how agent.py is launched
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import me2_ui_mcp as ui
+import me2_tools as ui
 import web_tools as web
 import spotify_tools as sp
 from piper_tts import PiperLocalTTSService
@@ -566,6 +566,10 @@ class InputGate(FrameProcessor):
 
     async def process_frame(self, frame, direction):
         from pipecat.frames.frames import InputAudioRawFrame
+        _n = getattr(self, "_dbg_n", 0)
+        if _n < 8:
+            self._dbg_n = _n + 1
+            logger.info(f"[micdbg] frame type={type(frame).__name__} hasaudio=%s dir=%s", hasattr(frame, "audio"), getattr(frame, "direction", "?"))
         if isinstance(frame, InputAudioRawFrame):
             # FIX: compute a live mic level (RMS) on the RAW audio *before* the
             # gate mutes it, so the UI level meter reflects what the mic hears.

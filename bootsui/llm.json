@@ -1,0 +1,1 @@
+{"label": "HPC \u00b7 vLLM", "base_url": "http://202.92.159.240:8001/v1", "api_key": "***REMOVED-HPC-KEY***", "model": "Qwen/Qwen3.8-27B", "thinking": "off", "provider": "hpc"}
