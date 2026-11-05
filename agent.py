@@ -675,6 +675,69 @@ class InputGate(FrameProcessor):
         _t.Thread(target=_go, daemon=True).start()
 
 
+
+# ---------------------------------------------------------------------------
+# MCP bridge (2026-11-06): Boots runs its tools through the MCP server
+# (mcp_server.py) over stdio -- the same MCP path an external client uses.
+# The 5 handlers below call _MCP.call() first; if the bridge is down they
+# fall back to direct dispatch() so voice never dies on an MCP hiccup.
+# ---------------------------------------------------------------------------
+class _MCPBridge:
+    def __init__(self):
+        self._session = None
+        self.available = False
+        self._stack = None
+        self.calls_via_mcp = 0
+        self.calls_fallback = 0
+
+    async def start(self):
+        try:
+            from contextlib import AsyncExitStack
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+            here = os.path.dirname(os.path.abspath(__file__))
+            params = StdioServerParameters(
+                command=os.path.join(here, ".venv", "bin", "python"),
+                args=[os.path.join(here, "mcp_server.py")],
+                cwd=here)
+            self._stack = AsyncExitStack()
+            r, w = await self._stack.enter_async_context(stdio_client(params))
+            self._session = await self._stack.enter_async_context(ClientSession(r, w))
+            await self._session.initialize()
+            tools = await self._session.list_tools()
+            self.available = True
+            logger.info("[mcp] bridge up: %d tools via mcp_server.py (stdio)"
+                        % len(tools.tools))
+        except Exception as e:
+            self.available = False
+            logger.error("[mcp] bridge failed to start: %r "
+                         "(handlers fall back to direct dispatch)" % (e,))
+
+    async def call(self, tool, args):
+        """Return the tool result string via MCP, or None to signal fallback."""
+        if not self.available or self._session is None:
+            return None
+        try:
+            res = await asyncio.wait_for(
+                self._session.call_tool(tool, dict(args or {})), timeout=25)
+            text = "".join(getattr(c, "text", "") or "" for c in res.content)
+            self.calls_via_mcp += 1
+            logger.info("[mcp] ran %s via bridge (%d total)" % (tool, self.calls_via_mcp))
+            return text or "(tool returned nothing)"
+        except Exception as e:
+            logger.warning("[mcp] call %s failed: %r" % (tool, e))
+            return None
+
+    async def close(self):
+        try:
+            if self._stack is not None:
+                await self._stack.aclose()
+        except Exception:
+            pass
+
+_MCP = _MCPBridge()
+
+
 async def _spotify_handler(params):
     """Route a Spotify function call to spotify_tools.dispatch().
 
@@ -685,7 +748,11 @@ async def _spotify_handler(params):
     for older pipecat compatibility."""
     import asyncio as _aio, functools as _ft
     args = dict(params.arguments or {})
-    result = await _aio.to_thread(_ft.partial(sp.dispatch, params.function_name), **args)
+    result = await _MCP.call(params.function_name, args)
+    if result is None:
+        # bridge down -- direct dispatch fallback
+        result = await _aio.to_thread(_ft.partial(sp.dispatch, params.function_name), **args)
+        _MCP.calls_fallback += 1
     try:
         if getattr(params, "result_callback", None) is not None:
             await params.result_callback(result)
@@ -716,7 +783,11 @@ async def _web_handler(params):
     if not tool:
         result = "I couldn't run that web action."
     else:
-        result = await asyncio.to_thread(web.dispatch, tool, **args)
+        result = await _MCP.call(tool, args)
+        if result is None:
+            # bridge down -- direct dispatch fallback
+            result = await asyncio.to_thread(web.dispatch, tool, **args)
+            _MCP.calls_fallback += 1
     # 2026-11-06 toolfix: report via result_callback (see _spotify_handler).
     try:
         if getattr(params, "result_callback", None) is not None:
@@ -733,7 +804,11 @@ async def _ui_handler(params):
     _spotify_handler) so the tool result reaches the LLM and the UI."""
     import asyncio as _aio, functools as _ft
     args = dict(params.arguments or {})
-    result = await _aio.to_thread(_ft.partial(ui.dispatch, params.function_name), **args)
+    result = await _MCP.call(params.function_name, args)
+    if result is None:
+        # bridge down -- direct dispatch fallback
+        result = await _aio.to_thread(_ft.partial(ui.dispatch, params.function_name), **args)
+        _MCP.calls_fallback += 1
     try:
         if getattr(params, "result_callback", None) is not None:
             await params.result_callback(result)
@@ -749,7 +824,11 @@ async def _files_handler(params):
     so the tool result reaches the LLM and the UI."""
     import asyncio as _aio, functools as _ft
     args = dict(params.arguments or {})
-    result = await _aio.to_thread(_ft.partial(ft.dispatch, params.function_name), **args)
+    result = await _MCP.call(params.function_name, args)
+    if result is None:
+        # bridge down -- direct dispatch fallback
+        result = await _aio.to_thread(_ft.partial(ft.dispatch, params.function_name), **args)
+        _MCP.calls_fallback += 1
     try:
         if getattr(params, "result_callback", None) is not None:
             await params.result_callback(result)
@@ -765,7 +844,11 @@ async def _shell_handler(params):
     so the tool result reaches the LLM and the UI."""
     import asyncio as _aio, functools as _ft
     args = dict(params.arguments or {})
-    result = await _aio.to_thread(_ft.partial(sh.dispatch, params.function_name), **args)
+    result = await _MCP.call(params.function_name, args)
+    if result is None:
+        # bridge down -- direct dispatch fallback
+        result = await _aio.to_thread(_ft.partial(sh.dispatch, params.function_name), **args)
+        _MCP.calls_fallback += 1
     try:
         if getattr(params, "result_callback", None) is not None:
             await params.result_callback(result)
@@ -1078,6 +1161,7 @@ async def run_bot():
     status = StatusIndicator(state=gate_state)
     _me3_heartbeat()   # FIX: liveness heartbeat (UI: LISTENING vs OFF)
 
+    await _MCP.start()
     context = LLMContext(tools=_function_schemas())
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context, user_params=LLMUserAggregatorParams(vad_analyzer=vad))
