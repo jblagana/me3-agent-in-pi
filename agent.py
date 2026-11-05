@@ -120,6 +120,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import me2_tools as ui
 import web_tools as web
 import spotify_tools as sp
+import files_tools as ft
 from piper_tts import PiperLocalTTSService
 from asr import WhisperCPPSTTService
 from remote_voice import (Qwen2AudioSTTService, Qwen3TTSService,
@@ -709,6 +710,22 @@ async def _ui_handler(params):
     return result
 
 
+async def _files_handler(params):
+    """Route a file tool call to files_tools.dispatch().
+
+    Same result_callback contract as the other handlers (2026-11-06 toolfix)
+    so the tool result reaches the LLM and the UI."""
+    import asyncio as _aio, functools as _ft
+    args = dict(params.arguments or {})
+    result = await _aio.to_thread(_ft.partial(ft.dispatch, params.function_name), **args)
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
+
+
 def _normalize_props(p):
     """Return a valid JSON-schema `properties` dict for a tool's param dict.
 
@@ -743,6 +760,8 @@ def _function_schemas():
         out.append(FunctionSchema(n, d, _normalize_props(p), list(p.keys()), handler=_spotify_handler))
     for (n, d, p) in web.TOOL_SPECS:
         out.append(FunctionSchema(n, d, _normalize_props(p), list(p.keys()), handler=_web_handler))
+    for (n, d, p) in ft.TOOL_SPECS:
+        out.append(FunctionSchema(n, d, _normalize_props(p), list(p.keys()), handler=_files_handler))
     return out
 
 
