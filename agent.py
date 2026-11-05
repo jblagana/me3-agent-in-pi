@@ -643,10 +643,22 @@ class InputGate(FrameProcessor):
 
 
 async def _spotify_handler(params):
-    """Route a Spotify function call to spotify_tools.dispatch(). ASYNC (pipecat 1.12 awaits the handler)."""
+    """Route a Spotify function call to spotify_tools.dispatch().
+
+    2026-11-06 toolfix: pipecat 1.12 handlers must report via
+    params.result_callback(result) -- returning a value is ignored, so the
+    FunctionCallResultFrame never fired, the LLM re-prompt never ran, and
+    voice tool turns hung on the in-flight spinner. Callback + return kept
+    for older pipecat compatibility."""
     import asyncio as _aio, functools as _ft
     args = dict(params.arguments or {})
-    return await _aio.to_thread(_ft.partial(sp.dispatch, params.function_name), **args)
+    result = await _aio.to_thread(_ft.partial(sp.dispatch, params.function_name), **args)
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
 
 
 async def _web_handler(params):
@@ -669,15 +681,32 @@ async def _web_handler(params):
         args = {}
         tool = None
     if not tool:
-        return "I couldn't run that web action."
-    return await asyncio.to_thread(web.dispatch, tool, **args)
+        result = "I couldn't run that web action."
+    else:
+        result = await asyncio.to_thread(web.dispatch, tool, **args)
+    # 2026-11-06 toolfix: report via result_callback (see _spotify_handler).
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
 
 
 async def _ui_handler(params):
-    """Route a Boots UI function call to ui.dispatch() -> Boots UI server :8330. ASYNC (pipecat 1.12 awaits the handler)."""
+    """Route a Boots UI function call to ui.dispatch() -> Boots UI server :8330.
+
+    2026-11-06 toolfix: report via params.result_callback(result) (see
+    _spotify_handler) so the tool result reaches the LLM and the UI."""
     import asyncio as _aio, functools as _ft
     args = dict(params.arguments or {})
-    return await _aio.to_thread(_ft.partial(ui.dispatch, params.function_name), **args)
+    result = await _aio.to_thread(_ft.partial(ui.dispatch, params.function_name), **args)
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
 
 
 def _normalize_props(p):
