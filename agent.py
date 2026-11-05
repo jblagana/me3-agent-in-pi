@@ -527,11 +527,15 @@ def _install_reply_tap(llm):
                 if reply:
                     _RECENT_TEXT["reply"] = reply
                     _RECENT_TEXT["thinking"] = reply  # thinking bubble shows live text too
-                    # Push with phase="speaking" so the RESPONSE bubble renders
-                    # the live reply (the dashboard only draws liveReply for
-                    # phase=="speaking"). StatusIndicator's own phase pushes will
-                    # keep correcting the real listening/speaking state.
-                    _me3_push_state("speaking", reply, reply)
+                    # Push with the REAL phase (2026-11-06 dup-bubble fix):
+                    # forcing "speaking" per token made the UI see
+                    # thinking->speaking->thinking... per token, and the server
+                    # appends a history turn on EVERY speaking->non-speaking
+                    # transition -> N identical assistant bubbles. The UI
+                    # renders the reply bubble whenever phase==speaking OR the
+                    # turn just finished (its own liveReply gate), so the real
+                    # phase is safe.
+                    _me3_push_state(_LAST_STATUS.get("phase", "thinking"), reply, reply)
             elif isinstance(frame, LLMFullResponseEndFrame):
                 # Finalize: keep whatever was streamed (or the seeded tool phrase
                 # if this was a pure function-call turn with no text).

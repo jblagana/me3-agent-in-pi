@@ -71,7 +71,7 @@ STATE = {
     # phase: idle|listening|transcribing|thinking|tool|speaking
     "me3": {"phase": "listening", "heard": "", "thinking": "", "response": "",
             "tool": "", "tool_args": "", "tool_result": "", "tool_ms": 0,
-            "tool_seq": 0,
+            "tool_seq": 0, "turn": 0,
             "active": False, "mic": False,
             "mic_level": 0.0, "last_hb": 0.0, "ts": 0.0},
 }
@@ -1275,7 +1275,25 @@ def _append_turn(heard: str, response: str) -> None:
     try:
         if not (response or "").strip():
             return
+        # heard may be empty (the boot greeting has no user utterance) —
+        # the assistant entry is still appended so the greeting survives a
+        # refresh (it used to vanish because the append required heard).
         with STATE["lock"]:
+            # DEDUPE (2026-11-06): the same (heard, response) pair may only be
+            # appended ONCE. The Pi's reply-tap used to force phase="speaking"
+            # on every LLM token while the real phase was still "thinking", so
+            # the phase bounced thinking->speaking per token and this handler
+            # (which appends on every speaking->non-speaking transition) wrote
+            # the SAME reply to history once per token — the UI then rendered
+            # N identical assistant bubbles. With the tap fixed the phase is
+            # clean, but this guard makes the history append idempotent either
+            # way.
+            _h = STATE["chat_history"]
+            _prev = _h[-1] if _h else None
+            if _prev and _prev.get("role") == "assistant" \
+                    and _prev.get("content") == response[:400] \
+                    and (not heard or (len(_h) >= 2 and _h[-2].get("content") == heard[:400])):
+                return
             if heard:
                 STATE["chat_history"].append(
                     {"role": "user", "content": heard[:400]})
@@ -1802,6 +1820,14 @@ class Handler(BaseHTTPRequestHandler):
             with STATE["lock"]:
                 m3 = STATE["me3"]
                 _prev_tool = m3.get("tool") or ""
+                # turn: monotonic per-voice-turn id (2026-11-06). Bumped when a
+                # NEW heard text arrives. The UI keys its reply bubble on this
+                # (not on m3.ts, which moves on EVERY push — a mid-turn ts bump
+                # made the poll mint a fresh bubble per re-push, and the
+                # heard-only boundary reset mid-stream did the same).
+                _new_heard = (obj.get("heard") or m3["heard"])[:300]
+                if _new_heard and _new_heard != m3["heard"]:
+                    m3["turn"] = m3.get("turn", 0) + 1
                 m3["phase"] = phase
                 # heard: the transcript arrives via _push_heard_to_ui (a separate,
                 # reliable POST); the agent's frame-pushes send empty heard, so we
@@ -2017,6 +2043,7 @@ class Handler(BaseHTTPRequestHandler):
                 m3["phase"] = "thinking"
                 m3["latency"] = None
                 m3["heard"] = msg[:400]
+                m3["turn"] = m3.get("turn", 0) + 1  # typed turn = fresh id
                 m3["thinking"] = ""
                 m3["response"] = ""
                 m3["tool"] = ""
@@ -2114,6 +2141,7 @@ class Handler(BaseHTTPRequestHandler):
                 # linger while this turn is in flight
                 m3["latency"] = None
                 m3["heard"] = msg[:400]  # typed text shows as the HEARD bubble
+                m3["turn"] = m3.get("turn", 0) + 1  # typed turn = fresh id
                 m3["thinking"] = ""
                 m3["response"] = ""
                 m3["tool"] = ""

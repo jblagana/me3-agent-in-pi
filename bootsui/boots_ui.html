@@ -832,23 +832,26 @@ function liveHeard(text){if(!text||text===last.heard)return;const d=document.cre
 //  the CoT box. The CoT box is the single thinking surface: SSE for typed
 //  turns, the /ui_state poll for voice turns.)
 function endThinking(){}  // no-op: the in-thread thinking bubble is gone (CoT box is the surface)
-let replyEl=null,replyShown='',renderedTs=0;
+let replyEl=null,replyShown='',renderedTs=0,renderedTurn=0;
 // Turn-aware dedupe: a bubble renders once PER TURN (keyed on the server's
-// m3.ts, stamped at turn start+end), not once per unique text. Text-only
-// dedupe broke both ways: repeated identical replies ("Lights are on."
-// twice) skipped the second bubble, and a refresh re-appended the last
-// one (replyShown synced, then the poll "saw" new text). renderedTs is
-// synced in rebuildChat so a reload never redraws the final turn.
-function liveReply(text,ts){
+// m3.turn — a monotonic id bumped when a NEW heard text arrives), not once
+// per unique text. m3.ts was tried and rejected as the key: it moves on
+// EVERY push, so a mid-turn ts bump minted a fresh bubble per re-push.
+// Text-only dedupe broke both ways: repeated identical replies ("Lights are
+// on." twice) skipped the second bubble, and a refresh re-appended the last
+// one (replyShown synced, then the poll "saw" new text). renderedTs and
+// renderedTurn are synced in rebuildChat so a reload never redraws the
+// final turn.
+function liveReply(text,ts,turnId){
   if(!text)return;
   // Check BEFORE creating: the first poll after a refresh sees text===
   // replyShown && ts===renderedTs (rebuildChat already drew the bubble and
   // synced both) — creating reply() first left a hollow empty BOOTS bubble
   // behind (the refresh duplicate).
   if(text===replyShown && ts===renderedTs)return;
-  const isNewTurn=!replyEl||ts!==renderedTs;
+  const isNewTurn=!replyEl||turnId!==renderedTurn;
   if(isNewTurn)replyEl=reply();
-  replyShown=text; renderedTs=ts||0;
+  replyShown=text; renderedTs=ts||0; renderedTurn=turnId||0;
   replyEl.querySelector('.body').textContent=text; scroll();
   // NOTE: the CoT reply row is driven from live() (only when the turn is OUT
   // of the thinking phase) — during thinking, m3.response is in-flight text
@@ -952,9 +955,12 @@ function rebuildChat(s){
   renderedTs=m3.ts||0;  // the last bubble is already drawn by the loop above —
                         // mark its turn rendered so the first poll doesn't
                         // re-append it (the refresh-duplicate fix)
+  renderedTurn=m3.turn||0;  // same, keyed on the turn id (liveReply's key)
   last.tool=m3.tool||null;
   last.tool_seq=m3.tool_seq||0;
   last.ts=m3.ts||0;
+  last.turn=m3.turn||0;  // without this the first poll after a refresh sees a
+                         // turn mismatch and drops/re-mints the last bubble
   pinBottom();
 }
 // Command log is server-side now (persists across refresh). The server is
@@ -993,20 +999,31 @@ async function live(){
   const m3=s.me3||{}; const ph=m3.phase||'idle'; const pm=PHASE_MAP[ph]||PHASE_MAP.idle;
   setVoice(pm.mode, pm.st, pm.sub);
   setMicLevel(Math.round((m3.mic_level||0)*100));
-  // turn boundary: a NEW heard text. (A ts-based boundary was tried and
-  // rejected: m3.ts moves on every server push, so the first poll after a
-  // refresh fired a "new turn" reset, then liveReply re-appended the last
-  // bubble — duplicate after refresh. Repeated identical messages are
-  // covered by liveReply's renderedTs guard instead.)
+  // turn boundary: a NEW heard text (2026-11-06). A (heard,response) pair
+  // key was tried and rejected: the agent re-pushes the same heard while the
+  // reply streams in, so the pair changed mid-turn and the full reset
+  // (liveHeard + replyEl=null) re-minted the HEARD bubble and the reply
+  // bubble per token — the "replicated assistant replies" bug. heard-only
+  // is the stable key (a new utterance = a new turn); the reply-side reset
+  // is split out below so a mid-turn text change can't re-run liveHeard.
+  // (A ts-based boundary was rejected earlier: m3.ts moves on every server
+  // push, so the first poll after a refresh fired a "new turn" reset, then
+  // liveReply re-appended the last bubble — duplicate after refresh.)
   if(m3.heard && m3.heard!==last.heard){
     liveHeard(m3.heard); endThinking(); clearPulse();  // new turn: latest-call pulse is stale
-    if(replyEl){replyShown='';replyEl=null;} renderedTs=0;
+    if(replyEl){replyShown='';replyEl=null;} renderedTs=0; renderedTurn=0;
     cotReset();                                        // new turn: CoT streams fresh
     last.cotReply=false;
     last.cotTotal=null;   // the PREVIOUS turn's latency total must not re-fire
     // the settle on the first poll of the new turn (m3.latency lingers until
     // the next turn's reset push) — that would mark the fresh CoT "done"
     // before it streams a single step.
+  }
+  // Reply-side reset (no liveHeard): the server's m3.turn id bumps on a new
+  // heard, so a turnId mismatch = fresh turn — drop the in-flight bubble
+  // without re-rendering the HEARD bubble.
+  if(m3.heard && m3.turn && m3.turn!==(last.turn||0)){
+    if(replyEl){replyShown='';replyEl=null;} renderedTs=0; renderedTurn=0;
   }
   // CoT think row = the model's REAL reasoning stream (m3.thinking, pushed
   // by the server from the response's reasoning/reasoning_content field).
@@ -1070,11 +1087,29 @@ async function live(){
   // earlier tick, it's already above. liveReply() reuses replyEl and only
   // updates when the text changes; replyEl is reset on each new turn
   // (boundary check above), so one bubble per turn.
-  liveReply(m3.response, m3.ts);
+  //
+  // Render gate (2026-11-06): the Pi's reply-tap now pushes the reply text
+  // with the REAL phase (it used to force "speaking" per token — that phase
+  // bounce is what minted one bubble per token, see the server's _append_turn
+  // dedupe). While the LLM is still generating, phase is "thinking", so the
+  // in-flight text streams into the CoT think row (m3.thinking mirrors it on
+  // the Pi) and the bubble renders from the moment the turn leaves thinking
+  // (speaking) or the reply is final (phase back to idle/listening with text
+  // present). The bubble's text keeps updating until the next turn's
+  // boundary reset, so late final text still lands in the same bubble.
+  if(ph==='speaking'||(m3.response&&ph!=='thinking')){
+    // turnId mismatch: a NEW turn with the SAME heard text (the heard
+    // boundary above can't fire on repeats) — drop the stale bubble so
+    // liveReply mints a fresh one.
+    if(m3.turn && m3.turn!==renderedTurn && replyEl){
+      replyShown=''; replyEl=null; renderedTs=0;
+    }
+    liveReply(m3.response, m3.ts, m3.turn||0);
+  }
   // No CoT reply row (boss, 2026-11-05): the CoT box keeps only think + tool
   // rows — the reply already lives in the chat thread bubble.
   if(m3.tool_seq)lastToolSeq=Math.max(lastToolSeq,m3.tool_seq);  // poll-side render marker (SSE sets it too)
-  last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null,tool_seq:m3.tool_seq||0,ts:m3.ts||0,cotTotal:last.cotTotal,cotReply:last.cotReply};
+  last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null,tool_seq:m3.tool_seq||0,ts:m3.ts||0,turn:m3.turn||0,cotTotal:last.cotTotal,cotReply:last.cotReply};
   { const L=m3.latency||{};   // null = reset to "–" (turn cleared/in flight)
     [['asr','b-asr','l-asr'],['llm','b-llm','l-llm'],['tool','b-tool','l-tool'],['tts','b-tts','l-tts']].forEach(([k,b,l])=>{
       const v=L[k];
