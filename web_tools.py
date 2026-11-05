@@ -37,7 +37,6 @@ import urllib.error
 USER_AGENT = "BootsVoiceAgent/1.0 (Raspberry Pi; contact: jan)"
 TIMEOUT = float(os.environ.get("WEB_TOOL_TIMEOUT", "8.0"))
 
-
 def _get(url: str, headers=None, timeout=None, retries: int = 2) -> str:
     """GET a URL, return the body as text. Fail-soft (returns '' on error).
 
@@ -66,7 +65,6 @@ def _get(url: str, headers=None, timeout=None, retries: int = 2) -> str:
         _t.sleep(0.4)
     return last
 
-
 # ---------------------------------------------------------------------------
 # Tavily -- real web search (primary when a key is available)
 # ---------------------------------------------------------------------------
@@ -82,7 +80,6 @@ def _tavily_key() -> str:
     except Exception:
         k = ""
     return k.strip()
-
 
 def _tavily_search(query: str, max_results: int = 4) -> str:
     """One bounded Tavily search -> spoken summary. Returns '' on any failure
@@ -121,7 +118,6 @@ def _tavily_search(query: str, max_results: int = 4) -> str:
         return ""
     except Exception:
         return ""
-
 
 # ---------------------------------------------------------------------------
 # web_search -- Tavily (primary) -> Wikipedia opensearch fallback
@@ -198,14 +194,12 @@ def _web_search(query: str) -> str:
     return (f"I couldn't find a clear result for '{q}' right now. "
             "Try a more specific topic, or give me a web address to open.")
 
-
 # ---------------------------------------------------------------------------
 # fetch_url -- fetch a specific web page and return its readable text
 # ---------------------------------------------------------------------------
 _TAG_RE = re.compile(r"<(script|style|noscript|svg)[^>]*>.*?</\1>", re.S | re.I)
 _TAG_STRIP_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
-
 
 def _strip_html(raw: str) -> str:
     """Remove scripts/styles/tags, unescape entities, collapse whitespace."""
@@ -214,7 +208,6 @@ def _strip_html(raw: str) -> str:
     t = _html.unescape(t)
     t = _WS_RE.sub(" ", t).strip()
     return t
-
 
 def _fetch_url(url: str) -> str:
     """Fetch a webpage and return its readable text (truncated for speech)."""
@@ -238,7 +231,6 @@ def _fetch_url(url: str) -> str:
         return f"I loaded {u} but couldn't find readable text on it."
     snippet = text[:700]
     return f"From {host}: {snippet}"
-
 
 # ---------------------------------------------------------------------------
 # check_weather -- current weather via Open-Meteo (no key, no bot-gate).
@@ -265,7 +257,6 @@ _WMO = {
     95: "thunderstorm", 96: "thunderstorm with light hail", 99: "thunderstorm with heavy hail",
 }
 
-
 def _geocode(name: str):
     """Resolve a place name to (lat, lon, label) via Open-Meteo geocoding.
     Returns (None, None, None) on failure."""
@@ -287,7 +278,6 @@ def _geocode(name: str):
         return r.get("latitude"), r.get("longitude"), label
     except Exception:
         return None, None, None
-
 
 def _resolve_location(location: str):
     """Decide which (lat, lon, label) to fetch weather for. See the block
@@ -314,7 +304,6 @@ def _resolve_location(location: str):
         # Unresolvable name: try to geocode as a plain city, else fail-soft home.
     # (3) default home.
     return _HOME_LOCATION
-
 
 def _check_weather(location: str = "") -> str:
     """Current weather for a place. Returns a speakable summary string."""
@@ -358,7 +347,6 @@ def _check_weather(location: str = "") -> str:
     except Exception as e:
         return f"I hit a problem checking the weather ({e!r}). Please try again."
 
-
 # ---------------------------------------------------------------------------
 # Canonical tool specs (same shape as me2_tools.TOOL_SPECS)
 # (name, description, params) -- params is the OpenAI JSON-schema "properties".
@@ -382,15 +370,21 @@ TOOL_SPECS = [
     ("write_website",
      "Build a modern website about a topic and serve it in a browser. Use when "
      "the user asks you to 'make', 'create', 'build', or 'write' a website/"
-     "webpage/web page about something. YOU write the content: set "
-     "description to a short lede (1-2 sentences) and sections to 4-6 "
-     "sections, each with a heading, a body paragraph (2-4 sentences of real "
-     "prose), and 2-4 key points. The tool renders them into a themed page "
-     "with a sticky outline and returns the URL. Pick a hue (0-360) that fits "
+     "webpage/web page about something. RESEARCH FIRST: call web_search 2-3 "
+     "times and fetch_url on 2+ of the best results, then write the content "
+     "from what you actually read — every number, date, and name must come "
+     "from a source you fetched, and those pages go in `sources` (never "
+     "invent stats). YOU write the content: description = short lede (1-2 "
+     "sentences); sections = 4-6 sections, each {heading, body (2-4 sentences "
+     "of real prose), points (2-4 key points)}; a section may set "
+     "kind='timeline' (points become 'Year — event' entries on a vertical "
+     "spine) when the topic has a clear history. Set stats to 3-4 headline "
+     "numbers {value, label} (real figures from your sources) for a stat band "
+     "under the hero. The tool renders a themed page, verifies it renders, "
+     "and returns the URL + verification status. Pick a hue (0-360) that fits "
      "the topic's mood (e.g. 195 ocean, 35 bakery, 265 space, 120 forest, 0 "
-     "red-alert) so the page's theme matches the subject; leave empty to "
-     "auto-pick. Set publish=true ONLY when the user explicitly asks to "
-     "publish/host it publicly on GitHub; otherwise leave it false.",
+     "red-alert); leave empty to auto-pick. Set publish=true ONLY when the "
+     "user explicitly asks to publish/host it publicly on GitHub.",
      {"topic": {"type": "string"},
       "title": {"type": "string"},
       "description": {"type": "string"},
@@ -399,9 +393,17 @@ TOOL_SPECS = [
                              "properties": {
                                  "heading": {"type": "string"},
                                  "body": {"type": "string"},
+                                 "kind": {"type": "string",
+                                          "enum": ["prose", "timeline"]},
                                  "points": {"type": "array",
                                             "items": {"type": "string"}}},
                              "required": ["heading", "body"]}},
+      "stats": {"type": "array",
+                "items": {"type": "object",
+                          "properties": {
+                              "value": {"type": "string"},
+                              "label": {"type": "string"}},
+                          "required": ["value", "label"]}},
       "sources": {"type": "array",
                   "items": {"type": "object",
                             "properties": {
@@ -410,7 +412,6 @@ TOOL_SPECS = [
       "hue": {"type": "integer"},
       "publish": {"type": "boolean"}}),
 ]
-
 
 def dispatch(tool: str, **kw) -> str:
     """Execute a web tool. Returns a string the LLM can speak back to the user."""
@@ -426,12 +427,12 @@ def dispatch(tool: str, **kw) -> str:
                                   kw.get("description", ""),
                                   kw.get("hue"), kw.get("publish", False),
                                   sections=kw.get("sections"),
-                                  sources=kw.get("sources"))
+                                  sources=kw.get("sources"),
+                                  stats=kw.get("stats"))
         return f"I don't know how to do '{tool}'."
     except Exception as e:
         # Fail-soft: never crash the agent on a web error.
         return f"Something went wrong while using the web ({e!r}). Please try again."
-
 
 # ---------------------------------------------------------------------------
 # write_website -- adaptive-theme site builder + optional GitHub Pages publish
@@ -453,11 +454,9 @@ _GH_CACHE = os.environ.get("WEBSITE_GH_CACHE",
                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                         ".gh_boots_sites"))
 
-
 def _slugify(text: str) -> str:
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
     return s or "site"
-
 
 def _hue_for(topic: str, hue=None) -> int:
     """Pick the theme hue: explicit (validated) > deterministic hash of topic."""
@@ -469,18 +468,19 @@ def _hue_for(topic: str, hue=None) -> int:
         pass
     return sum(ord(c) for c in (topic or "site").lower()) % 360
 
-
 def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-
 def _render_site(title: str, topic: str, description: str, hue: int,
-                 sections=None, sources=None) -> str:
+                 sections=None, sources=None, stats=None) -> str:
     """Modern single-file page: one hue drives the whole palette (HSL vars).
 
     Content is LLM-authored: `sections` is a list of {heading, body,
-    points[]} and `sources` a list of {title, url}. When sections are empty
-    the page falls back to a lede-only layout (never a blank page)."""
+    points[], kind?} where kind='timeline' renders points as a vertical
+    spine of 'Year — event' entries; `stats` is a list of {value, label}
+    rendered as a stat band under the hero; `sources` a list of {title,
+    url}. When sections are empty the page falls back to a lede-only
+    layout (never a blank page)."""
     desc = (description or "").strip() or (
         "A page about " + (topic or "this topic") +
         ", generated by the Boots voice agent on a Raspberry Pi.")
@@ -493,12 +493,36 @@ def _render_site(title: str, topic: str, description: str, hue: int,
         h = (s.get("heading") or "").strip()
         b = (s.get("body") or "").strip()
         pts = [p.strip() for p in (s.get("points") or [])
-               if isinstance(p, str) and p.strip()][:6]
+               if isinstance(p, str) and p.strip()][:8]
+        kind = (s.get("kind") or "prose").strip().lower()
+        if kind not in ("prose", "timeline"):
+            kind = "prose"
         if not h and not b:
             continue
         secs.append({"id": "s" + str(i + 1),
                      "heading": h or ("Section " + str(i + 1)),
-                     "body": b, "points": pts})
+                     "body": b, "points": pts, "kind": kind})
+
+    # --- normalize stat band ------------------------------------------------
+    stat_items = []
+    for st in (stats or []):
+        if not isinstance(st, dict):
+            continue
+        v = (st.get("value") or "").strip()
+        l = (st.get("label") or "").strip()
+        if v:
+            stat_items.append({"value": v, "label": l})
+    stat_items = stat_items[:4]
+    if stat_items:
+        stats_html = (
+            '  <section class="statband" id="stats">\n'
+            + "\n".join(
+                f'    <div class="stat"><span class="stat-v">{_esc(s["value"])}</span>'
+                f'<span class="stat-l">{_esc(s["label"])}</span></div>'
+                for s in stat_items)
+            + "\n  </section>")
+    else:
+        stats_html = ""
 
     toc = "\n".join(
         f'      <a href="#{s["id"]}">{_esc(s["heading"])}</a>' for s in secs)
@@ -509,13 +533,22 @@ def _render_site(title: str, topic: str, description: str, hue: int,
     if secs:
         cards = []
         for s in secs:
-            pts = ("\n        <ul>\n"
-                   + "\n".join(f"          <li>{_esc(p)}</li>" for p in s["points"])
-                   + "\n        </ul>" if s["points"] else "")
             body = (f'\n        <p>{_esc(s["body"])}</p>' if s["body"] else "")
+            if s["kind"] == "timeline" and s["points"]:
+                items = "\n".join(
+                    f'          <li><span class="tl-dot"></span>{_esc(p)}</li>'
+                    for p in s["points"])
+                extra = (f'\n        <ol class="timeline">\n{items}\n        </ol>')
+            elif s["points"]:
+                extra = ("\n        <ul>\n"
+                         + "\n".join(f"          <li>{_esc(p)}</li>"
+                                     for p in s["points"])
+                         + "\n        </ul>")
+            else:
+                extra = ""
             cards.append(f'    <section class="sec" id="{s["id"]}">'
                          f'\n      <h2>{_esc(s["heading"])}</h2>'
-                         f"{body}{pts}\n    </section>")
+                         f"{body}{extra}\n    </section>")
         body_html = "\n".join(cards)
     else:
         body_html = (f'    <section class="sec" id="s1">'
@@ -650,6 +683,34 @@ main {{
   font-size: .88rem;
 }}
 .sources li::before {{ display: none; }}
+.statband {{
+  display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  margin: 8px 0 40px;
+}}
+.stat {{
+  background: var(--surface); border: 1px solid var(--line);
+  border-radius: 14px; padding: 20px; text-align: center;
+}}
+.stat-v {{
+  display: block; font-size: 1.9rem; font-weight: 750; letter-spacing: -0.02em;
+  color: var(--accent);
+}}
+.stat-l {{
+  display: block; margin-top: 4px; font-size: .82rem; color: var(--muted);
+}}
+.timeline {{
+  list-style: none; margin: 14px 0 0; padding: 0 0 0 20px;
+  border-left: 2px solid var(--line);
+}}
+.timeline li {{
+  position: relative; padding: 0 0 14px 14px; color: var(--muted);
+}}
+.timeline li:last-child {{ padding-bottom: 0; }}
+.tl-dot {{
+  position: absolute; left: -26px; top: 6px; width: 10px; height: 10px;
+  border-radius: 50%; background: var(--accent);
+  box-shadow: 0 0 0 4px var(--accent-soft);
+}}
 footer {{
   text-align: center; padding: 40px 20px 56px; color: var(--muted);
   font-size: .85rem; border-top: 1px solid var(--line); margin-top: 32px;
@@ -666,13 +727,13 @@ a {{ color: var(--accent); }}
   </header>
   <main>
 {toc_nav}
+{stats_html}
 {body_html}
 {sources_html}
   </main>
   <footer>Generated by Boots &middot; Raspberry Pi &middot; {_esc(_time.strftime('%Y-%m-%d %H:%M'))}</footer>
 </body>
 </html>"""
-
 
 def _gh_publish(slug: str, html: str) -> str:
     """Opt-in: commit the page to the GitHub Pages repo and push.
@@ -713,14 +774,77 @@ def _gh_publish(slug: str, html: str) -> str:
     except Exception as e:
         return f"Publishing to GitHub failed ({e!r}). It's still live on the LAN."
 
+def _verify_site(url: str, html: str) -> str:
+    """Tiered render verification. Returns an HONEST status string — the
+    label always says exactly which tier ran, never more.
+
+    T1  (always)  : HTTP 200 + byte size + <title> present (urllib).
+    T1.5 (always) : static sanity — every local href/src in the page resolves
+                    to a file on disk, and <section> tags are balanced.
+    T2  (auto)    : headless Chromium (playwright) if importable — renders the
+                    page, checks for JS errors, asserts the title is in the
+                    DOM. If playwright is absent the result says so, it does
+                    NOT pretend a render happened."""
+    import urllib.request
+    label = "http-only"
+    problems = []
+    try:
+        with urllib.request.urlopen(url, timeout=10) as r:
+            served = r.read()
+            code = r.status
+        if code != 200:
+            return f"verification FAILED: server returned HTTP {code} for {url}"
+        title_ok = "<title>" in served.decode("utf-8", "replace")
+        label = f"http-200 ({len(served)} bytes, title {'ok' if title_ok else 'MISSING'})"
+        if not title_ok:
+            problems.append("no <title> in served page")
+    except Exception as e:
+        return f"verification FAILED: could not fetch {url} ({e!r})"
+
+    # T1.5 static sanity (runs on the generated HTML itself)
+    import re as _re
+    secs_open = len(_re.findall(r"<section", html))
+    secs_close = len(_re.findall(r"</section>", html))
+    if secs_open != secs_close:
+        problems.append(f"unbalanced <section> tags ({secs_open} open / {secs_close} close)")
+    for ref in _re.findall(r'(?:src|href)="([^"]+)"', html):
+        if ref.startswith(("http", "#", "mailto:", "data:")):
+            continue
+        if not os.path.exists(os.path.join(SITES_DIR, ref.lstrip("/"))):
+            problems.append(f"missing local asset: {ref}")
+    label += " + static-sanity"
+
+    # T2 headless render (auto-detected; honest when absent)
+    try:
+        from playwright.sync_api import sync_playwright
+        with sync_playwright() as p:
+            b = p.chromium.launch()
+            pg = b.new_page()
+            js_errors = []
+            pg.on("pageerror", lambda e: js_errors.append(str(e)))
+            pg.goto(url, wait_until="networkidle", timeout=20000)
+            dom_title = pg.title()
+            b.close()
+        label += f" + headless-render (dom title: {dom_title[:40]!r})"
+        if js_errors:
+            problems.append("JS errors: " + "; ".join(js_errors[:3]))
+    except ImportError:
+        label += " [playwright absent — no render check]"
+    except Exception as e:
+        problems.append(f"headless render check errored ({e!r})")
+
+    if problems:
+        return f"verification WARNINGS: {label} — " + "; ".join(problems)
+    return f"verified: {label}"
 
 def _write_website(topic: str, title: str, description: str,
-                   hue=None, publish=False, sections=None, sources=None) -> str:
-    """Generate an adaptive-theme page, save to SITES_DIR, optionally publish.
-
-    Content is LLM-authored (sections/sources); the tool only renders and
-    serves. Returns a spoken message with the LAN URL (always) and, when
-    publish is true, the GitHub Pages URL."""
+                   hue=None, publish=False, sections=None, sources=None,
+                   stats=None) -> str:
+    """Generate an adaptive-theme page, save to SITES_DIR, VERIFY the render,
+    optionally publish. Content is LLM-authored (sections/stats/sources); the
+    tool renders, serves, and checks. Returns a spoken message with the LAN
+    URL, the honest verification status, and (when publish is true) the
+    GitHub Pages URL."""
     topic = (topic or "").strip()
     title = (title or "").strip() or topic or "Untitled page"
     description = (description or "").strip()
@@ -733,7 +857,7 @@ def _write_website(topic: str, title: str, description: str,
     path = os.path.join(SITES_DIR, slug + ".html")
 
     html = _render_site(title, topic, description, h,
-                        sections=sections, sources=sources)
+                        sections=sections, sources=sources, stats=stats)
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
@@ -741,16 +865,17 @@ def _write_website(topic: str, title: str, description: str,
         return f"I couldn't save the website file ({e!r})."
 
     url = f"http://{_SITE_HOST}:{_SITE_PORT}/site/{slug}.html"
+    verify = _verify_site(url, html)
     n_sec = len([s for s in (sections or [])
                  if isinstance(s, dict) and ((s.get("heading") or "").strip()
                                              or (s.get("body") or "").strip())])
     msg = (f"Done! I built a website about {topic or title} with {n_sec} "
            f"{'section' if n_sec == 1 else 'sections'} and saved it. "
-           f"You can open it in your browser at {url}")
+           f"You can open it in your browser at {url} "
+           f"({verify}).")
     if publish:
         msg += " " + _gh_publish(slug, html)
     return msg
-
 
 # NOTE: the standalone FastMCP server that used to live here was removed -
 # the canonical MCP server is mcp_server.py (one process, all tools).

@@ -33,11 +33,11 @@ import me2_tools as ui_mod
 import spotify_tools as spotify_mod
 import web_tools as web_mod
 import files_tools as files_mod
+import shell_tools as shell_mod
 
 mcp = FastMCP("boots")
 
-_MODULES = [ui_mod, spotify_mod, web_mod, files_mod]
-
+_MODULES = [ui_mod, spotify_mod, web_mod, files_mod, shell_mod]
 
 def _make_tool(mod, name, desc, params):
     """Build a properly-typed function for FastMCP to introspect.
@@ -79,12 +79,10 @@ def _make_tool(mod, name, desc, params):
     fn.__name__ = name
     return fn
 
-
 for _mod in _MODULES:
     for _name, _desc, _params in _mod.TOOL_SPECS:
         mcp.add_tool(_make_tool(_mod, _name, _desc, _params),
                      name=_name, description=_desc)
-
 
 if __name__ == "__main__":
     mcp.run()  # stdio transport

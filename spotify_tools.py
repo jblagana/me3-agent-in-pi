@@ -20,13 +20,7 @@ import tempfile
 
 import urllib.parse
 
-
-
 from loguru import logger
-
-
-
-
 
 def _load_token():
 
@@ -50,29 +44,41 @@ def _load_token():
 
         return {}
 
-
-
-
-
 def _refresh_token(tok):
 
     client_id = os.environ.get("SPOTIFY_CLIENT_ID", "")
 
     if not client_id:
 
-        try:
+        # Linux path first (Pi), then the Windows-native location next to the token.
 
-            with open(os.path.join(os.path.expanduser("~"), ".config", "spotify-mcp", "env")) as f:
+        for env_path in (
 
-                for line in f:
+            os.path.join(os.path.expanduser("~"), ".config", "spotify-mcp", "env"),
 
-                    if line.startswith("SPOTIFY_CLIENT_ID="):
+            os.path.join(os.path.expanduser("~"), ".spotify-mcp", "env"),
 
-                        client_id = line.strip().split("=", 1)[1]
+        ):
 
-        except Exception:
+            try:
 
-            pass
+                with open(env_path) as f:
+
+                    for line in f:
+
+                        if line.startswith("SPOTIFY_CLIENT_ID="):
+
+                            client_id = line.strip().split("=", 1)[1]
+
+                            break
+
+                if client_id:
+
+                    break
+
+            except Exception:
+
+                pass
 
     if not client_id or not tok.get("refresh_token"):
 
@@ -126,10 +132,6 @@ def _refresh_token(tok):
 
     return tok
 
-
-
-
-
 def _api(method, path, body=None):
 
     import subprocess, tempfile
@@ -140,7 +142,7 @@ def _api(method, path, body=None):
 
     auth_header = f"Authorization: Bearer {tok.get('access_token', '')}"
 
-    cmd = ["curl", "-s", "-X", method, url, "-H", auth_header]
+    cmd = ["curl", "-s", "-w", "\n__HTTP_STATUS__:%{http_code}", "-X", method, url, "-H", auth_header]
 
     if body:
 
@@ -154,7 +156,7 @@ def _api(method, path, body=None):
 
     else:
 
-        cmd += ["-H", "Content-Type: application/json"]
+        cmd += ["-H", "Content-Type: application/json", "-H", "Content-Length: 0"]
 
     try:
 
@@ -168,15 +170,55 @@ def _api(method, path, body=None):
 
             return {"error": f"curl failed: {r.stderr}"}
 
-        return json.loads(r.stdout) if r.stdout.strip() else {"status": "ok"}
+        out = r.stdout
+
+        status = None
+
+        if "__HTTP_STATUS__:" in out:
+
+            out, status_s = out.rsplit("__HTTP_STATUS__:", 1)
+
+            try:
+
+                status = int(status_s.strip())
+
+            except ValueError:
+
+                status = None
+
+        if not out.strip():
+
+            if status is None or status < 400:
+
+                return {"status": "ok"}
+
+            return {"error": {"status": status, "message": "HTTP " + str(status)}}
+
+        try:
+
+            return json.loads(out)
+
+        except json.JSONDecodeError:
+
+            return {"error": "non-JSON response (HTTP " + str(status) + "): " + out[:200]}
 
     except Exception as e:
 
         return {"error": str(e)}
 
+AUTH_MSG = ("Spotify auth is expired or missing — re-run `spotify-mcp auth` and "
 
+            "try again. (Nothing was changed on Spotify.)")
 
+def _auth_error(res) -> bool:
 
+    """True when the API rejected the call on auth (401/403). Must never be
+
+    masked as 'no results' / 'paused' / 'nothing playing'."""
+
+    err = res.get("error") if isinstance(res, dict) else None
+
+    return isinstance(err, dict) and err.get("status") in (401, 403)
 
 # ---- tool specs (name, description, param dict) ----
 
@@ -228,10 +270,6 @@ TOOL_SPECS = [
 
 ]
 
-
-
-
-
 def dispatch(tool: str, **kw) -> str:
 
     """Execute a Spotify tool and return a short human-readable string."""
@@ -241,6 +279,10 @@ def dispatch(tool: str, **kw) -> str:
         q = kw.get("query", "")
 
         res = _api("GET", f"/search?q={urllib.parse.quote(q)}&type=track&limit=1")
+
+        if _auth_error(res):
+
+            return AUTH_MSG
 
         tracks = res.get("tracks", {}).get("items", [])
 
@@ -268,6 +310,10 @@ def dispatch(tool: str, **kw) -> str:
 
         play = _api("PUT", "/me/player/play", play_body)
 
+        if _auth_error(play):
+
+            return AUTH_MSG
+
         if "error" in play:
 
             reason = play.get("error", {}).get("reason", "")
@@ -286,31 +332,51 @@ def dispatch(tool: str, **kw) -> str:
 
     elif tool == "spotify_pause":
 
-        _api("PUT", "/me/player/pause")
+        res = _api("PUT", "/me/player/pause")
+
+        if _auth_error(res):
+
+            return AUTH_MSG
 
         return "Paused."
 
     elif tool == "spotify_resume":
 
-        _api("PUT", "/me/player/play")
+        res = _api("PUT", "/me/player/play")
+
+        if _auth_error(res):
+
+            return AUTH_MSG
 
         return "Resuming."
 
     elif tool == "spotify_next":
 
-        _api("POST", "/me/player/next")
+        res = _api("POST", "/me/player/next")
+
+        if _auth_error(res):
+
+            return AUTH_MSG
 
         return "Skipped to the next track."
 
     elif tool == "spotify_previous":
 
-        _api("POST", "/me/player/previous")
+        res = _api("POST", "/me/player/previous")
+
+        if _auth_error(res):
+
+            return AUTH_MSG
 
         return "Went back to the previous track."
 
     elif tool == "spotify_now_playing":
 
         res = _api("GET", "/me/player")
+
+        if _auth_error(res):
+
+            return AUTH_MSG
 
         if "error" in res:
 
@@ -334,6 +400,10 @@ def dispatch(tool: str, **kw) -> str:
 
         res = _api("GET", f"/search?q={urllib.parse.quote(q)}&type=track,artist,album&limit=5")
 
+        if _auth_error(res):
+
+            return AUTH_MSG
+
         parts = []
 
         for t in res.get("tracks", {}).get("items", [])[:3]:
@@ -356,10 +426,6 @@ def dispatch(tool: str, **kw) -> str:
 
         return f"Unknown tool: {tool}"
 
-
-
-
-
 if __name__ == "__main__":
 
     import sys
@@ -367,6 +433,3 @@ if __name__ == "__main__":
     t = sys.argv[1] if len(sys.argv) > 1 else "spotify_now_playing"
 
     print(dispatch(t, query="Opalite Taylor Swift"))
-
-
-
