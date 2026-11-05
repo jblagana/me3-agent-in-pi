@@ -1859,11 +1859,18 @@ class Handler(BaseHTTPRequestHandler):
             # (the UI chat is a voice proxy — one pipeline, one context).
             # A turn completes when its phase leaves "speaking" with a
             # response present; tool calls are logged as they appear.
-            if obj.get("tool"):
-                _tool = str(obj.get("tool", ""))
-            _cls = ("boots" if _tool.startswith("boots_")
-                    else "spotify" if _tool.startswith("spotify_") else "web")
-            _cmdlog(_tool[:120], _cls)
+            # BUGFIX (2026-11-05): _tool was referenced before assignment when
+            # the payload had no "tool" key (every heartbeat / phase push) ->
+            # UnboundLocalError crashed the whole /me3 handler AFTER the state
+            # update but BEFORE _cmdlog/_append_turn/self._send. Symptoms: the
+            # agent's [me3push] "Remote end closed connection" spam, voice
+            # turns never appended to chat history, and no command-log lines
+            # for voice activity. Now: default empty + log only real tools.
+            _tool = str(obj.get("tool") or "")
+            if _tool:
+                _cls = ("boots" if _tool.startswith("boots_")
+                        else "spotify" if _tool.startswith("spotify_") else "web")
+                _cmdlog(_tool[:120], _cls)
             _lp = _VOICE_LAST["phase"]
             _VOICE_LAST["phase"] = phase
             if _lp == "speaking" and phase != "speaking" \

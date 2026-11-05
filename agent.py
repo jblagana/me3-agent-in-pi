@@ -566,10 +566,6 @@ class InputGate(FrameProcessor):
 
     async def process_frame(self, frame, direction):
         from pipecat.frames.frames import InputAudioRawFrame
-        _n = getattr(self, "_dbg_n", 0)
-        if _n < 8:
-            self._dbg_n = _n + 1
-            logger.info(f"[micdbg] frame type={type(frame).__name__} hasaudio=%s dir=%s", hasattr(frame, "audio"), getattr(frame, "direction", "?"))
         if isinstance(frame, InputAudioRawFrame):
             # FIX: compute a live mic level (RMS) on the RAW audio *before* the
             # gate mutes it, so the UI level meter reflects what the mic hears.
@@ -714,6 +710,12 @@ async def _speak_welcome(tts: "PiperLocalTTSService", spk_dev: int, state: dict)
     """
     text = "Hi there. I am Boots."
     state["bot_speaking"] = True  # gate the mic while we speak (no self-feedback)
+    # GREETING-UI: surface the spoken greeting as an assistant bubble in the
+    # Boots UI (voice turns share the UI chat thread). Set the reply text so
+    # _me3_push carries it, then push phase=speaking so the response bubble
+    # renders; the finally-block idle push finalizes the turn into history.
+    _RECENT_TEXT["reply"] = text
+    _me3_push("speaking")
     logger.info(f"[me3] speaking welcome: {text!r}")
     # UNIFIED VOICE: synthesize at the SAME rate the pipeline uses (48 kHz),
     # via the same _synthesize() path as responses. This removes the old
@@ -749,6 +751,12 @@ async def _speak_welcome(tts: "PiperLocalTTSService", spk_dev: int, state: dict)
         logger.error(f"[me3] welcome failed: {e!r}")
     finally:
         state["bot_speaking"] = False
+        # GREETING-UI: phase leaves speaking with the reply present -> the
+        # dashboard appends the greeting to chat history as a real turn.
+        try:
+            _me3_push("idle")
+        except Exception:
+            pass
 
 
 # --------------------------------------------------------------------------- #
