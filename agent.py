@@ -1854,6 +1854,93 @@ class _KeepAliveMixer:
         return _M()
 
 
+class _SpotifyPipe:
+    """Reads librespot's raw PCM (S16LE, 44.1 kHz, stereo) from a FIFO and
+    keeps ~0.3 s of it as 48 kHz mono, read at REAL-TIME pace: librespot's pipe
+    backend writes as fast as the reader takes, so reading only when the buffer
+    runs low is what paces the music (and never skips audio). 2026-11-07."""
+
+    def __init__(self, path):
+        import threading
+        self.path = path
+        self.buf = bytearray()
+        self.lock = threading.Lock()
+        threading.Thread(target=self._run, daemon=True, name="spotify-pipe").start()
+
+    def _run(self):
+        import numpy as _np, soxr
+        keep = int(48000 * 2 * 0.3)            # target backlog, bytes at 48 kHz mono s16
+        while True:
+            try:
+                if not os.path.exists(self.path):
+                    time.sleep(2)
+                    continue
+                rs = soxr.ResampleStream(44100, 48000, 1, dtype="int16")
+                with open(self.path, "rb", buffering=0) as f:   # blocks until librespot opens it
+                    while True:
+                        with self.lock:
+                            full = len(self.buf) >= keep
+                        if full:
+                            time.sleep(0.01)
+                            continue
+                        chunk = f.read(4 * 882)                 # ~20 ms of stereo s16
+                        if not chunk:
+                            break                               # writer closed: reopen
+                        st = _np.frombuffer(chunk[:len(chunk) // 4 * 4], dtype=_np.int16).reshape(-1, 2)
+                        mono = st.astype(_np.int32).mean(axis=1).astype(_np.int16)
+                        out = rs.resample_chunk(mono)
+                        with self.lock:
+                            self.buf += out.tobytes()
+            except Exception as e:
+                logger.debug(f"[spotify-pipe] {e!r}")
+                time.sleep(1)
+
+    def take(self, nbytes):
+        with self.lock:
+            if not self.buf:
+                return None
+            out = bytes(self.buf[:nbytes])
+            del self.buf[:nbytes]
+        return out
+
+
+class _MusicOutputTransport(LocalAudioOutputTransport):
+    """EMEET output that also plays Spotify (librespot) through the SAME stream
+    the agent owns (the M1A can't be opened twice, and there is no PipeWire).
+    Music is mixed at the very last step (write_audio_frame), AFTER pipecat's
+    is-the-bot-speaking check, so music never counts as Boots talking. Ducked
+    to ME3_MUSIC_DUCK while Boots speaks. The M1A's echo cancelling removes
+    the music from the mic too, so barge-in keeps working. 2026-11-07."""
+
+    MUSIC_GAIN = float(os.environ.get("ME3_MUSIC_GAIN", "0.8"))
+    DUCK = float(os.environ.get("ME3_MUSIC_DUCK", "0.2"))
+
+    def __init__(self, pa, params, pipe):
+        super().__init__(pa, params)
+        self._pipe = pipe
+        self._g = 1.0
+
+    async def write_audio_frame(self, frame):
+        try:
+            music = self._pipe.take(len(frame.audio)) if self._pipe else None
+            if music:
+                import numpy as _np
+                a = _np.frombuffer(frame.audio, dtype=_np.int16)
+                m = _np.frombuffer(music, dtype=_np.int16)
+                if len(m) < len(a):
+                    m = _np.concatenate([m, _np.zeros(len(a) - len(m), _np.int16)])
+                talking = bool(len(a)) and int(_np.max(_np.abs(a))) > 64
+                self._g += ((self.DUCK if talking else 1.0) - self._g) * 0.35
+                mix = a.astype(_np.int32) + (m[:len(a)].astype(_np.float32) * self.MUSIC_GAIN * self._g).astype(_np.int32)
+                frame.audio = _np.clip(mix, -32768, 32767).astype(_np.int16).tobytes()
+        except Exception as e:
+            logger.debug(f"[music-mix] {e!r}")
+        return await super().write_audio_frame(frame)
+
+
+SPOTIFY_FIFO = os.environ.get("ME3_SPOTIFY_FIFO", "/run/me3-spotify/spotify.pcm")
+
+
 async def build_bot(transport=None):
     """Build Boots' pipeline. Returns (task, tts, gate_state, pa).
 
@@ -1957,7 +2044,12 @@ async def build_bot(transport=None):
                                                audio_out_mixer=(_KeepAliveMixer()  # no fade-in
                                                                 if os.environ.get("ME3_KEEPALIVE", "1") != "0" else None))
         in_transport = LocalAudioInputTransport(pa, in_params)
-        out_transport = LocalAudioOutputTransport(pa, out_params)
+        # Spotify (librespot "Boots") mixed into the EMEET stream (2026-11-07);
+        # ME3_SPOTIFY=0 turns the mixing off.
+        if os.environ.get("ME3_SPOTIFY", "1") != "0":
+            out_transport = _MusicOutputTransport(pa, out_params, _SpotifyPipe(SPOTIFY_FIFO))
+        else:
+            out_transport = LocalAudioOutputTransport(pa, out_params)
 
     # `status` (StatusIndicator) MUST sit immediately AFTER `stt` and BEFORE
     # `user_aggregator`. In pipecat 1.12 the LLMUserAggregator CONSUMES

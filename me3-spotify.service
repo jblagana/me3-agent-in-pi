@@ -1,0 +1,26 @@
+[Unit]
+# Boots as a Spotify Connect speaker (2026-11-07).
+# librespot writes raw PCM (S16LE, 44.1 kHz, stereo) into a FIFO; the voice
+# agent (agent.py _SpotifyPipe + _MusicOutputTransport) mixes it into the
+# EMEET stream it already owns -- the M1A can't be opened twice and there is
+# no PipeWire. The device shows up in Spotify as "Boots".
+# First sign-in (once, cached in ~/.cache/librespot): pick "Boots" in a
+# Spotify app on the same network, or run librespot once with --enable-oauth.
+Description=Boots Spotify Connect speaker (librespot -> FIFO -> agent mixer)
+After=network-online.target
+Wants=network-online.target
+Before=me3-agent.service
+
+[Service]
+Type=simple
+User=jan
+RuntimeDirectory=me3-spotify
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/bin/sh -c '[ -p /run/me3-spotify/spotify.pcm ] || mkfifo -m 0660 /run/me3-spotify/spotify.pcm'
+ExecStart=/home/jan/.cargo/bin/librespot --name Boots --device-type speaker --backend pipe --device /run/me3-spotify/spotify.pcm --format S16 --bitrate 160 --cache /home/jan/.cache/librespot --initial-volume 80 --enable-volume-normalisation --zeroconf-port 5354 --quiet
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

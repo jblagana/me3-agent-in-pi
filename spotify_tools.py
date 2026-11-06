@@ -228,11 +228,14 @@ TOOL_SPECS = [
 
         "spotify_play_search",
 
-        "Search Spotify and play the first matching track. Use when the user says "
+        "Search Spotify and play it. The speech recognizer often mishears song and "
+        "artist names: BEFORE calling, correct the query to the real title and add the "
+        "artist if you know it (e.g. heard 'bohemian rap city' -> 'Bohemian Rhapsody "
+        "Queen'). kind: 'track' (a specific song, default), 'artist' (play some <artist>), "
+        "'playlist' (a genre, mood or vibe like 'chill jazz'). If the result says it is "
+        "NOT sure, read the options to the user and wait; do not call again until they pick.",
 
-        "something like 'play <song> by <artist>' or 'play some <genre>'.",
-
-        {"query": "string"},
+        {"query": "string", "kind": "string"},
 
     ),
 
@@ -270,45 +273,157 @@ TOOL_SPECS = [
 
 ]
 
+# Spotify Connect device to use when nothing is active: the Pi's own librespot
+# ("Boots", 2026-11-07). Overridable with SPOTIFY_DEVICE_NAME.
+SPOTIFY_DEVICE_NAME = os.environ.get("SPOTIFY_DEVICE_NAME", "Boots")
+
+
+def _pick_device():
+    """Active device if any, else the one named SPOTIFY_DEVICE_NAME, else None."""
+    try:
+        devs = _api("GET", "/me/player/devices").get("devices", [])
+    except Exception:
+        return None
+    for d in devs:
+        if d.get("is_active"):
+            return d.get("id")
+    for d in devs:
+        if (d.get("name") or "").lower() == SPOTIFY_DEVICE_NAME.lower():
+            return d.get("id")
+    return None
+
+
+OPTIONAL_PARAMS = {"spotify_play_search": {"kind"}}
+
+# ---- match scoring (2026-11-07) -------------------------------------------
+import re as _re
+from difflib import SequenceMatcher as _SM
+
+PLAY_SURE = float(os.environ.get("ME3_SPOTIFY_SURE", "0.72"))   # play without asking
+PLAY_MIN = float(os.environ.get("ME3_SPOTIFY_MIN", "0.35"))     # below -> "not found"
+_FILLER = {"the", "a", "an", "by", "song", "songs", "track", "music", "play", "some",
+           "of", "feat", "ft", "featuring", "please"}
+
+
+def _norm(s):
+    s = (s or "").lower()
+    s = _re.sub(r"\s*[\(\[].*?[\)\]]", " ", s)          # (Remastered 2011), [Live]
+    s = _re.sub(r"\s+-\s+.*$", " ", s)                  # " - Radio Edit"
+    s = _re.sub(r"[^\w\s]", " ", s)
+    return [w for w in s.split() if w and w not in _FILLER]
+
+
+def _tok_hit(w, pool):
+    return max((_SM(None, w, p).ratio() for p in pool), default=0.0) >= 0.8
+
+
+def _cover(a, b):
+    """Fraction of tokens in a that (fuzzily) appear in b."""
+    return sum(_tok_hit(w, b) for w in a) / len(a) if a else 0.0
+
+
+def _score_track(q, t):
+    title = _norm(t.get("name"))
+    artists = [w for a in t.get("artists", []) for w in _norm(a.get("name"))]
+    qcov = _cover(q, title + artists)          # did we find everything that was said?
+    tcov = _cover(title, q)                    # is the title actually what was said?
+    whole = _SM(None, " ".join(q), " ".join(title + artists)).ratio()
+    return 0.5 * qcov + 0.35 * tcov + 0.15 * whole
+
+
+def _choose(query, kind, res):
+    """Pick what to play, or say we must ask. Returns a dict with action
+    'play' | 'ask' | 'none'."""
+    q = _norm(query) or query.lower().split()
+    tracks = [t for t in (res.get("tracks") or {}).get("items") or [] if t]
+    artists = [a for a in (res.get("artists") or {}).get("items") or [] if a]
+    lists = [p for p in (res.get("playlists") or {}).get("items") or [] if p]
+
+    def art(t):
+        return t["artists"][0]["name"] if t.get("artists") else ""
+
+    if kind == "playlist" and lists:
+        p = lists[0]
+        return {"action": "play", "type": "playlist", "uri": p["uri"], "name": p["name"], "artist": ""}
+
+    best_artist = None
+    if artists:
+        a = artists[0]
+        s = _SM(None, " ".join(q), " ".join(_norm(a["name"]))).ratio()
+        best_artist = (s, a)
+        if kind == "artist" and s >= 0.6:
+            return {"action": "play", "type": "artist", "uri": a["uri"], "name": a["name"], "artist": ""}
+
+    # score tracks; Spotify's order (popularity) breaks ties, dupes collapsed
+    scored, seen = [], set()
+    for i, t in enumerate(tracks):
+        key = (" ".join(_norm(t.get("name"))), art(t).lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        scored.append((_score_track(q, t) - 0.01 * i, t))
+    scored.sort(key=lambda x: -x[0])
+    logger.info("spotify match '{}': {}", query,
+                [(round(s, 2), t.get("name"), art(t)) for s, t in scored[:4]])
+
+    # "play Taylor Swift" -> the query IS an artist name
+    if best_artist and best_artist[0] >= 0.85 and (not scored or scored[0][0] < 0.9):
+        a = best_artist[1]
+        return {"action": "play", "type": "artist", "uri": a["uri"], "name": a["name"], "artist": ""}
+
+    if scored and scored[0][0] >= PLAY_SURE:
+        s, t = scored[0]
+        return {"action": "play", "type": "track", "uri": t["uri"], "name": t["name"], "artist": art(t)}
+    if kind == "playlist" or (not scored and lists):
+        if lists:
+            p = lists[0]
+            return {"action": "play", "type": "playlist", "uri": p["uri"], "name": p["name"], "artist": ""}
+    cands = [f"{t['name']} by {art(t)}" for s, t in scored[:2] if s >= PLAY_MIN]
+    if cands:
+        return {"action": "ask", "options": cands}
+    return {"action": "none"}
+
+
 def dispatch(tool: str, **kw) -> str:
 
     """Execute a Spotify tool and return a short human-readable string."""
 
     if tool == "spotify_play_search":
 
-        q = kw.get("query", "")
+        q = (kw.get("query") or "").strip()
+        kind = (kw.get("kind") or "track").strip().lower()
+        if not q:
+            return "What should I play?"
 
-        res = _api("GET", f"/search?q={urllib.parse.quote(q)}&type=track&limit=1")
+        # (2026-11-07) No more blind "play result #1": misheard names used to
+        # start a random song. Pull several candidates, score them against what
+        # was asked, and ASK when nothing is a clear match.
+        res = _api("GET", f"/search?q={urllib.parse.quote(q)}&type=track,artist,playlist&limit=8")
 
         if _auth_error(res):
 
             return AUTH_MSG
 
-        tracks = res.get("tracks", {}).get("items", [])
-
-        if not tracks:
-
+        pick = _choose(q, kind, res)
+        if pick["action"] == "none":
             return f"Sorry, I couldn't find anything for '{q}' on Spotify."
+        if pick["action"] == "ask":
+            opts = " or ".join(pick["options"])
+            return (f"NOT sure which one you meant (nothing matched '{q}' closely). "
+                    f"Ask the user: did you mean {opts}?")
 
-        uri = tracks[0]["uri"]
-
-        name = tracks[0]["name"]
-
-        artist = tracks[0]["artists"][0]["name"] if tracks[0].get("artists") else "unknown"
-
-        # Prefer a specific active device if one is connected.
-
-        play_body = {"uri": uri, "position_ms": 0}
-
-        devs = _api("GET", "/me/player/devices").get("devices", [])
-
-        active = [d for d in devs if d.get("is_active")]
-
-        if active:
-
-            play_body["device_id"] = active[0]["id"]
-
-        play = _api("PUT", "/me/player/play", play_body)
+        name, artist = pick["name"], pick["artist"]
+        # (2026-11-07) Spotify wants {"uris": [...]} (track) or {"context_uri": ...}
+        # (artist/playlist) in the body and device_id as a QUERY parameter. The old
+        # {"uri": ...} body was ignored -> Spotify just RESUMED whatever was playing.
+        dev = _pick_device()
+        play_body = ({"uris": [pick["uri"]], "position_ms": 0} if pick["type"] == "track"
+                     else {"context_uri": pick["uri"]})
+        play = _api("PUT", "/me/player/play" + (f"?device_id={dev}" if dev else ""), play_body)
+        if pick["type"] == "artist":
+            name, artist = f"songs by {name}", ""
+        elif pick["type"] == "playlist":
+            name, artist = f"the playlist {name}", ""
 
         if _auth_error(play):
 
@@ -328,7 +443,7 @@ def dispatch(tool: str, **kw) -> str:
 
             return f"I found '{name}' by {artist} but couldn't start playback: {play.get('error', {}).get('message', reason)}."
 
-        return f"Playing {name} by {artist}."
+        return f"Playing {name}" + (f" by {artist}." if artist else ".")
 
     elif tool == "spotify_pause":
 
@@ -342,7 +457,8 @@ def dispatch(tool: str, **kw) -> str:
 
     elif tool == "spotify_resume":
 
-        res = _api("PUT", "/me/player/play")
+        dev = _pick_device()
+        res = _api("PUT", "/me/player/play" + (f"?device_id={dev}" if dev else ""))
 
         if _auth_error(res):
 
