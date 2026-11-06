@@ -1370,6 +1370,17 @@ def _chat_load_impl():
         import spotify_tools as _sp
         import web_tools as _web
         import prompt as _prompt
+    # File + shell tools (voice parity) — optional: older deployments may not
+    # have them yet, and the chat path must still work without.
+    _ft = _sh = None
+    try:
+        import files_tools as _ft
+    except ImportError:
+        pass
+    try:
+        import shell_tools as _sh
+    except ImportError:
+        pass
 
     def _norm_props(p):
         out = {}
@@ -1383,7 +1394,9 @@ def _chat_load_impl():
         return out
 
     tools = []
-    for mod in (_ui, _sp, _web):
+    for mod in (_ui, _sp, _web, _ft, _sh):
+        if mod is None:
+            continue
         for (n, d, p) in mod.TOOL_SPECS:
             tools.append({
                 "type": "function",
@@ -1672,6 +1685,11 @@ def _chat_run(msg: str, emit=None):
                 res = _ui_dispatch(name, args)
             elif name.startswith("spotify_"):
                 res = _sp_dispatch(name, args)
+            elif name in ("list_dir", "read_file", "write_file",
+                          "edit_file", "search_files"):
+                res = _ft_dispatch(name, args)
+            elif name == "run_command":
+                res = _sh_dispatch(name, args)
             else:
                 res = _web_dispatch(name, args)
             err = isinstance(res, str) and bool(res) and res[:7].lower() in ("errored", "error: ", "error —")
@@ -1748,6 +1766,20 @@ def _sp_dispatch(name, args):
 def _web_dispatch(name, args):
     try:
         import web_tools as _m
+        return _m.dispatch(name, **args)
+    except Exception as e:
+        return f"tool {name} errored: {e!r}"
+
+def _ft_dispatch(name, args):
+    try:
+        import files_tools as _m
+        return _m.dispatch(name, **args)
+    except Exception as e:
+        return f"tool {name} errored: {e!r}"
+
+def _sh_dispatch(name, args):
+    try:
+        import shell_tools as _m
         return _m.dispatch(name, **args)
     except Exception as e:
         return f"tool {name} errored: {e!r}"
