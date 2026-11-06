@@ -48,6 +48,74 @@ LLM_MODEL    = os.environ.get("LLM_MODEL", "qwen/qwen3.8-27b")
 # other OpenAI-compatible servers do NOT accept that extra_body, so gate on it.
 LLM_USE_VLLM_THINKING = os.environ.get("LLM_USE_VLLM_THINKING", "0") == "1"
 ASR_BASE_URL = os.environ.get("ME3_ASR_BASE_URL", "http://127.0.0.1:8080/v1")
+# ---------------------------------------------------------------------------
+# Voice LLM hot-swap (2026-11-06): the UI dropdown (boots_ui.py POST /llm)
+# writes bootsui/llm.json; this poller watches it and re-points the LIVE
+# voice pipeline at the new provider mid-run -- no restart, no SSH.
+# The AsyncOpenAI client is recreated on change (it bakes base_url+key),
+# and the model rides in settings.model (read per request). The swap defers
+# while a turn is in flight (bot_speaking or an LLM request open) so a
+# mid-response swap can't orphan a completion.
+# ---------------------------------------------------------------------------
+LLM_JSON_PATH = os.path.expanduser("~/me3/bootsui/llm.json")
+_llm_swap = {"mtime": 0.0, "sig": None, "inflight": 0}
+
+
+def _llm_sig():
+    try:
+        import json as _json
+        with open(LLM_JSON_PATH) as f:
+            d = _json.load(f)
+        return (d.get("base_url", "").rstrip("/"),
+                d.get("api_key", ""),
+                d.get("model", ""),
+                str(d.get("thinking", "off")).lower() == "on")
+    except Exception:
+        return None
+
+
+def _apply_llm_swap(llm, sig):
+    # Re-point the live LLM service at (base_url, key, model, thinking).
+    from openai import AsyncOpenAI, DefaultAsyncHttpxClient
+    old = (getattr(llm, "_settings", None) and llm._settings.model,
+           getattr(getattr(llm, "_client", None), "base_url", None))
+    llm._client = AsyncOpenAI(api_key=sig[1], base_url=sig[0],
+                              http_client=DefaultAsyncHttpxClient())
+    llm._settings.model = sig[2]
+    extra = dict(getattr(llm._settings, "extra", None) or {})
+    if sig[3]:
+        extra["extra_body"] = {"chat_template_kwargs": {"enable_thinking": False}}
+    else:
+        extra.pop("extra_body", None)
+    llm._settings.extra = extra
+    th = "on" if sig[3] else "off"
+    logger.info(f"[me3] voice LLM swapped: {old[1]} {old[0]} -> {sig[0]} {sig[2]} (thinking {th})")
+
+
+async def _llm_swap_poller(llm, gate_state):
+    import asyncio as _aio
+    while True:
+        await _aio.sleep(2.0)
+        try:
+            st = os.stat(LLM_JSON_PATH)
+            if st.st_mtime == _llm_swap["mtime"]:
+                continue
+            _llm_swap["mtime"] = st.st_mtime
+            sig = _llm_sig()
+            if not sig or sig == _llm_swap["sig"]:
+                continue
+            # Defer until no turn is in flight (speaking or LLM request open).
+            for _ in range(50):
+                if not gate_state.get("bot_speaking") and _llm_swap["inflight"] == 0:
+                    break
+                await _aio.sleep(0.3)
+            _apply_llm_swap(llm, sig)
+            _llm_swap["sig"] = sig
+        except Exception as e:
+            logger.warning(f"[me3] llm swap poller: {e!r}")
+
+
+
 ME3_ASR_MODEL = os.environ.get("ME3_ASR_MODEL", "whisper-large-v3-turbo")
 def _find_mic_index():
     """Auto-detect the USB mic (EMEET M1A) by name; fallback to first input device."""
@@ -99,6 +167,7 @@ from pipecat.frames.frames import (
     BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     InterruptionFrame,
+    ErrorFrame,
 )
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -1084,16 +1153,19 @@ async def _speak_welcome(tts: "PiperLocalTTSService", spk_dev: int, state: dict)
 # trim the conversation context to the most recent N turns so each request
 # stays light (less per-request token cost = fewer 429s).
 # --------------------------------------------------------------------------- #
-def _inject_current_time(context) -> None:
-    """Stamp the current date/time into the LLM context's system message on
-    EVERY LLM call, so the model knows "now". The system instruction is set
-    once at boot (SYSTEM_PROMPT); we keep the original text in
-    _BASE_SYSTEM_TEXT and re-append a fresh "Current date/time: ..." line each
-    call. This runs before _trim_llm_context so the (updated) system message
-    is always the one that reaches the model.
+def _stamp_system_and_strip(context, llm) -> None:
+    """Guarantee the request carries EXACTLY ONE system message, at
+    position 0, with a fresh date stamp (2026-11-06b, re-merged 20:20+).
 
-    Why here (not in SYSTEM_PROMPT): a static prompt bakes in the boot-time
-    clock and goes stale; re-stamping per call keeps it current for free.
+    pipecat's OpenAI adapter (open_ai_adapter.py) ALWAYS prepends
+    settings.system_instruction when it is set, and keeps any context
+    system message too ("Keeping both") -- so a context system message
+    + the settings one = two system messages = Qwen3.8 template 400
+    'System message must be at the beginning' -> LLM marked unusable.
+    The logged context looked clean because the debug dump runs BEFORE
+    the adapter. Fix: fold the date stamp into settings.system_instruction
+    (the single message the adapter prepends) and strip every
+    system/developer message from the context.
     """
     global _BASE_SYSTEM_TEXT
     try:
@@ -1102,36 +1174,18 @@ def _inject_current_time(context) -> None:
         stamp = _t.strftime("%A, %B %d, %Y %H:%M %Z", now)
         line = f"\n\nCurrent date and time: {stamp} (the user's local time is Asia/Manila, UTC+8)."
         if _BASE_SYSTEM_TEXT is None:
-            _BASE_SYSTEM_TEXT = SYSTEM_PROMPT  # capture the boot-time base once
-        base = _BASE_SYSTEM_TEXT
-        target = base + line
-        # Replace the existing system/developer message content in place.
-        for i, m in enumerate(context.messages):
-            role = (m.get("role") if isinstance(m, dict)
-                    else getattr(m, "role", "")) or ""
-            if role in ("system", "developer"):
-                content = (m.get("content") if isinstance(m, dict)
-                           else getattr(m, "content", "")) or ""
-                # Strip any previously-appended stamp so we don't stack them.
-                if base in content:
-                    content = content[:content.index(base)]
-                new_content = content.rstrip() + line
-                if isinstance(m, dict):
-                    m["content"] = new_content
-                else:
-                    try:
-                        m.content = new_content
-                    except Exception:
-                        pass
-                break
-        else:
-            # No system message present (shouldn't happen) -- append one.
-            context.messages.insert(0, {"role": "system", "content": target})
+            _BASE_SYSTEM_TEXT = SYSTEM_PROMPT
+        try:
+            llm._settings.system_instruction = _BASE_SYSTEM_TEXT + line
+        except Exception:
+            pass
+        for _m in list(context.messages):
+            _r = (_m.get("role") if isinstance(_m, dict)
+                  else getattr(_m, "role", "")) or ""
+            if _r in ("system", "developer"):
+                context.messages.remove(_m)
     except Exception as e:
-        logger.debug(f"[me3] time stamp skipped: {e!r}")
-
-
-_BASE_SYSTEM_TEXT: str | None = None  # captured on first call (see above)
+        logger.debug(f"[me3] system stamp/strip skipped: {e!r}")
 
 
 def _trim_llm_context(context, max_messages: int) -> None:
@@ -1237,7 +1291,7 @@ class GroqResilientLLM(OpenAILLMService):
         # 0) Stamp the CURRENT date/time into the system prompt on EVERY call,
         #    so the model always knows "now" (it otherwise has no clock and
         #    can't answer "what time is it?" or reason about relative times).
-        _inject_current_time(context)
+        _stamp_system_and_strip(context, self)
         # 0b) REAL CoT (2026-11-06): ask Groq for reasoning tokens. Without
         #     this the Qwen3.8 stream carries NO reasoning field (verified
         #     live: reasoning=None), so the UI's CoT box could only mirror
@@ -1258,42 +1312,92 @@ class GroqResilientLLM(OpenAILLMService):
         # 2) Retry on 429 / rate-limit with exponential backoff.
         import asyncio as _aio
         from openai import APIStatusError, RateLimitError, APIConnectionError, APITimeoutError
-        attempt = 0
-        while True:
-            attempt += 1
-            try:
-                stream = await super().get_chat_completions(context)
-                # 3) REAL CoT (2026-11-06): tee the stream's reasoning deltas
-                #    into the UI. pipecat only pushes LLMTextFrame for
-                #    delta.content — delta.reasoning (Groq's Qwen3.8 carries
-                #    it when reasoning_effort is set) is dropped on the floor,
-                #    which is why the voice CoT box could only mirror the
-                #    reply text. This wrapper sits on the HTTP chunk stream
-                #    (NOT the frame path — a FrameProcessor in the LLM->TTS
-                #    path broke TTS, D21), so TTS keeps working while the
-                #    reasoning tokens stream to the CoT box live.
-                return _tap_reasoning_stream(stream)
-            except (RateLimitError, APIConnectionError, APITimeoutError) as e:
-                # 429 (RateLimitError) / transient network / timeout.
-                retryable = (
-                    isinstance(e, (RateLimitError, APIConnectionError, APITimeoutError))
-                    or (isinstance(e, APIStatusError) and e.status_code in (408, 429, 500, 502, 503, 504))
-                )
-                if not retryable or attempt > self.MAX_RETRIES:
-                    raise
-                delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))  # 1s, 2s, 4s
-                logger.warning(f"[me3] LLM {type(e).__name__} (attempt {attempt}/{self.MAX_RETRIES}); "
-                               f"retrying in {delay:.1f}s")
-                await _aio.sleep(delay)
-            except APIStatusError as e:
-                # Other HTTP errors (4xx except 429, 5xx handled above).
-                if e.status_code in (500, 502, 503, 504) and attempt <= self.MAX_RETRIES:
-                    delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                    logger.warning(f"[me3] LLM HTTP {e.status_code} (attempt {attempt}/{self.MAX_RETRIES}); "
+        _llm_swap["inflight"] += 1
+        try:
+            attempt = 0
+            while True:
+                attempt += 1
+                try:
+                    stream = await super().get_chat_completions(context)
+                    # 3) REAL CoT (2026-11-06): tee the stream's reasoning deltas
+                    #    into the UI. pipecat only pushes LLMTextFrame for
+                    #    delta.content — delta.reasoning (Groq's Qwen3.8 carries
+                    #    it when reasoning_effort is set) is dropped on the floor,
+                    #    which is why the voice CoT box could only mirror the
+                    #    reply text. This wrapper sits on the HTTP chunk stream
+                    #    (NOT the frame path — a FrameProcessor in the LLM->TTS
+                    #    path broke TTS, D21), so TTS keeps working while the
+                    #    reasoning tokens stream to the CoT box live.
+                    return _tap_reasoning_stream(stream)
+                except (RateLimitError, APIConnectionError, APITimeoutError) as e:
+                    # 429 (RateLimitError) / transient network / timeout.
+                    retryable = (
+                        isinstance(e, (RateLimitError, APIConnectionError, APITimeoutError))
+                        or (isinstance(e, APIStatusError) and e.status_code in (408, 429, 500, 502, 503, 504))
+                    )
+                    if not retryable or attempt > self.MAX_RETRIES:
+                        raise
+                    delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))  # 1s, 2s, 4s
+                    logger.warning(f"[me3] LLM {type(e).__name__} (attempt {attempt}/{self.MAX_RETRIES}); "
                                    f"retrying in {delay:.1f}s")
                     await _aio.sleep(delay)
-                else:
-                    raise
+                except APIStatusError as e:
+                    # Other HTTP errors (4xx except 429, 5xx handled above).
+                    if e.status_code in (500, 502, 503, 504) and attempt <= self.MAX_RETRIES:
+                        delay = self.RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        logger.warning(f"[me3] LLM HTTP {e.status_code} (attempt {attempt}/{self.MAX_RETRIES}); "
+                                       f"retrying in {delay:.1f}s")
+                        await _aio.sleep(delay)
+                    else:
+                        raise
+        finally:
+            _llm_swap["inflight"] -= 1
+
+
+# ---------------------------------------------------------------------------
+# Fallback TTS on pipeline errors (2026-11-06, re-merged 20:20+): pipecat
+# turns tool-validation failures and LLM/STT errors into ErrorFrames; with no
+# handler the pipeline just goes quiet and the user gets silence. These
+# processors intercept ErrorFrames and speak a short apology THROUGH the
+# pipeline TTS service (a second PyAudio stream on the held speaker fails
+# with OSError -9985). Cooldown dedupes bursts (a 429 fans out into frames).
+# ---------------------------------------------------------------------------
+_ERROR_APOLOGY_COOLDOWN_S = 20.0
+_last_error_apology = 0.0
+
+async def _speak_error_apology(tts, spk_dev: int, state: dict, text: str):
+    """Speak the apology THROUGH the pipeline TTS service."""
+    try:
+        import inspect as _insp
+        _kw = {"append_to_context": False}
+        if "allow_interruptions" in _insp.signature(TTSSpeakFrame.__init__).parameters:
+            _kw["allow_interruptions"] = False
+        await tts.queue_frame(TTSSpeakFrame(text, **_kw))
+        logger.info("[me3] error apology queued through pipeline TTS")
+    except Exception as e:
+        logger.error(f"[me3] error apology queue failed: {e!r}")
+
+class ErrorApologyTTS(FrameProcessor):
+    """Catch ErrorFrames and speak a short apology THROUGH the pipeline TTS
+    service so the user never gets silence. Cooldown-deduped."""
+
+    def __init__(self, tts, spk_dev: int, state: dict,
+                 text: str = "Sorry, that didn't go through."):
+        super().__init__()
+        self._tts = tts
+        self._spk_dev = spk_dev
+        self._state = state
+        self._text = text
+
+    async def process_frame(self, frame, direction):
+        await self.push_frame(frame, direction)
+        if isinstance(frame, ErrorFrame):
+            global _last_error_apology
+            now = time.monotonic()
+            if now - _last_error_apology > _ERROR_APOLOGY_COOLDOWN_S:
+                _last_error_apology = now
+                logger.warning(f"[me3] ErrorFrame caught -> apology: {frame.error!r}")
+                await _speak_error_apology(self._tts, self._spk_dev, self._state, self._text)
 
 async def run_bot():
     pa = pyaudio.PyAudio()
@@ -1342,6 +1446,11 @@ async def run_bot():
     vad = SileroVADAnalyzer(params=VADParams(
         confidence=0.90, start_secs=0.2, stop_secs=0.3, min_volume=0.85))
     gate_state = {"bot_speaking": False, "mic_level": 0.0}
+    import asyncio as _aio_mod
+    # mtime stays 0.0: the first poll (~2s) reads llm.json and compares
+    # its signature to the boot config, so a pre-existing UI choice is
+    # applied at startup too (not only on the next dropdown change).
+    _aio_mod.create_task(_llm_swap_poller(llm, gate_state))
     input_gate = InputGate(state=gate_state)
     status = StatusIndicator(state=gate_state)
     _me3_heartbeat()   # FIX: liveness heartbeat (UI: LISTENING vs OFF)
@@ -1349,7 +1458,8 @@ async def run_bot():
     await _MCP.start()
     context = LLMContext(tools=_function_schemas())
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
-        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad))
+        context, user_params=LLMUserAggregatorParams(vad_analyzer=vad,
+                                                     empty_user_turn=None))
 
     in_params = LocalAudioTransportParams(audio_in_enabled=True, audio_in_sample_rate=16000,
                                           audio_in_channels=1, input_device_index=MIC_DEV)
@@ -1372,9 +1482,17 @@ async def run_bot():
     # upstream StatusIndicator never sees in pipecat 1.12. It captures the
     # assistant's spoken reply + tool results into _RECENT_TEXT and pushes them
     # to the UI (fixes: blank assistant bubble on text turns, stale reply).
+    err_after_stt = ErrorApologyTTS(tts, SPK_DEV, gate_state,
+                                    text="Sorry, I didn't quite catch that.")
+    err_after_llm = ErrorApologyTTS(tts, SPK_DEV, gate_state,
+                                    text="Sorry, that didn't go through.")
+    # Apology speaker: sits between the LLM and the TTS service so a
+    # queued TTSSpeakFrame lands in the TTS and plays on the transport.
+    apology_proc = ErrorApologyTTS(tts, SPK_DEV, gate_state,
+                                   text="Sorry, that didn't go through.")
     pipeline = Pipeline([
-        in_transport, input_gate, stt, status, user_aggregator, llm,
-        tts, out_transport, assistant_aggregator,
+        in_transport, input_gate, stt, status, err_after_stt, user_aggregator, llm,
+        err_after_llm, apology_proc, tts, out_transport, assistant_aggregator,
     ])
     task = PipelineTask(pipeline, params=PipelineParams(enable_metrics=True, allow_interruptions=True),
                         cancel_on_idle_timeout=False, idle_timeout_secs=3600)
