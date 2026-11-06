@@ -796,14 +796,18 @@ async function demo(){
    Polls /ui_state at ~1 Hz and drives the same components the demo uses, but
    from real data. ME2 stays OBSERVE-ONLY (cards light when the agent fires a
    command; nothing here is clickable). On file:// this never runs.           */
+// sub-labels for thinking/tool are built LIVE in live() from m3.voice (the
+// voice agent's real LLM identity, pushed per push) — they used to be
+// hardcoded 'qwen3.8-27b · vllm' / 'me2-bridge' regardless of the actual
+// provider (2026-11-06). 'transcribing' and 'starting' were removed: the
+// agent never pushes those phases (it jumps listening→thinking directly), so
+// the UI stopped promising states that can't happen.
 const PHASE_MAP = {
   idle:{st:'idle',mode:'idle',sub:'waiting for speech'},
   listening:{st:'listening…',mode:'listen',sub:'vad · barge-in armed'},
-  transcribing:{st:'transcribing',mode:'listen',sub:'asr · finalizing'},
-  thinking:{st:'thinking…',mode:'think',sub:'qwen3.8-27b · vllm'},
-  tool:{st:'running tool…',mode:'listen',sub:'me2-bridge'},
-  speaking:{st:'speaking…',mode:'talk',sub:'tts · streaming'},
-  starting:{st:'starting…',mode:'listen',sub:'booting pipeline'}
+  thinking:{st:'thinking…',mode:'think',sub:'llm'},
+  tool:{st:'running tool…',mode:'listen',sub:'mcp-bridge'},
+  speaking:{st:'speaking…',mode:'talk',sub:'tts · streaming'}
 };
 const TOOL_TO_CHIP = {
   // Names MUST match the tool specs in me2_tools.py / spotify_tools.py /
@@ -956,6 +960,15 @@ function rebuildChat(s){
                                   // without this sync the first poll after a
                                   // refresh re-fires cotThink() with the stale
                                   // text into the FRESH CoT panel
+  // CoT change-key sync (2026-11-06): the poll fires cotThink() on
+  // lastCotText CHANGE, and a refresh leaves lastCotText '' — so any
+  // lingering m3.thinking/m3.cot re-fires the previous turn's think row
+  // into the FRESH panel (the 'stale think' bug). The voice agent clears
+  // thinking at round end, but the TYPED /chat path leaves m3.thinking
+  // set after the turn, so the only reliable fix is syncing the key here:
+  // the last turn's thought is already done, and a fresh turn resets
+  // lastCotText='' in the heard-change block above anyway.
+  lastCotText=m3.thinking||m3.cot||'';
   replyShown=m3.response||'';
   renderedTs=m3.ts||0;  // the last bubble is already drawn by the loop above —
                         // mark its turn rendered so the first poll doesn't
@@ -1002,7 +1015,13 @@ async function live(){
       t.textContent=want?'💭 on':'💭 off'; t.classList.toggle('on',want); } }
   try{
   const m3=s.me3||{}; const ph=m3.phase||'idle'; const pm=PHASE_MAP[ph]||PHASE_MAP.idle;
-  setVoice(pm.mode, pm.st, pm.sub);
+  // Provider-aware sub-labels (2026-11-06): m3.voice carries the VOICE LLM's
+  // real identity (agent-pushed); fall back to s.llm (the chat LLM) only when
+  // the agent hasn't pushed yet (fresh server / agent down).
+  const _vm=(m3.voice&&m3.voice.model)?m3.voice:(s.llm&&s.llm.model?s.llm:null);
+  const _vlab=_vm?_vm.model+' · '+_vm.provider:'llm';
+  const _sub=(ph==='thinking')?_vlab:(ph==='tool')?('mcp-bridge · '+(m3.tool||'…')):pm.sub;
+  setVoice(pm.mode, pm.st, _sub);
   setMicLevel(Math.round((m3.mic_level||0)*100));
   // turn boundary: a NEW heard text (2026-11-06). A (heard,response) pair
   // key was tried and rejected: the agent re-pushes the same heard while the

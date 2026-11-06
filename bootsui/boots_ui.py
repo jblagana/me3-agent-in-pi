@@ -73,6 +73,8 @@ STATE = {
             "tool": "", "tool_args": "", "tool_result": "", "tool_ms": 0,
             "tool_seq": 0, "turn": 0,
             "cot": "", "cot_round": 0,   # last non-empty thinking per round
+            "voice": {"provider": "llm", "model": "llm"},  # voice LLM identity
+            "latency": None,             # per-leg voice turn ms {asr,llm,tool,tts,total}
             "active": False, "mic": False,
             "mic_level": 0.0, "last_hb": 0.0, "ts": 0.0},
 }
@@ -1868,7 +1870,19 @@ class Handler(BaseHTTPRequestHandler):
                 # made the poll mint a fresh bubble per re-push, and the
                 # heard-only boundary reset mid-stream did the same).
                 _new_heard = (obj.get("heard") or m3["heard"])[:300]
-                if _new_heard and _new_heard != m3["heard"]:
+                # New-turn boundary = a 'listening' push with a fresh heard.
+                # NOT 'any push with a different heard' (2026-11-06): the
+                # agent's HEARTBEAT push carries the stale last-heard with
+                # phase='idle', and a mid-idle poll would then re-fire the
+                # turn bump + clear the previous turn's cot/latency (the Pi
+                # stress caught this: heartbeat wiped the stored latency).
+                # (the variable is `phase` — `_phase` was a typo that raised
+                # NameError on ANY new-heard turn push; the handler's except
+                # swallowed it as a generic "bad json" 400, so the Pi's
+                # real voice turns were all 400ing while same-heard pushes
+                # short-circuited past the bug and worked. 2026-11-06.)
+                if (_new_heard and _new_heard != m3["heard"]
+                        and phase in ("listening", "transcribing")):
                     m3["turn"] = m3.get("turn", 0) + 1
                     # New turn: drop the PREVIOUS turn's tool result so the
                     # UI's seq-keyed path can't re-flip the old chip green
@@ -1876,6 +1890,14 @@ class Handler(BaseHTTPRequestHandler):
                     # utterance, but a crashed/late agent could leave it).
                     m3["tool_result"] = ""
                     m3["tool_ms"] = 0
+                    # New turn: drop the PREVIOUS turn's CoT text too. The
+                    # UI's CoT box reads m3.thinking||m3.cot and fires on
+                    # change — a page refresh rebuilds the panel with an
+                    # empty lastCotText, so a lingering m3.cot would
+                    # re-fire the old turn's thinking into the fresh panel
+                    # (the 'stale think' bug, 2026-11-06).
+                    m3["cot"] = ""
+                    m3["thinking"] = ""
                 m3["phase"] = phase
                 # heard: the transcript arrives via _push_heard_to_ui (a separate,
                 # reliable POST); the agent's frame-pushes send empty heard, so we
@@ -1974,6 +1996,15 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         m3["latency"] = None
                 m3["mic"] = bool(obj.get("mic", False))
+                # voice: the VOICE agent's LLM identity (provider/model), pushed
+                # with every agent push (2026-11-06). The UI's provider-aware
+                # sub-labels read THIS, not s.llm (the typed-chat LLM — a
+                # different engine) and not the old hardcoded 'qwen3.8-27b ·
+                # vllm'.
+                v = obj.get("voice")
+                if isinstance(v, dict) and v.get("model"):
+                    m3["voice"] = {"provider": str(v.get("provider", "llm")),
+                                   "model": str(v.get("model", "llm"))}
                 # active = agent alive (any push, incl. the 2s heartbeat) OR a
                 # non-idle phase. A heartbeat omits 'active', so treat its
                 # presence (last_hb set below) as "alive".

@@ -96,6 +96,7 @@ from pipecat.frames.frames import (
     TTSSpeakFrame,
     TTSStoppedFrame,
     TTSAudioRawFrame,
+    BotStartedSpeakingFrame,
     BotStoppedSpeakingFrame,
     InterruptionFrame,
 )
@@ -149,6 +150,55 @@ _RECENT_TEXT = {"transcript": None, "reply": None, "tool": None, "tool_args": No
 # invisible to it). Global counter (never reset): the UI keys on CHANGE,
 # and it resets its own marker at each turn boundary.
 _LLM_ROUND = {"n": 0}
+# Per-leg voice turn latencies (ms) — 2026-11-06. The UI's LATENCY column was
+# dead for voice turns (only the typed /chat path ever set it). The agent
+# stamps these on the Pi's own clock: asr = TranscriptionFrame -> LLM round
+# start, llm = LLM round start -> first spoken text token (TTFT), tool =
+# FunctionCallsStarted -> FunctionCallResult, tts = LLM end -> BotStarted
+# Speaking, total = heard -> first audio out. Pushed as m3.latency on the
+# BotStartedSpeaking push (the server merges it into /ui_state).
+_VOICE_LAT = {"asr": None, "llm": None, "tool": None, "tts": None, "total": None}
+# Turn-boundary timestamps (monotonic) shared between StatusIndicator (which
+# sees the audio/ASR/TTS frames) and the reply tap (which sees the LLM
+# frames). Set by _voice_turn_start() / _voice_llm_start() / _voice_tts_end().
+_VOICE_T = {"heard": None, "llm_start": None, "tts_done": None,
+            "first_audio": None, "first_round": None}
+# Tool-call wall clock: set by StatusIndicator on FunctionCallsStartedFrame,
+# read by the reply tap on FunctionCallResultFrame (they're different
+# processors, so a shared global is the clean handoff).
+_TOOL_T0 = {"t": None}
+# Per-round flag: did the reasoning stream deliver real thinking tokens THIS
+# LLM round? When yes, the LLMTextFrame handler must NOT overwrite
+# _RECENT_TEXT['thinking'] with the reply text (that was the old CoT bug:
+# the box mirrored the answer, not the deliberation). Reset at round start.
+_REASONING_SEEN = {"round": 0}
+
+
+def _voice_turn_start():
+    """A new utterance was transcribed — reset the per-turn latency stamps."""
+    _VOICE_T["heard"] = time.monotonic()
+    # ASR leg = VAD speech-stop -> final transcript (the real ASR time).
+    # speech_end is stamped by StatusIndicator (it sees the VAD frames; the
+    # reply tap does not).
+    if _VOICE_T.get("speech_end"):
+        _VOICE_LAT["asr"] = int((_VOICE_T["heard"] - _VOICE_T["speech_end"]) * 1000)
+    _VOICE_T["llm_start"] = None
+    _VOICE_T["tts_done"] = None
+    _VOICE_T["first_audio"] = None
+    _VOICE_T["first_round"] = None
+    _VOICE_LAT.update({"asr": None, "llm": None, "tool": None, "tts": None, "total": None})
+
+
+def _voice_llm_start():
+    """First LLM round of the turn began (LLMFullResponseStartFrame)."""
+    _VOICE_T["llm_start"] = time.monotonic()
+    if _VOICE_T["first_round"] is None:
+        _VOICE_T["first_round"] = _VOICE_T["llm_start"]
+
+
+def _voice_tts_end():
+    """LLM finished its final round — start the TTS leg clock."""
+    _VOICE_T["tts_done"] = time.monotonic()
 
 # Human-readable "Boots is doing X" phrases for tool calls. Groq's Qwen often
 # responds to a command with a pure function call (NO text tokens), so without
@@ -203,6 +253,20 @@ def _tool_phrase(tool_name: str) -> str:
 _BOOTSUI = os.environ.get("ME3_BOOTSUI", "http://127.0.0.1:8330")
 
 
+def _voice_state() -> dict:
+    """The VOICE LLM identity (GroqResilientLLM's provider/model), for the UI's
+    provider-aware sub-labels. The UI's chat LLM (s.llm) is a DIFFERENT engine
+    (boots_ui.py's /chat) — the sub-labels must name the voice one, not the
+    chat one, and not a hardcoded 'qwen3.8-27b · vllm' (2026-11-06)."""
+    try:
+        base = (LLM_BASE_URL or "").lower()
+        prov = "groq" if "groq.com" in base else ("vllm" if "202.92" in base or "8001" in base else "llm")
+        model = LLM_MODEL or "llm"
+        return {"provider": prov, "model": model.split("/")[-1]}
+    except Exception:
+        return {"provider": "llm", "model": "llm"}
+
+
 def _me3_push(phase: str, label: str = "") -> None:
     """Best-effort POST of the current conversation state to the Boots UI."""
     import json as _json
@@ -224,6 +288,7 @@ def _me3_push(phase: str, label: str = "") -> None:
         "tool_args": (_RECENT_TEXT.get("tool_args") or "")[:400],
         "cot_round": _LLM_ROUND["n"],
         "tool_result": (_RECENT_TEXT.get("tool_result") or "")[:200],
+        "voice": _voice_state(),
         "active": phase != "idle",
     }
 
@@ -289,7 +354,7 @@ class StatusIndicator(FrameProcessor):
         self._reply_buf = []
         self._thinking_buf = []
         self._mic_active = False
-        self._tool_t0 = None
+        self._tool_t0 = None  # (legacy; tool latency now uses the shared _TOOL_T0)
         # time-based cooldown: after ME3 stops, keep the mic closed this many
         # seconds to absorb the speaker's echo tail before re-opening.
         self._rearm_at = 0.0
@@ -350,6 +415,7 @@ class StatusIndicator(FrameProcessor):
             self._mic_active = False
             self._clear_idle_timer()
             self._schedule_idle(2.5)
+            _VOICE_T["speech_end"] = time.monotonic()  # ASR leg clock start
         elif isinstance(frame, InterimTranscriptionFrame):
             text = (frame.text or "").strip()
             if text:
@@ -358,6 +424,7 @@ class StatusIndicator(FrameProcessor):
             self._set("listening", "Heard (interim): " + text[:60])
         elif isinstance(frame, TranscriptionFrame):
             text = (frame.text or "").strip()
+            _voice_turn_start()  # new utterance: reset the per-turn latency legs
             _RECENT_TEXT["transcript"] = text
             _RECENT_TEXT["reply"] = None
             _RECENT_TEXT["tool"] = None
@@ -403,6 +470,7 @@ class StatusIndicator(FrameProcessor):
             except Exception:
                 _RECENT_TEXT["tool_args"] = None
             self._tool_t0 = time.monotonic()
+            _TOOL_T0["t"] = self._tool_t0  # shared clock for the reply tap's tool leg
             # Fill the thinking bubble with a human phrase for the tool the LLM
             # chose to run (Groq's Qwen often emits a pure function call with NO
             # text tokens, which otherwise leaves the bubble blank). Use the first
@@ -426,10 +494,37 @@ class StatusIndicator(FrameProcessor):
             self._state["bot_speaking"] = True
             self._clear_idle_timer()
             self._set("speaking", "Speaking...")
-        elif isinstance(frame, TTSAudioRawFrame):
+        elif isinstance(frame, (BotStartedSpeakingFrame, TTSAudioRawFrame)):
             if not self._state.get("bot_speaking"):
                 self._state["bot_speaking"] = True
                 self._set("speaking", "Speaking...")
+            # First real audio out (2026-11-06): stamp the TTS leg (LLM end ->
+            # first audio) + the total (heard -> first audio), then push the
+            # latency dict so the UI's LATENCY column shows the voice turn's
+            # real numbers (it was dead for voice turns — typed chat only).
+            if self._state.get("bot_speaking") and _VOICE_T["tts_done"] \
+                    and _VOICE_LAT["tts"] is None:
+                _VOICE_LAT["tts"] = int((time.monotonic() - _VOICE_T["tts_done"]) * 1000)
+                # total = user finished speaking (transcript) -> first audio
+                # out of the speaker (the E2E number for the deck).
+                if _VOICE_T["heard"]:
+                    _VOICE_LAT["total"] = int((time.monotonic() - _VOICE_T["heard"]) * 1000)
+                try:
+                    import json as _j, threading as _t, urllib.request as _u
+                    lat = {k: v for k, v in _VOICE_LAT.items() if isinstance(v, (int, float))}
+                    body = {"latency": lat, "active": True,
+                            "phase": _LAST_STATUS.get("phase", "speaking")}
+                    def _lat_go():
+                        try:
+                            req = _u.Request(_BOOTSUI + "/me3", data=_j.dumps(body).encode("utf-8"),
+                                             headers={"Content-Type": "application/json"}, method="POST")
+                            with _u.urlopen(req, timeout=1.0) as r:
+                                r.read()
+                        except Exception:
+                            pass
+                    _t.Thread(target=_lat_go, daemon=True).start()
+                except Exception:
+                    pass
         elif isinstance(frame, BotStoppedSpeakingFrame):
             if getattr(self, "_tool_t0", None):
                 dt = time.monotonic() - self._tool_t0
@@ -490,6 +585,8 @@ def _me3_push_state(phase: str, thinking: str, reply: str) -> None:
                 "tool_args": (_RECENT_TEXT.get("tool_args") or "")[:400],
                 "cot_round": _LLM_ROUND["n"],
                 "tool_result": (_RECENT_TEXT.get("tool_result") or "")[:200],
+                "voice": _voice_state(),
+                "latency": {k: v for k, v in _VOICE_LAT.items() if isinstance(v, (int, float))} or None,
                 "mic": False, "active": True}
         def _go():
             try:
@@ -547,13 +644,26 @@ def _install_reply_tap(llm):
                 # counted because the number is what the poll sees, not the
                 # (cleared) thinking text.
                 _LLM_ROUND["n"] += 1
+                _voice_llm_start()   # ASR leg = heard -> this moment (see _VOICE_LAT)
                 _me3_push_state(_LAST_STATUS.get("phase", "thinking"), "", "")
             elif isinstance(frame, LLMTextFrame):
                 reply_buf.append(frame.text or "")
                 reply = "".join(reply_buf).strip()
                 if reply:
+                    # LLM leg = round start -> first spoken text token (TTFT),
+                    # stamped ONCE per round (2026-11-06: the UI's LATENCY
+                    # column was dead for voice turns).
+                    if _VOICE_LAT["llm"] is None and _VOICE_T["first_round"]:
+                        _VOICE_LAT["llm"] = int((time.monotonic() - _VOICE_T["first_round"]) * 1000)
                     _RECENT_TEXT["reply"] = reply
-                    _RECENT_TEXT["thinking"] = reply  # thinking bubble shows live text too
+                    # CoT shows the REAL thinking, not the reply (2026-11-06):
+                    # when the reasoning stream delivered tokens this round,
+                    # _RECENT_TEXT['thinking'] already holds the model's
+                    # deliberation — do NOT overwrite it with the reply text.
+                    # The reply-mirror fallback stays for rounds WITHOUT
+                    # reasoning (pure tool-call turns, reasoning_effort=none).
+                    if _REASONING_SEEN["round"] != _LLM_ROUND["n"]:
+                        _RECENT_TEXT["thinking"] = reply
                     # Push with the REAL phase (2026-11-06 dup-bubble fix):
                     # forcing "speaking" per token made the UI see
                     # thinking->speaking->thinking... per token, and the server
@@ -574,6 +684,7 @@ def _install_reply_tap(llm):
                     reply = _RECENT_TEXT.get("reply") or ""
                 _RECENT_TEXT["reply"] = reply
                 _RECENT_TEXT["thinking"] = ""  # done; stop the thinking spinner text
+                _voice_tts_end()  # TTS leg clock starts now (LLM finished)
                 # Push phase="speaking" at LLM end (2026-11-06): the server
                 # appends a history turn on the speaking->non-speaking
                 # transition, and with the real-phase text pushes above the
@@ -598,6 +709,11 @@ def _install_reply_tap(llm):
                 # tool result ("Lights are on, boo." is both).
                 if result and result not in ("IN_PROGRESS", "OK"):
                     _RECENT_TEXT["tool_result"] = result
+                # Tool leg = FunctionCallsStarted -> this result (shared clock:
+                # StatusIndicator sets _TOOL_T0, we read it here).
+                if _TOOL_T0["t"]:
+                    _VOICE_LAT["tool"] = int((time.monotonic() - _TOOL_T0["t"]) * 1000)
+                    _TOOL_T0["t"] = None
                 _me3_push_state(_LAST_STATUS.get("phase", "tool"), "",
                                 _RECENT_TEXT.get("reply") or "")
                 logger.info(f"[me3] tool result {fname!r}: {result[:80]!r}")
@@ -1059,6 +1175,51 @@ def _trim_llm_context(context, max_messages: int) -> None:
         logger.debug(f"[me3] context trim skipped: {e!r}")
 
 
+async def _tap_reasoning_stream(stream):
+    """Async-generator wrapper over the LLM's HTTP chunk stream: forwards
+    every chunk UNCHANGED, and tees `delta.reasoning` (Groq Qwen3.8's real
+    thinking tokens, present when reasoning_effort is set) into
+    _RECENT_TEXT['thinking'] + a throttled UI push. pipecat's base LLM only
+    pushes LLMTextFrame for delta.content — the reasoning field was being
+    dropped, so the voice CoT box could only mirror the reply text.
+
+    This is a STREAM wrapper, not a FrameProcessor: it never sits in the
+    pipecat frame path (a FrameProcessor between LLM and TTS broke TTS in
+    1.12 — D21), so the LLM->TTS flow is byte-identical. The generator must
+    be consumed exactly once (pipecat's _closing() handles aclose)."""
+    buf = []
+    last_push = 0.0
+    try:
+        async for chunk in stream:
+            try:
+                choices = getattr(chunk, "choices", None) or []
+                if choices:
+                    delta = getattr(choices[0], "delta", None)
+                    if delta is not None:
+                        # Groq puts reasoning on delta.reasoning (verified
+                        # live 2026-11-06); keep the openai convention too.
+                        r = getattr(delta, "reasoning", None) or \
+                            getattr(delta, "reasoning_content", None)
+                        if r:
+                            buf.append(r)
+                            _RECENT_TEXT["thinking"] = "".join(buf)[:400]
+                            _REASONING_SEEN["round"] = _LLM_ROUND["n"]
+                            now = time.monotonic()
+                            if now - last_push > 0.35:   # ~3 Hz push cap
+                                last_push = now
+                                _me3_push_state(_LAST_STATUS.get("phase", "thinking"),
+                                                _RECENT_TEXT["thinking"],
+                                                _RECENT_TEXT.get("reply") or "")
+            except Exception as e:
+                logger.debug(f"[me3] reasoning-tap chunk error: {e!r}")
+            yield chunk
+    finally:
+        # Round end: keep the accumulated reasoning in _RECENT_TEXT so the
+        # next LLMFullResponseStart's clear-push is the ONLY thing that wipes
+        # it (the UI's m3.cot server-side keeps the row visible regardless).
+        pass
+
+
 class GroqResilientLLM(OpenAILLMService):
     """OpenAILLMService with Groq 429 retry + context trimming (D23).
 
@@ -1077,6 +1238,20 @@ class GroqResilientLLM(OpenAILLMService):
         #    so the model always knows "now" (it otherwise has no clock and
         #    can't answer "what time is it?" or reason about relative times).
         _inject_current_time(context)
+        # 0b) REAL CoT (2026-11-06): ask Groq for reasoning tokens. Without
+        #     this the Qwen3.8 stream carries NO reasoning field (verified
+        #     live: reasoning=None), so the UI's CoT box could only mirror
+        #     the reply text. 'medium' balances token burn against the 1000-
+        #     OTPM tier; override via ME3_REASONING_EFFORT ('none' = off).
+        #     vLLM (local Qwen) uses enable_thinking instead — never send
+        #     reasoning_effort there.
+        if not LLM_USE_VLLM_THINKING:
+            _eff = os.environ.get("ME3_REASONING_EFFORT", "medium").strip().lower()
+            if _eff in ("minimal", "low", "medium", "high"):
+                try:
+                    self._settings.extra["reasoning_effort"] = _eff
+                except Exception:
+                    pass
         # 1) Keep the request light: trim to the most recent N messages.
         if self.MAX_CONTEXT_MESSAGES > 0:
             _trim_llm_context(context, self.MAX_CONTEXT_MESSAGES)
@@ -1087,7 +1262,17 @@ class GroqResilientLLM(OpenAILLMService):
         while True:
             attempt += 1
             try:
-                return await super().get_chat_completions(context)
+                stream = await super().get_chat_completions(context)
+                # 3) REAL CoT (2026-11-06): tee the stream's reasoning deltas
+                #    into the UI. pipecat only pushes LLMTextFrame for
+                #    delta.content — delta.reasoning (Groq's Qwen3.8 carries
+                #    it when reasoning_effort is set) is dropped on the floor,
+                #    which is why the voice CoT box could only mirror the
+                #    reply text. This wrapper sits on the HTTP chunk stream
+                #    (NOT the frame path — a FrameProcessor in the LLM->TTS
+                #    path broke TTS, D21), so TTS keeps working while the
+                #    reasoning tokens stream to the CoT box live.
+                return _tap_reasoning_stream(stream)
             except (RateLimitError, APIConnectionError, APITimeoutError) as e:
                 # 429 (RateLimitError) / transient network / timeout.
                 retryable = (
