@@ -9,11 +9,19 @@
 Description=ME3 voice agent (pipecat; ASR/LLM/TTS, drives the Boots UI on :8330)
 After=network-online.target me2-ui.service openvpn-sharc.service
 Wants=network-online.target me2-ui.service
+
+[Service]
+# Environment= MUST live in [Service] (2026-11-07): these lines used to sit in
+# [Unit], where systemd ignores them ("Unknown key 'Environment' in section
+# [Unit]") — so none of them ever applied.
 # ME3_VOICE: remote (default, DGX3 over VPN) or local (whisper.cpp + Piper).
 Environment=ME3_VOICE=remote
 Environment=ME3_NOISE_FLOOR_RMS=0.006
-
-[Service]
+# Mic gate while Boots speaks: 0 = mic stays OPEN (barge-in), relying on the
+# EMEET M1A's on-board full-duplex echo cancellation (measured 2026-11-07).
+# Set to 1 to restore the old "mute mic during TTS" behaviour (no code change),
+# then: sudo systemctl daemon-reload && sudo systemctl restart me3-agent
+Environment=ME3_GATE_MIC=0
 Type=simple
 User=jan
 WorkingDirectory=/home/jan/me3

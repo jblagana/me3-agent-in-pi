@@ -112,7 +112,13 @@ def _tavily_search(query: str, max_results: int = 4) -> str:
             if title or content:
                 bits.append(f"{title}. {content} ({url})")
         if answer:
-            return f"Here's what I found about {query}: {answer[:500]}"
+            # Answer + the sources it came from (2026-11-07): the answer-only
+            # result left the model no URLs to fetch_url or cite in
+            # write_website's `sources`.
+            srcs = "; ".join(f"{(r.get('title') or '').strip()[:70]} ({(r.get('url') or '').strip()})"
+                             for r in results[:3] if r.get("url"))
+            return (f"Here's what I found about {query}: {answer[:500]}"
+                    + (f" Sources: {srcs}." if srcs else ""))
         if bits:
             return f"Here's what I found about {query}: " + " ".join(bits)[:800]
         return ""
@@ -140,39 +146,44 @@ def _web_search(query: str) -> str:
 
     blocked = False
 
-    # 1) Find candidate article titles + URLs via MediaWiki opensearch.
-    api = ("https://en.wikipedia.org/w/api.php?action=opensearch&search="
-           + urllib.parse.quote(q)
-           + "&limit=5&namespace=0&format=json&redirects=resolve")
+    # 1) Candidate articles via MediaWiki FULL-TEXT search (2026-11-07).
+    #    opensearch is a title-PREFIX match: "Mayon Volcano height" found
+    #    nothing, so every research query fell through to "couldn't find".
+    api = ("https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch="
+           + urllib.parse.quote(q) + "&srlimit=5&format=json")
     body = _get(api)
-    candidates = []  # list of (title, url)
+    candidates = []  # list of (title, url, snippet)
     if not body:
         blocked = True
     else:
         try:
-            data = json.loads(body)
-            titles = data[1] if len(data) > 1 else []
-            urls = data[3] if len(data) > 3 else []
-            for i, t in enumerate(titles):
-                u = urls[i] if i < len(urls) else ""
-                candidates.append((t, u))
+            for hit in (json.loads(body).get("query") or {}).get("search") or []:
+                t = hit.get("title") or ""
+                snip = _strip_html(hit.get("snippet") or "")
+                candidates.append((t, "https://en.wikipedia.org/wiki/"
+                                   + urllib.parse.quote(t.replace(" ", "_")), snip))
         except Exception:
             blocked = True
 
-    # 2) Fetch the top candidate's REST summary (clean plain-text extract).
+    # 2) Top hit's REST summary (clean plain text) + the other hits' titles
+    #    and URLs, so a research step can fetch_url the best ones next.
     if candidates:
-        title, _url = candidates[0]
+        title, url, _ = candidates[0]
         api_title = urllib.parse.quote(title.replace(" ", "_"))
         summ = _get(f"https://en.wikipedia.org/api/rest_v1/page/summary/{api_title}")
+        extract = ""
         if summ:
             try:
-                sd = json.loads(summ)
-                extract = (sd.get("extract") or "").strip()
-                if extract:
-                    extract = extract[:600]
-                    return (f"Here's what I found about {title}: {extract}")
+                extract = (json.loads(summ).get("extract") or "").strip()[:700]
             except Exception:
                 pass
+        others = "; ".join(f"{t} ({u})" for t, u, _s in candidates[1:4])
+        if extract:
+            return (f"Here's what I found about {title} ({url}): {extract}"
+                    + (f" Related pages: {others}." if others else ""))
+        if others or candidates:
+            return ("Top results: " + "; ".join(
+                f"{t} ({u}) — {s[:120]}" for t, u, s in candidates[:4]))
 
     # 3) Fallback: try a REST summary directly on the raw query.
     direct = _get("https://en.wikipedia.org/api/rest_v1/page/summary/"
@@ -223,25 +234,60 @@ def _fetch_url(url: str) -> str:
     # Safety: only allow public hosts (never localhost / private ranges).
     if host in ("localhost", "127.0.0.1", "0.0.0.0") or host.startswith(("192.168.", "10.")):
         return "I can only open public web pages, not private or local ones."
+    # Wikipedia: the plain-text extract API (2026-11-07) — the raw HTML's
+    # first 700 chars were pure navigation ("Jump to content Main menu…"),
+    # useless as a research source for write_website.
+    m = re.match(r"https?://([a-z\-]+)\.(?:m\.)?wikipedia\.org/wiki/([^?#]+)", u)
+    if m:
+        api = (f"https://{m.group(1)}.wikipedia.org/w/api.php?action=query&prop=extracts"
+               f"&explaintext=1&redirects=1&format=json&titles={m.group(2)}")
+        body = _get(api)
+        try:
+            pages = (json.loads(body).get("query") or {}).get("pages") or {}
+            text = " ".join((p.get("extract") or "") for p in pages.values())
+            text = _WS_RE.sub(" ", text).strip()
+            if text:
+                return f"From {host}: {text[:_FETCH_CHARS]}"
+        except Exception:
+            pass
     body = _get(u, headers={"Accept": "text/html, text/plain, */*"}, timeout=TIMEOUT)
     if not body:
         return f"I couldn't load that page: {u}. It may be offline or blocking bots."
-    text = _strip_html(body)
+    text = _readable_text(body)
     if not text:
         return f"I loaded {u} but couldn't find readable text on it."
-    snippet = text[:700]
-    return f"From {host}: {snippet}"
+    return f"From {host}: {text[:_FETCH_CHARS]}"
+
+
+# Enough text to research from (the LLM summarizes it); was 700.
+_FETCH_CHARS = int(os.environ.get("WEB_FETCH_CHARS", "2500"))
+
+
+def _readable_text(raw: str) -> str:
+    """Main content, not chrome: <article>/<main> if present, else the
+    page's <p> paragraphs, else the whole stripped page."""
+    for tag in ("article", "main"):
+        mm = re.search(rf"<{tag}\b[^>]*>(.*?)</{tag}>", raw, re.S | re.I)
+        if mm:
+            t = _strip_html(mm.group(1))
+            if len(t) > 200:
+                return t
+    paras = [_strip_html(p) for p in re.findall(r"<p\b[^>]*>(.*?)</p>", raw, re.S | re.I)]
+    paras = [p for p in paras if len(p) > 40]
+    if paras:
+        return " ".join(paras)
+    return _strip_html(raw)
 
 # ---------------------------------------------------------------------------
 # check_weather -- current weather via Open-Meteo (no key, no bot-gate).
 #   Geocoding + forecast are both free, keyless, and JSON. Location order:
 #   (1) an explicit place name -> geocoded; (2) stored GPS from the dashboard
 #   (~/.me3_location.json, written by the UI's /location endpoint, or "gps");
-#   (3) a default home location (UP Diliman) so it always works.
+#   (3) a default home location (U.P. Diliman) so it always works.
 # ---------------------------------------------------------------------------
 _GPS_FILE = os.path.join(os.path.expanduser("~"), ".me3_location.json")
-# Default home = UP Diliman (matches the ME2 tile). lat, lon, label.
-_HOME_LOCATION = (14.6534, 121.0673, "UP Diliman")
+# Default home = U.P. Diliman (matches the ME2 tile). lat, lon, label.
+_HOME_LOCATION = (14.6534, 121.0673, "U.P. Diliman")
 
 # WMO weather-code -> short spoken condition. (Open-Meteo "weathercode" group.)
 _WMO = {
@@ -272,7 +318,8 @@ def _geocode(name: str):
             return None, None, None
         r = results[0]
         label = r.get("name") or name
-        adm = [x for x in (r.get("admin2"), r.get("admin1")) if x]
+        # skip a region equal to the place itself ("Tokyo, Tokyo")
+        adm = [x for x in (r.get("admin2"), r.get("admin1")) if x and x != label]
         if adm:
             label = label + ", " + ", ".join(adm[:1])
         return r.get("latitude"), r.get("longitude"), label
@@ -304,6 +351,27 @@ def _resolve_location(location: str):
         # Unresolvable name: try to geocode as a plain city, else fail-soft home.
     # (3) default home.
     return _HOME_LOCATION
+
+def _post_weather_card(place, temp, condition, code) -> None:
+    """Show this lookup on the Boots UI WEATHER card (POST /weather).
+    Fire-and-forget on a daemon thread: never slows or breaks the tool."""
+    if temp is None:
+        return
+    import threading
+    base = os.environ.get("ME3_BOOTSUI", "http://127.0.0.1:8330")
+    body = json.dumps({"place": place, "temp": temp,
+                       "condition": condition, "code": code}).encode()
+
+    def _go():
+        try:
+            req = urllib.request.Request(base + "/weather", data=body,
+                                         headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=1.5) as r:
+                r.read()
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
 
 def _check_weather(location: str = "") -> str:
     """Current weather for a place. Returns a speakable summary string."""
@@ -343,6 +411,7 @@ def _check_weather(location: str = "") -> str:
             extras.append(f"{pmax} percent chance of rain")
         if extras:
             parts.append("Today: " + ", ".join(extras) + ".")
+        _post_weather_card(name, t_now, cond if cond != "unremarkable" else "", code)
         return " ".join(parts)
     except Exception as e:
         return f"I hit a problem checking the weather ({e!r}). Please try again."
@@ -351,12 +420,18 @@ def _check_weather(location: str = "") -> str:
 # Canonical tool specs (same shape as me2_tools.TOOL_SPECS)
 # (name, description, params) -- params is the OpenAI JSON-schema "properties".
 # ---------------------------------------------------------------------------
+# Params the model may OMIT (not in the schema's `required`). check_weather
+# without a place = U.P. Diliman; a required `location` made the model
+# ask "where?" instead of just calling (2026-11-07).
+OPTIONAL_PARAMS = {"check_weather": {"location"}}
+
 TOOL_SPECS = [
     ("check_weather",
-     "Get the CURRENT weather (temperature, conditions, wind) for a place. Use "
-     "when the user asks about the weather, the temperature, or whether it will "
-     "rain. Pass a location only when the user names a place (a city name); "
-     "leave it empty otherwise — never guess or pass 'here'.",
+     "Get the CURRENT weather (temperature, conditions, wind). Use when the "
+     "user asks about the weather, the temperature, or whether it will rain. "
+     "If the user does NOT name a place, call this IMMEDIATELY with no "
+     "location — it defaults to U.P. Diliman (the default home). Never ask where. "
+     "Pass a location only when the user names a place (a city name).",
      {"location": {"type": "string"}}),
     ("web_search",
      "Search the web for information about a topic or question. Use this when "
@@ -443,8 +518,35 @@ SITES_DIR = os.environ.get("WEBSITES_DIR",
                            os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                         "bootsui", "sites"))
 # Base URL the user can open the generated site from (Pi's LAN IP, UI port).
-_SITE_HOST = os.environ.get("WEBSITE_HOST", "192.168.1.3")
 _SITE_PORT = os.environ.get("WEBSITE_PORT", "8330")
+
+
+def _site_host() -> str:
+    """WEBSITE_HOST if set, else the Pi's LAN address, detected per call
+    (2026-11-07). The old fixed default 192.168.1.3 was stale (the Pi is on
+    192.168.137.x now), and the default-route source is NOT the answer here:
+    the route goes through the VPN (tun0 192.168.100.5), which a LAN browser
+    can't reach. So: first IPv4 on a non-loopback, non-tunnel interface."""
+    h = os.environ.get("WEBSITE_HOST", "").strip()
+    if h:
+        return h
+    try:
+        import subprocess
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show"], capture_output=True,
+                             text=True, timeout=3).stdout
+        for line in out.splitlines():
+            parts = line.split()
+            iface, addr = parts[1], parts[3].split("/")[0]
+            if iface == "lo" or iface.startswith(("tun", "tap", "wg", "docker", "veth", "br-")):
+                continue
+            return addr
+    except Exception:
+        pass
+    try:
+        import socket
+        return socket.gethostname() + ".local"   # mDNS (avahi runs on the Pi)
+    except Exception:
+        return "localhost"
 
 # GitHub Pages publish (opt-in via publish=true).
 _GH_REPO = os.environ.get("WEBSITE_GH_REPO", "jblagana/boots-sites")
@@ -864,8 +966,10 @@ def _write_website(topic: str, title: str, description: str,
     except Exception as e:
         return f"I couldn't save the website file ({e!r})."
 
-    url = f"http://{_SITE_HOST}:{_SITE_PORT}/site/{slug}.html"
-    verify = _verify_site(url, html)
+    url = f"http://{_site_host()}:{_SITE_PORT}/site/{slug}.html"
+    # Verify through loopback: the server is on this machine, and the LAN
+    # address can be unreachable from itself (or wrong, like the old default).
+    verify = _verify_site(f"http://127.0.0.1:{_SITE_PORT}/site/{slug}.html", html)
     n_sec = len([s for s in (sections or [])
                  if isinstance(s, dict) and ((s.get("heading") or "").strip()
                                              or (s.get("body") or "").strip())])

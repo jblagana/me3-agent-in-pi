@@ -85,7 +85,7 @@ def _check(command: str):
         if base in BLOCKED_VERBS:
             return f"I can't run {base} — that's a destructive or system command, off limits for me."
     if SYSTEM_PATH.search(command):
-        return "That touches system folders — off limits. I only work in Jan's home folder."
+        return "That touches system folders — off limits. I only work in your home folder."
     return None
 
 

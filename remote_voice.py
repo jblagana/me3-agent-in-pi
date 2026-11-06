@@ -32,18 +32,19 @@ from pipecat.services.tts_service import TTSService
 # DGX3 uses /v1/chat/completions with an input_audio content part.
 ASR_PROVIDER = os.environ.get("ME3_ASR_PROVIDER", "groq")
 # Groq (OpenAI-compatible) credentials + endpoints.
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY",
-                              "***REMOVED-GROQ-KEY***")
+# Keys come ONLY from the environment (/etc/me3/groq.env on the Pi) -- no
+# hardcoded fallbacks: this repo is public (2026-11-07 secrets cleanup).
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GROQ_BASE_URL = os.environ.get("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 ASR_MODEL = os.environ.get("ME3_ASR_MODEL", "whisper-large-v3-turbo")
 # DGX3 (legacy fallback for TTS / ASR)
 DGX3_HOST = os.environ.get("ME3_DGX3_HOST", "10.153.60.233")
 ASR_BASE_URL = os.environ.get("ME3_ASR_BASE_URL", f"http://{DGX3_HOST}:8000/v1")
 TTS_BASE_URL = os.environ.get("ME3_TTS_BASE_URL", f"http://{DGX3_HOST}:8001/v1")
-DGX3_API_KEY = os.environ.get("ME3_DGX3_API_KEY",
-                              "***REMOVED-DGX3-KEY***")
+DGX3_API_KEY = os.environ.get("ME3_DGX3_API_KEY", "")
 TTS_MODEL = os.environ.get("ME3_TTS_MODEL", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
 TTS_VOICE = os.environ.get("ME3_TTS_VOICE", "vivian")
+TTS_SPEED = float(os.environ.get("ME3_TTS_SPEED", "1.08"))   # DGX3 fallback voice: +8 %
 # TTS_SAMPLE_RATE: the rate we hand to the pipeline / welcome path. The DGX3
 # Qwen3-TTS emits a FIXED 24 kHz PCM stream (it rejects a sample_rate override
 # with HTTP 400), so _synthesize resamples 24 kHz -> TTS_SAMPLE_RATE with soxr.
@@ -70,6 +71,127 @@ EDGE_PITCH = os.environ.get("ME3_EDGE_PITCH", "+30Hz")
 EDGE_RATE = os.environ.get("ME3_EDGE_RATE", "+8%")
 EDGE_TIMEOUT_S = float(os.environ.get("ME3_EDGE_TIMEOUT_S", "8.0"))
 TTS_BACKEND = os.environ.get("ME3_TTS_BACKEND", "auto").lower()
+
+# Turn-start hook: agent.py points this at StatusIndicator.on_transcript.
+ON_TRANSCRIPT = None
+
+# fd-benchmark stage mark (2026-11-07). Our transcript is re-delivered
+# straight to the aggregator (push_frame below), so the benchmark's Pipecat
+# observer never sees the TranscriptionFrame -> ASR final + WER would read
+# "not reported". Its documented level-2 hook: mark("asr_final", text=...).
+# Only importable when launch_assistant.py runs Boots; a no-op otherwise.
+try:
+    from fdbench_marks import mark as _fdb_mark
+except Exception:
+    _fdb_mark = None
+
+
+import re as _re
+_URL_RE = _re.compile(r"https?://[^\s<>\"'\])]+")
+_URL_TOK = "\x00URL\x00"
+# "<url> and <url>", "<url>, <url>, or <url>" -> one plural phrase
+_URL_RUN_RE = _re.compile(_re.escape(_URL_TOK) + r"(?:\s*(?:,\s*)?(?:and|or|,)\s*" + _re.escape(_URL_TOK) + r")+")
+
+
+# Spoken site names (2026-11-07): Boots never reads a domain out loud
+# ("en dot wikipedia dot org"); it says the site's name instead.
+_SITE_NAMES = {"wikipedia": "Wikipedia", "britannica": "Britannica", "statista": "Statista",
+               "nationalgeographic": "National Geographic", "bbc": "BBC", "cnn": "CNN",
+               "nasa": "NASA", "youtube": "YouTube", "github": "GitHub", "reddit": "Reddit",
+               "google": "Google", "nytimes": "the New York Times", "theguardian": "the Guardian",
+               "reuters": "Reuters", "apnews": "AP News", "phivolcs": "PHIVOLCS",
+               "pagasa": "PAGASA", "inquirer": "the Inquirer", "rappler": "Rappler",
+               "worldbank": "the World Bank", "who": "the WHO", "un": "the UN"}
+_SLDS = {"com", "org", "net", "gov", "edu", "ac", "co", "mil", "int"}
+_SKIP_LABELS = {"www", "m", "en", "mobile", "amp"}
+_TLDS = ("com|org|net|gov|edu|io|ai|co|ph|uk|us|ca|au|de|fr|jp|info|news|"
+         "dev|app|me|tv|int|mil")
+_BARE_DOMAIN_RE = _re.compile(r"\b(?:[a-z0-9-]+\.)+(?:%s)\b(?:/[^\s,;!?)]*)?" % _TLDS, _re.I)
+
+
+def site_name(host: str) -> str:
+    """'en.wikipedia.org' -> 'Wikipedia', 'www.britannica.com' -> 'Britannica',
+    'phivolcs.dost.gov.ph' -> 'PHIVOLCS', 'tanawexplorer.com' -> 'Tanawexplorer'."""
+    labels = [l for l in str(host or "").lower().split("/")[0].split(":")[0].split(".") if l]
+    if len(labels) >= 2:
+        labels = labels[:-1]                              # TLD
+        if len(labels) >= 2 and labels[-1] in _SLDS:
+            labels = labels[:-1]                          # .gov.ph / .co.uk
+    labels = [l for l in labels if l not in _SKIP_LABELS] or labels
+    if not labels:
+        return "the site"
+    for l in labels:                                      # any well-known name wins
+        if l in _SITE_NAMES:
+            return _SITE_NAMES[l]
+    return labels[-1].replace("-", " ").title()
+
+
+def _speakable(text: str) -> str:
+    """Text for TTS with links NOT read aloud (2026-11-07): the bubble keeps
+    the clickable URL; the voice says "the link in the chat" instead of
+    "h t t p colon slash slash one nine two dot…". Trailing sentence
+    punctuation stays outside the replacement. Pipecat's sentence splitter
+    keeps a URL inside one chunk (verified), so per-chunk replacement is safe."""
+    if "http" not in text:
+        # bare domains ("I'm reading en.wikipedia.org") -> the site's name
+        return _BARE_DOMAIN_RE.sub(lambda m: site_name(m.group(0)), text) if "." in text else text
+
+    def _tok(m):
+        u = m.group(0)
+        tail = _re.search(r"[.,;:!?]+$", u)
+        return _URL_TOK + (tail.group(0) if tail else "")
+
+    t = _URL_RE.sub(_tok, text)
+    t = _URL_RUN_RE.sub("the links in the chat", t)
+    t = t.replace(_URL_TOK, "the link in the chat")
+    return _BARE_DOMAIN_RE.sub(lambda m: site_name(m.group(0)), t)
+
+
+# --- Groq ASR transport (2026-11-07) ----------------------------------------
+# ONE kept-alive HTTPS session (a fresh TLS handshake per utterance cost ~0.7 s),
+# FLAC instead of WAV (half the upload), and a pre-warm the moment the user
+# STARTS speaking so an idle-closed connection is open again by the end.
+# ME3_ASR_LANGUAGE (e.g. "en") pins the language; unset = Whisper auto-detect
+# (keeps Taglish/Tagalog working; it made no speed difference in the test).
+ASR_LANGUAGE = os.environ.get("ME3_ASR_LANGUAGE", "").strip()
+_GROQ = {"session": None, "warm_ts": 0.0}
+
+
+def _groq_session():
+    import requests
+    if _GROQ["session"] is None:
+        _GROQ["session"] = requests.Session()
+    return _GROQ["session"]
+
+
+def prewarm_asr():
+    """Open (or keep open) the HTTPS connection to Groq, off the audio path.
+    Called on 'user started speaking'; throttled to once per 20 s."""
+    import threading
+    now = time.time()
+    if now - _GROQ["warm_ts"] < 20:
+        return
+    _GROQ["warm_ts"] = now
+
+    def _go():
+        try:
+            _groq_session().get(GROQ_BASE_URL + "/models", timeout=5,
+                                headers={"Authorization": f"Bearer {GROQ_API_KEY}"})
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+
+def _wav_to_flac(wav_bytes: bytes):
+    """WAV -> FLAC bytes (lossless, ~half the size); None if unavailable."""
+    try:
+        import soundfile as sf
+        data, sr = sf.read(io.BytesIO(wav_bytes), dtype="int16")
+        out = io.BytesIO()
+        sf.write(out, data, sr, format="FLAC")
+        return out.getvalue()
+    except Exception:
+        return None
 
 
 def _to_wav_bytes(samples_f32: np.ndarray, sample_rate: int = 16000) -> bytes:
@@ -185,15 +307,22 @@ class Qwen2AudioSTTService(SegmentedSTTService):
         bans urllib's browser signature on the multipart ASR upload, while
         `requests` passes. Returns the transcript text (may be empty)."""
         import base64
-        import requests
         wav_bytes = base64.b64decode(wav_b64)
-        r = requests.post(
+        # Faster ASR leg (2026-11-07, measured on the Pi, 4.2 s utterance):
+        #   new connection per call + WAV ....... 1.54 s
+        #   kept-alive Session ................... 0.82 s  (no TLS handshake)
+        #   + FLAC upload (61 KB vs 132 KB) ...... 0.61 s
+        name, data, mime = "segment.wav", wav_bytes, "audio/wav"
+        flac = _wav_to_flac(wav_bytes)
+        if flac:
+            name, data, mime = "segment.flac", flac, "audio/flac"
+        form = {"model": ASR_MODEL, "response_format": "json"}
+        if ASR_LANGUAGE:
+            form["language"] = ASR_LANGUAGE
+        r = _groq_session().post(
             GROQ_BASE_URL + "/audio/transcriptions",
             headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-            files={"file": ("segment.wav", wav_bytes, "audio/wav")},
-            data={"model": ASR_MODEL},
-            timeout=60,
-        )
+            files={"file": (name, data, mime)}, data=form, timeout=60)
         if r.status_code != 200:
             raise RuntimeError(f"Groq ASR HTTP {r.status_code}: {r.text[:200]}")
         return (r.json().get("text") or "").strip()
@@ -255,6 +384,12 @@ class Qwen2AudioSTTService(SegmentedSTTService):
         try:
             text = await asyncio.to_thread(self._transcribe_sync, wav_b64)
             text = _clean_transcript(text)
+            # No words at all (".", "…" from a noise burst) -> not a turn
+            # (2026-11-07: "." was sent to the LLM as a user message).
+            if not _re.search(r"[A-Za-z0-9]", text or ""):
+                if text:
+                    logger.info(f"[asr-dgx3] dropped word-less transcript {text!r}")
+                text = ""
             if text:
                 logger.info(f"[asr-dgx3] transcript: {text!r}")
                 # FIX (UI "heard" bubble): pipecat 1.12's SegmentedSTTService
@@ -265,6 +400,17 @@ class Qwen2AudioSTTService(SegmentedSTTService):
                 # the transcript straight to the Boots UI here (where we have the
                 # value in hand), guaranteeing the user bubble + heard field.
                 self._push_heard_to_ui(text)
+                if _fdb_mark is not None:
+                    _fdb_mark("asr_final", text=text)
+                # Turn-start hook (agent.py sets it to StatusIndicator.
+                # on_transcript): the TranscriptionFrame is re-delivered
+                # straight to the aggregator (push_frame above), so the
+                # status tap never sees it otherwise. Never breaks ASR.
+                if ON_TRANSCRIPT is not None:
+                    try:
+                        ON_TRANSCRIPT(text)
+                    except Exception as _e:
+                        logger.warning(f"[asr-dgx3] ON_TRANSCRIPT hook failed: {_e!r}")
                 yield TranscriptionFrame(text, "", "dgx3")
         except Exception as e:
             logger.error(f"[asr-dgx3] transcription failed: {e!r}")
@@ -283,7 +429,11 @@ class Qwen2AudioSTTService(SegmentedSTTService):
 
             def _go():
                 try:
-                    body = {"heard": text[:300], "phase": "listening"}
+                    # new_turn: one per transcript, so the server starts a
+                    # fresh turn even when the words repeat ("hey" twice)
+                    # -- heard-text change alone can't see a repeat.
+                    body = {"heard": text[:300], "phase": "listening",
+                            "new_turn": True}
                     req = _u.Request(base + "/me3", data=_j.dumps(body).encode("utf-8"),
                                      headers={"Content-Type": "application/json"}, method="POST")
                     with _u.urlopen(req, timeout=0.4) as r:
@@ -342,16 +492,31 @@ class Qwen3TTSService(TTSService):
             # no "sample_rate" key: DGX3 Qwen3-TTS rejects it (HTTP 400) and
             # always returns its native TTS_NATIVE_SR (24 kHz) PCM.
         }
-        req = urllib.request.Request(
-            TTS_BASE_URL + "/audio/speech",
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Authorization": f"Bearer {DGX3_API_KEY}",
-                     "Content-Type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"DGX3 TTS HTTP {resp.status}")
-            native = resp.read()
+        # Speaking rate +8 % like the primary voice (Roger +8 %), 2026-11-07.
+        # The server honours `speed` (tested: 1.5 -> 2.5 s vs 4.0 s; 0.7 ->
+        # 7.0 s); retried without it below if a server version rejects it.
+        if TTS_SPEED and TTS_SPEED != 1.0:
+            payload["speed"] = TTS_SPEED
+
+        def _post(body):
+            req = urllib.request.Request(
+                TTS_BASE_URL + "/audio/speech",
+                data=json.dumps(body).encode("utf-8"),
+                headers={"Authorization": f"Bearer {DGX3_API_KEY}",
+                         "Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                if resp.status != 200:
+                    raise RuntimeError(f"DGX3 TTS HTTP {resp.status}")
+                return resp.read()
+        try:
+            native = _post(payload)
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and "speed" in payload:     # older server: no speed
+                payload.pop("speed")
+                native = _post(payload)
+            else:
+                raise
         if sample_rate == TTS_NATIVE_SR:
             return native
         samples = np.frombuffer(native, dtype=np.int16).astype(np.float64)
@@ -360,7 +525,7 @@ class Qwen3TTSService(TTSService):
         return out.astype(np.int16).tobytes()
 
     async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
-        text = (text or "").strip()
+        text = _speakable((text or "").strip())   # never read URLs aloud
         if not text:
             return
         logger.info(f"[tts-dgx3] synthesizing: {text!r}")
@@ -467,7 +632,97 @@ class EdgeTTSService(Qwen3TTSService):
         return super()._synthesize(text, sample_rate)
 
 
-class BootsTTSService(EdgeTTSService):
+def _mp3_to_pcm24k(buf):
+    """Decode the MP3 received so far -> int16 mono 24 kHz (edge-tts's native rate)."""
+    import miniaudio
+    try:
+        d = miniaudio.decode(bytes(buf), output_format=miniaudio.SampleFormat.SIGNED16,
+                             nchannels=1, sample_rate=24000)
+        return np.asarray(d.samples, dtype=np.int16)
+    except miniaudio.DecodeError:
+        return np.zeros(0, np.int16)
+
+
+# Lead silence for PIPELINE replies (2026-11-07). The 0.45 s LEAD_SILENCE_S
+# covers the EMEET dropping the head of a FRESHLY OPENED stream (the welcome
+# path opens its own); the pipeline's output stream stays open, so replies
+# need far less. Benchmark mode (direct feed, no device) uses 0.
+REPLY_LEAD_S = float(os.environ.get(
+    "ME3_REPLY_LEAD_S", "0" if os.environ.get("ME3_BENCH") == "1" else "0.1"))
+# (0.1 s since the speaker stream is kept running between replies -- agent.py
+#  _KeepAliveMixer -- so there is no stream (re)start for padding to cover.)
+_STREAM_FIRST_BYTES = 720      # ~0.12 s of 48 kbit/s MP3 -> first audio ASAP
+_STREAM_NEXT_BYTES = 2400      # then decode every ~0.4 s of audio
+
+
+class StreamingEdgeTTSService(EdgeTTSService):
+    """edge-tts STREAMED (2026-11-07): plays the first audio while the rest of
+    the sentence is still being synthesized, instead of synthesizing the whole
+    sentence to an MP3 file and decoding it before the first sample.
+
+    Measured on the Pi: first audio ~0.7-1.0 s instead of 1.0-1.9 s, same voice.
+    How: re-decode the growing MP3 buffer and emit only the new samples
+    (verified bit-identical to a single full decode -> no seams), then a
+    streaming soxr resampler 24 kHz -> 48 kHz. Falls back to the old
+    full-synthesis path (and its Qwen3 fallback) if streaming fails before any
+    audio was sent."""
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        text = _speakable((text or "").strip())   # never read URLs aloud
+        if not text:
+            return
+        if not self._edge_enabled():
+            async for f in super().run_tts(text, context_id):
+                yield f
+            return
+        import edge_tts, soxr
+        t0 = time.time()
+        rs = soxr.ResampleStream(24000, TTS_SAMPLE_RATE, 1, dtype="int16")
+        buf = bytearray(); emitted = 0; last_len = 0; sent = False
+        try:
+            if REPLY_LEAD_S > 0:
+                yield TTSAudioRawFrame(b"\x00\x00" * int(TTS_SAMPLE_RATE * REPLY_LEAD_S),
+                                       TTS_SAMPLE_RATE, 1, context_id=context_id)
+            comm = edge_tts.Communicate(text, EDGE_VOICE, pitch=EDGE_PITCH, rate=EDGE_RATE)
+            agen = comm.stream()
+            while True:
+                try:
+                    ch = await asyncio.wait_for(agen.__anext__(), timeout=EDGE_TIMEOUT_S)
+                except StopAsyncIteration:
+                    break
+                if ch.get("type") != "audio":
+                    continue
+                buf += ch["data"]
+                need = _STREAM_FIRST_BYTES if not sent else _STREAM_NEXT_BYTES
+                if len(buf) - last_len < need:
+                    continue
+                last_len = len(buf)
+                pcm = _mp3_to_pcm24k(buf)
+                new = pcm[emitted:]; emitted = len(pcm)
+                if len(new):
+                    out = rs.resample_chunk(new)
+                    if len(out):
+                        if not sent:
+                            logger.info(f"[tts-edge] streaming: first audio {time.time()-t0:.2f}s")
+                        sent = True
+                        yield TTSAudioRawFrame(out.tobytes(), TTS_SAMPLE_RATE, 1, context_id=context_id)
+            pcm = _mp3_to_pcm24k(buf)
+            tail = rs.resample_chunk(pcm[emitted:], last=True)
+            if len(tail):
+                sent = True
+                yield TTSAudioRawFrame(tail.tobytes(), TTS_SAMPLE_RATE, 1, context_id=context_id)
+            logger.info(f"[tts-edge] streamed {len(text)} chars in {time.time()-t0:.2f}s")
+        except Exception as e:
+            self._edge_ok = False
+            self._edge_fail_ts = time.time()
+            logger.warning(f"[tts-edge] streaming failed ({e!r})"
+                           + ("; qwen3 fallback" if not sent else "; reply cut short"))
+            if not sent:
+                async for f in Qwen3TTSService.run_tts(self, text, context_id):
+                    yield f
+
+
+class BootsTTSService(StreamingEdgeTTSService):
     """The ME3 TTS used by run_bot(): edge-tts (Roger) primary, Qwen3 (vivian)
     fallback, every reply leads with LEAD_SILENCE_S. The welcome calls
     _synthesize() on the same instance, so the welcome voice matches the

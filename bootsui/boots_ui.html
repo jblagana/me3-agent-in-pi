@@ -49,6 +49,11 @@
   .m.user .body{background:rgba(45,212,191,.10);border:1px solid rgba(45,212,191,.45);color:#7ff0e2;border-radius:12px 12px 3px 12px;padding:8px 12px}
   .m.agent{align-self:flex-start}
   .m .body{border-radius:3px 12px 12px 12px;padding:9px 12px;border:1px solid var(--line);background:var(--card)}
+  /* progress updates (spoken mid-turn): a smaller, dimmed intermediate reply */
+  .m.agent.progress .who{display:none}
+  .m.agent.progress .body{font-size:12.5px;color:var(--dim);font-style:italic;background:transparent;border-style:dashed;padding:5px 11px}
+  .m .body a{color:var(--cyan,#5cc8ff);text-decoration:underline;text-underline-offset:2px;word-break:break-all}
+  .m .body a:hover{opacity:.8}
 
   /* heard = user bubble (first-mockup style): right-aligned, what the agent heard */
   .heard{align-self:flex-end;max-width:92%}
@@ -56,16 +61,26 @@
   .heard .body{background:rgba(45,212,191,.08);border:1px solid rgba(45,212,191,.35);border-radius:12px 12px 3px 12px;padding:8px 12px;font-style:italic;color:var(--teal);font-size:13.5px}
   .thinking{align-self:flex-start;border-left:3px solid var(--amber);background:rgba(245,176,76,.06);border-radius:0 8px 8px 0;padding:7px 11px;font-size:12.5px;color:var(--dim);font-style:italic;max-width:92%}
   .thinking .tag{font:10px var(--mono);font-style:normal;letter-spacing:1px;color:var(--amber);display:block;margin-bottom:3px}
-  .tool{align-self:flex-start;font:12px var(--mono);color:var(--purple);background:rgba(180,140,255,.07);border:1px solid rgba(180,140,255,.3);border-radius:8px;padding:6px 11px;display:flex;gap:8px;align-items:center;max-width:92%;cursor:pointer}
-  .tool .spin{width:10px;height:10px;border:2px solid rgba(180,140,255,.3);border-top-color:var(--purple);border-radius:50%;animation:rot .7s linear infinite;flex:none}
-  .tool.ok{color:var(--green);border-color:rgba(62,207,142,.35);background:rgba(62,207,142,.05)}
+  /* Tool calls in the thread render as plain lines, same as the CoT tool
+     rows (2026-11-07; were bordered chips): dim "tool" label, purple while
+     running, green when done, amber on error. Click still expands detail. */
+  .tool{align-self:flex-start;font:11px var(--mono);color:var(--purple);background:none;border:none;border-radius:0;padding:1px 0;display:flex;flex-wrap:wrap;gap:8px;align-items:baseline;max-width:92%;cursor:pointer}
+  .tool::before{content:"tool";flex:none;width:34px;color:var(--faint);font-size:9px;letter-spacing:.3px;opacity:.75}
+  .tool .spin{width:8px;height:8px;border:1.5px solid rgba(180,140,255,.3);border-top-color:var(--purple);border-radius:50%;animation:rot .7s linear infinite;flex:none;align-self:center}
+  .tool.ok{color:var(--green)}
   .tool.ok .spin{display:none}
-  .tool .meta{color:var(--dim);font-size:.85em;margin-left:auto}
-  .tool .caret{opacity:.4;transition:transform .15s;font-size:.85em}
-  .tool .detail{display:none;flex-basis:100%;margin-top:4px;padding:6px 10px;border-left:2px dashed var(--dim);color:var(--dim);font-size:.9em;white-space:pre-wrap;word-break:break-word}
+  .tool .meta{color:inherit}
+  /* Thread lines show WHAT ran, not "ok"/timing (2026-11-07) — the CoT tool
+     row and the LATENCY panel carry the ms. Errors still show (amber + the
+     auto-opened detail). */
+  #msgs .tool .meta{display:none}
+  #msgs .tool::before{content:none}   /* no "tool" label in the thread (2026-11-07) */
+  #msgs .tool .detail{margin-left:0}
+  .tool .caret{opacity:.35;transition:transform .15s;font-size:.85em}
+  .tool .detail{display:none;flex-basis:100%;margin:2px 0 2px 42px;padding:4px 10px;border-left:2px dashed var(--dim);color:var(--dim);font-size:.9em;white-space:pre-wrap;word-break:break-word}
   .tool.open .detail{display:block}
   .tool.open .caret{transform:rotate(90deg)}
-  .tool.err{color:var(--amber);border-color:rgba(245,176,76,.4);background:rgba(245,176,76,.05)}
+  .tool.err{color:var(--amber)}
   .tool.err .detail{display:block;border-left-color:var(--amber);color:var(--amber)}
   .reply{position:relative}
   .ttsbar{height:3px;background:var(--line);border-radius:2px;margin-top:8px;overflow:hidden}
@@ -167,7 +182,11 @@
   /* CoT + latency share a FIXED-height row (v2 layout, approved): the row
      never grows with streamed steps, so the ME2 grid below never moves.
      CoT body scrolls internally (thin rounded scrollbar). */
-  .latcot{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:0 18px 22px;height:196px;flex:none}
+  /* 2026-11-07: CoT 70% / latency 30%; CoT top edge drops 13px to line up
+     with the cap-top of the "LATENCY" h3 (its 12px padding + line gap), and
+     the row grows by the same 13px so the CoT box keeps its height. */
+  .latcot{display:grid;grid-template-columns:7fr 3fr;gap:14px;padding:0 18px 22px;height:209px;flex:none}
+  .latcot .cot{margin-top:13px}
   /* flex:none — the panel is a flex column; when the command log grows the
      row used to flex-shrink (132→110px) and drag the ME2 grid up. Locked. */
   .latcot .lat{padding:0}
@@ -185,9 +204,16 @@
   .cot .body::-webkit-scrollbar-track{background:transparent}
   .cot .body::-webkit-scrollbar-thumb{background:var(--line);border-radius:99px}
   .cot .body::-webkit-scrollbar-thumb:hover{background:var(--faint)}
-  .cot .row{display:flex;gap:7px;padding:3px 0;align-items:baseline}
-  .cot .row .k{flex:none;width:52px;color:var(--faint);font-size:9px;letter-spacing:.5px;text-transform:uppercase}
+  .cot .row{display:flex;gap:8px;padding:3px 0;align-items:baseline}
+  /* lighter step labels (were 52px UPPERCASE) */
+  .cot .row .k{flex:none;width:34px;color:var(--faint);font-size:9px;letter-spacing:.3px;opacity:.75}
   .cot .row .v{color:var(--text);word-break:break-word;font-size:10.5px}
+  /* reasoning reads as secondary: dim italic */
+  .cot .row.think .v{color:var(--dim);font-style:italic;line-height:1.45}
+  /* CoT tool rows carry class "tool" and were inheriting the CHAT tool-chip
+     box (border, padding, background, pointer) — reset to a plain line. */
+  .cot .row.tool{background:none;border:none;border-radius:0;padding:3px 0;max-width:none;cursor:default;font:inherit;align-self:auto}
+  .cot .row.tool::before{content:none}   /* CoT rows have their own .k label */
   .cot .row.tool .v{color:var(--purple)}
   .cot .row.tool.ok .v{color:var(--green)}
   .cot .row.reply .v{color:var(--green)}
@@ -197,6 +223,23 @@
   .cot.idle{border-left-color:var(--line);background:var(--card)}
   .cot.idle .hd .tag{color:var(--faint)}
   .lat .total{border-top:1px dashed var(--line);margin-top:3px;padding-top:3px}
+  /* 2026-11-07 latency panel: stacked E2E bar + benchmark-named rows with targets */
+  .lat-stack{position:relative;display:flex;height:7px;border-radius:4px;overflow:hidden;background:var(--line);margin:2px 0 9px}
+  .lat-stack .sg{flex:0 1 0;min-width:0;height:100%;transition:flex-grow .5s}
+  .lat-stack .tick{position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.7;display:none}
+  .sg.asr,.dot.asr{background:var(--cyan)} .sg.llm,.dot.llm{background:var(--amber)}
+  /* class 'tools', NOT 'tool': '.tool' is the chat tool line (its ::before
+     label printed a ghost "tool" over the bar and the Tools row) */
+  .sg.tools,.dot.tools{background:var(--purple)} .sg.tts,.dot.tts{background:var(--blue)}
+  .lat .lrow{display:flex;align-items:baseline;gap:7px;font:10px var(--mono);color:var(--dim);margin:4px 0}
+  .lat .lrow .dot{width:6px;height:6px;border-radius:50%;flex:none;align-self:center}
+  .lat .lrow .nm{flex:1;cursor:help;white-space:nowrap}
+  .lat .lrow .v{color:var(--text);font-size:11px;font-variant-numeric:tabular-nums}
+  .lat .lrow .tg{color:var(--faint);width:42px;text-align:right;flex:none;font-size:9.5px}
+  .lat .lrow .v.ok{color:var(--green)} .lat .lrow .v.warn{color:var(--amber)} .lat .lrow .v.bad{color:var(--red)}
+  .lat .lrow.total{border-top:1px dashed var(--line);margin-top:7px;padding-top:6px}
+  .lat .lrow.total .nm{color:var(--text);letter-spacing:.5px}
+  .lat .lrow.total .v{font-size:12.5px}
   .lat .total .row .v{color:var(--cyan);font-size:12px}
 
   /* ---- ME2 device cards: the 19 phrasebook classes as icon cards;
@@ -209,6 +252,9 @@
   .dev .ic{font-size:20px;line-height:1;filter:grayscale(.35)}
   .dev .nm{font:11px var(--mono);color:var(--dim);letter-spacing:.5px}
   .dev .st{font:10.5px var(--mono);color:var(--faint);margin-top:auto}
+  .dev .st.remlist{display:flex;flex-direction:column;gap:1px;min-width:0}
+  .dev .st.remlist div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .dev .st.remlist div.more{color:var(--faint);opacity:.7}
   .dev .sub{display:flex;flex-wrap:wrap;gap:4px;margin-top:1px}
   .dev .sub i{font:9px var(--mono);font-style:normal;color:var(--faint);border:1px solid var(--line);border-radius:4px;padding:1px 5px;background:var(--card2);transition:all .2s}
   .dev .sub i.on{color:var(--green);border-color:rgba(62,207,142,.5);background:rgba(62,207,142,.08)}
@@ -306,7 +352,11 @@
   /* --- CALL: ringing phone (shake + sonar rings) --- */
   .dev .ic.calling{animation:phone .45s ease-in-out infinite;position:relative;display:inline-block}
   @keyframes phone{0%,100%{transform:rotate(0)}25%{transform:rotate(-12deg)}75%{transform:rotate(12deg)}}
-  .viz-sonar{position:absolute;left:11px;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;border:1.5px solid var(--cyan);
+  /* Rings centred ON the phone icon (2026-11-07): they were positioned
+     against the whole card (left:11px; top:50%) and landed on the "call"
+     chip. The wrapper is the icon's box; the shake stays on the icon only. */
+  .callic-wrap{position:relative;display:inline-flex;align-items:center;justify-content:center;flex:none}
+  .viz-sonar{position:absolute;left:50%;top:50%;width:26px;height:26px;margin:-13px 0 0 -13px;border:1.5px solid var(--cyan);
     border-radius:50%;opacity:0;pointer-events:none}
   .dev.calling .viz-sonar{animation:sonar 1.2s ease-out infinite}
   .dev.calling .viz-sonar.s2{animation-delay:.6s}
@@ -370,8 +420,8 @@
       <div class="right">
         <span class="pill demo" id="p-mode">demo</span>
         <select id="llm-sel" title="chat LLM provider">
-          <option value="groq">Groq · qwen3.8-27b</option>
-          <option value="hpc">HPC · DGX3 vLLM</option>
+          <option value="groq">Groq</option>
+          <option value="hpc">HPC · vLLM</option>
         </select>
         <button class="btn" id="btn-think" title="Groq Qwen3 thinking (on = deeper but slower + uses tokens; off = fast, saves rate limit)" style="padding:3px 6px">💭 off</button>
         <button class="btn" id="btn-theme" title="toggle light / dark">◐</button>
@@ -403,7 +453,7 @@
       <div class="ringwrap idle" id="ringwrap"><div class="ring"><span class="zzz"><b>z</b><b>z</b><b>z</b></span><span class="eq"><i></i><i></i><i></i><i></i><i></i></span><span class="tthink"><span class="bub"><i></i><i></i><i></i></span><span class="t1"></span><span class="t2"></span></span><span class="speak"><span class="spk"></span><span class="arc"></span><span class="arc"></span><span class="arc"></span></span><span id="ringface" style="display:none">🎙</span></div></div>
       <div class="vinfo">
         <div class="st" id="vst">listening…</div>
-        <div class="sub" id="vsub">smart turn · barge-in armed</div>
+        <div class="sub" id="vsub">vad · mic open</div>
       </div>
     </div>
 
@@ -414,11 +464,14 @@
       </div>
       <div class="lat">
         <h3>LATENCY</h3>
-        <div class="row"><span>VAD → ASR final</span><span class="v" id="l-asr">–</span></div><div class="bar"><i id="b-asr" style="background:var(--green)"></i></div>
-        <div class="row"><span>LLM first token</span><span class="v" id="l-llm">–</span></div><div class="bar"><i id="b-llm" style="background:var(--amber)"></i></div>
-        <div class="row"><span>tool exec</span><span class="v" id="l-tool">–</span></div><div class="bar"><i id="b-tool" style="background:var(--purple)"></i></div>
-        <div class="row"><span>TTS first audio</span><span class="v" id="l-tts">–</span></div><div class="bar"><i id="b-tts" style="background:var(--blue)"></i></div>
-        <div class="row total"><span>voice→reply total</span><span class="v" id="l-total">–</span></div>
+        <!-- one bar = this turn's E2E, split into its stages (they add up exactly);
+             the white tick marks the 4.0 s E2E target when a turn runs over it -->
+        <div class="lat-stack" title="E2E split into stages"><i id="b-asr" class="sg asr"></i><i id="b-llm" class="sg llm"></i><i id="b-tool" class="sg tools"></i><i id="b-tts" class="sg tts"></i><b class="tick" id="lat-tick"></b></div>
+        <div class="lrow"><i class="dot asr"></i><span class="nm" title="end of your speech → final transcript">ASR final</span><span class="v" id="l-asr">–</span><span class="tg">/ 0.8 s</span></div>
+        <div class="lrow"><i class="dot llm"></i><span class="nm" title="transcript → first token of the spoken reply (LLM time-to-first-token, tool time excluded)">LLM TTFT</span><span class="v" id="l-llm">–</span><span class="tg">/ 1.5 s</span></div>
+        <div class="lrow"><i class="dot tools"></i><span class="nm" title="time spent running tools this turn">Tools</span><span class="v" id="l-tool">–</span><span class="tg"></span></div>
+        <div class="lrow"><i class="dot tts"></i><span class="nm" title="first reply token → first audio (TTS time-to-first-byte)">TTS TTFB</span><span class="v" id="l-tts">–</span><span class="tg">/ 0.6 s</span></div>
+        <div class="lrow total"><span class="nm" title="end of your speech → Boots' first audio (= ASR + LLM + Tools + TTS)">E2E</span><span class="v" id="l-total">–</span><span class="tg">/ 4.0 s</span></div>
       </div>
     </div>
 
@@ -432,23 +485,23 @@
         <div class="viz-prog"><i id="prog"></i></div>
         <span class="st" id="s-music">stopped</span>
       </div>
-      <div class="dev hit" id="c-lights">
+      <div class="dev" id="c-lights">
         <div class="hd"><span class="ic">💡</span><span class="nm">LIGHTS</span>
           <span class="viz-lamp"><span class="glow"></span><span class="bulb"></span><span class="shade"></span></span>
         </div>
         <div class="sub"><i id="p-lon">on</i><i id="p-loff">off</i><i id="p-bright">dim</i><i id="p-color">color</i></div>
-        <span class="st" id="s-lights">on · 90%</span>
+        <span class="st" id="s-lights">–</span>
       </div>
       <div class="dev" id="c-climate">
         <div class="hd"><span class="ic">🌡</span><span class="nm">THERMOSTAT</span>
           <span class="viz-thermo"><i></i><b></b></span>
         </div>
         <div class="sub"><i id="p-temp">temperature</i></div>
-        <span class="st" id="s-climate">24°C</span>
+        <span class="st" id="s-climate">–</span>
       </div>
       <div class="dev" id="c-weather">
         <div class="hd"><span class="ic wthr">⛅<span class="cloud">☁️</span></span><span class="nm">WEATHER</span></div>
-        <div class="sub"><i id="p-weather">weather</i></div>
+        <div class="sub"><i id="p-weather" title="place of the last weather reading">📍 –</i></div>
         <span class="st" id="s-weather">–</span>
       </div>
       <div class="dev" id="c-time">
@@ -459,8 +512,7 @@
         <span class="st" id="s-time">–</span>
       </div>
       <div class="dev" id="c-call">
-        <div class="hd"><span class="ic" id="callic">📞</span><span class="nm">CALL</span>
-          <span class="viz-sonar"></span><span class="viz-sonar s2"></span>
+        <div class="hd"><span class="callic-wrap"><span class="ic" id="callic">📞</span><span class="viz-sonar"></span><span class="viz-sonar s2"></span></span><span class="nm">CALL</span>
         </div>
         <div class="sub"><i id="p-call">call</i></div>
         <span class="st" id="s-call">–</span>
@@ -477,14 +529,12 @@
           <span class="viz-rem" id="rembadge">!</span>
         </div>
         <div class="sub"><i id="p-rem">create</i><i id="p-remlist">list</i></div>
-        <span class="st" id="s-rem">–</span>
+        <span class="st remlist" id="s-rem">none</span>
       </div>
     </div>
 
     <h3>COMMANDS · LOG</h3>
-    <div class="cmdlog" id="cmdlog">
-      <div class="c ok"><span class="t">11:02:14</span><span>light_on → ok (90%)</span></div>
-    </div>
+    <div class="cmdlog" id="cmdlog"></div>
 
   </div>
 </div>
@@ -518,7 +568,7 @@ async function think(t){const s=thinking();let i=0;
   s.textContent=t;s.classList.remove('cursor');scroll()}
 // Human-readable args for the chip face: `name · key: value, key2: value2`.
 // Empty/undefined values are dropped (check_weather({"location": ""}) →
-// name-only, or `· UP Diliman` for weather — the server resolves "" to the
+// name-only, or `· U.P. Diliman` for weather — the server resolves "" to the
 // default home location inside the tool). Long values truncate at 40 chars.
 // Raw JSON is never shown on the chip face — it lives in the .detail block.
 function fmtArgs(name,args){
@@ -542,7 +592,7 @@ function fmtArgs(name,args){
       parts.push(k[0].toUpperCase()+k.slice(1).replace(/_/g,' ')+': '+s);
     }
   }
-  if(name==='check_weather'&&!parts.length)parts.push('UP Diliman'); // "" → default home
+  if(name==='check_weather'&&!parts.length)parts.push('U.P. Diliman'); // "" → default home
   return parts.length?' · '+parts.join(', '):'';
 }
 function tool(name,args){const d=document.createElement('div');d.className='tool';
@@ -559,9 +609,8 @@ function tool(name,args){const d=document.createElement('div');d.className='tool
 function toolOk(d,result,ms){
   d.classList.add('ok');
   const nm=d.querySelector('.nm');
-  if(nm&&!nm.textContent.startsWith('✓'))nm.textContent='✓ '+nm.textContent;
   const meta=d.querySelector('.meta');
-  if(meta)meta.textContent='ok · '+(ms!=null?ms:'?')+' ms';
+  if(meta)meta.textContent='→ '+(ms!=null?ms+' ms':'ok');   // same wording as the CoT tool row
   const det=d.querySelector('.detail');
   if(det){
     const lines=[];
@@ -572,6 +621,9 @@ function toolOk(d,result,ms){
   }
   if(/^(error|errored|failed)/i.test(String(result||''))){d.classList.add('err');d.classList.add('open')}
 }
+function progressBubble(text){const d=document.createElement('div');d.className='m agent reply progress';
+  d.innerHTML='<div class="who">BOOTS</div><div class="body"></div>';d.querySelector('.body').textContent=text;add(d);scroll();return d}
+let lastProgressSeq=0;
 function reply(){const d=document.createElement('div');d.className='m agent reply';d.innerHTML=`<div class="who">BOOTS</div><div class="body"></div>`;add(d);scroll();return d}
 function barge(){const d=document.createElement('div');d.className='barge';d.textContent='⚡ barge-in — TTS ducked, listening';add(d)}
 /* p = sub-chip id (e.g. 'p-play'); the parent card lights up, the chip carries the action */
@@ -667,6 +719,11 @@ function cotRow(k,txt,cls){
 }
 function cotTool(name,args,ok,ms){
   const b=$('cot-body');if(!b)return;
+  // The thought before a tool call is finished: stop its cursor, and drop
+  // an unfilled placeholder think row (no reasoning arrived for it).
+  b.querySelectorAll('.cur').forEach(c=>c.remove());
+  const lr=b.lastElementChild;
+  if(lr&&lr.classList.contains('think')&&!lr.querySelector('.v').textContent.trim())lr.remove();
   const r=document.createElement('div');r.className='row tool'+(ok?' ok':'');
   r.innerHTML='<span class="k">tool</span><span class="v"></span>';
   r.querySelector('.v').textContent=name+fmtArgs(name,args)+(ok?(' → '+(ms!=null?ms+' ms':'ok')):' · running');
@@ -680,10 +737,18 @@ function cotThink(text){
   // new round started — append a fresh row instead of overwriting the
   // previous round's thought (a tool turn has 2+ rounds: plan, then the
   // post-tool deliberation; both belong in the CoT).
-  // (no :last-of-type — that's tag-scoped; walk back to the last think row)
-  let r=null; const all=b.querySelectorAll('.row');
-  for(let i=all.length-1;i>=0;i--){ if(all[i].classList.contains('think')){ r=all[i]; break; } }
-  if(text.length<cotThinkLen){ r=null; }
+  // Row choice (2026-11-07 fix: "two thinks, two cursors" on voice turns):
+  //  * only the LAST row can be continued (a think row above a tool row is a
+  //    finished earlier round and must never be overwritten);
+  //  * an EMPTY last think row is cotReset()'s placeholder — always FILL it
+  //    (the voice round-change forced a new row and left the placeholder,
+  //    with its own blinking cursor, behind);
+  //  * otherwise a shrink / forced round change (cotThinkLen=Infinity)
+  //    starts a fresh row.
+  const lastRow=b.lastElementChild;
+  let r=(lastRow&&lastRow.classList.contains('think'))?lastRow:null;
+  const placeholder=!!(r&&!r.querySelector('.v').textContent.trim());
+  if(r&&!placeholder&&text.length<cotThinkLen){ r=null; }
   if(!r){
     r=document.createElement('div');r.className='row think';
     r.innerHTML='<span class="k">think</span><span class="v"></span>';
@@ -694,6 +759,8 @@ function cotThink(text){
   // panel keeps the thought visible once the cursor is stripped.
   const v=r.querySelector('.v');
   v.textContent=text;
+  // ONE cursor: only on the row that is streaming now.
+  b.querySelectorAll('.cur').forEach(c=>{ if(!r.contains(c))c.remove(); });
   if(!r.querySelector('.cur')&&!$('cot-panel').classList.contains('done')){
     const c=document.createElement('span');c.className='cur';v.appendChild(c);
   }
@@ -708,8 +775,14 @@ function cotToolOk(ms){
 function cotDone(summary){
   const p=$('cot-panel');if(!p)return;
   p.classList.add('done');
-  const s=$('cot-sum');if(s)s.textContent=summary||'done';
-  const m=$('cot-ms');if(m&&cotT0)m.textContent=Math.max(1,Math.round((Date.now()-cotT0)/1000))+' s';
+  // One duration, not two (2026-11-07): "boots_set_reminder · 4030 ms" + "4 s"
+  // -> summary "boots_set_reminder", right side "4.0 s" (the turn's real total).
+  let sumTxt=summary||'done', dur='';
+  const mm=/^(.*) · (\d+) ms$/.exec(sumTxt);
+  if(mm){ sumTxt=mm[1]; dur=(+mm[2]/1000).toFixed(1)+' s'; }
+  else if(cotT0){ dur=Math.max(1,Math.round((Date.now()-cotT0)/1000))+' s'; }
+  const s=$('cot-sum');if(s)s.textContent=sumTxt;
+  const m=$('cot-ms');if(m)m.textContent=dur;
   const b=$('cot-body');
   if(b){
     // empty think row (no in-flight text ever landed): drop it, keep the
@@ -725,11 +798,24 @@ function micLevel(base,amp,burstEvery=40){ // ambient murmur + periodic "speech"
   let v=base+Math.sin(t*7)*amp+Math.random()*12;
   if(burstEvery&&n%burstEvery<12)v=Math.min(92,45+Math.sin(n*.9)*30+Math.random()*20); // speaking
   setMicLevel(v)},80);return iv}
-function latency(asr,llm,toolMs,tts,total){
-  const max=2500;
-  [['asr',asr],['llm',llm],['tool',toolMs],['tts',tts]].forEach(([k,v])=>{
-    if(v==null)return;$('l-'+k).textContent=v+' ms';$('b-'+k).style.width=Math.min(100,v/max*100)+'%'});
-  $('l-total').textContent=total+' ms'}
+// Latency panel (2026-11-07): stage values in seconds, coloured against the
+// fd-benchmark targets (green <= target, amber <= 1.5x, red above); the stacked
+// bar splits this turn's E2E into its stages (they add up exactly).
+const LAT_TARGETS={asr:0.8,llm:1.5,tts:0.6,total:4.0};
+function latStatus(el,k,ms){ el.classList.remove('ok','warn','bad'); const t=LAT_TARGETS[k];
+  if(ms==null||!t)return; const s=ms/1000; el.classList.add(s<=t?'ok':s<=t*1.5?'warn':'bad'); }
+function renderLatency(L){
+  L=L||{}; const keys=['asr','llm','tool','tts'];
+  const sum=keys.reduce((a,k)=>a+(+L[k]||0),0), tot=L.total!=null?L.total:sum;
+  keys.forEach(k=>{ const v=L[k], el=$('l-'+k), bar=$('b-'+k);
+    el.textContent = v!=null ? (v/1000).toFixed(2)+' s' : '–'; latStatus(el,k,v);
+    bar.style.flexGrow = (v!=null && tot) ? String(v) : '0'; });
+  const te=$('l-total'); te.textContent = L.total!=null ? (L.total/1000).toFixed(2)+' s' : '–'; latStatus(te,'total',L.total);
+  const tick=$('lat-tick');                       // 4.0 s target mark, only when over it
+  if(tick){ const over=L.total!=null && L.total>LAT_TARGETS.total*1000;
+    tick.style.display=over?'block':'none'; if(over)tick.style.left=(LAT_TARGETS.total*1000/L.total*100)+'%'; }
+}
+function latency(asr,llm,toolMs,tts,total){ renderLatency({asr,llm,tool:toolMs,tts,total}); }
 
 async function demo(){
   // mic ambient
@@ -804,10 +890,13 @@ async function demo(){
 // the UI stopped promising states that can't happen.
 const PHASE_MAP = {
   idle:{st:'idle',mode:'idle',sub:'waiting for speech'},
-  listening:{st:'listening…',mode:'listen',sub:'vad · barge-in armed'},
+  // Honest sub-labels (2026-11-07): the mic is MUTED while Boots speaks
+  // (InputGate, no echo cancellation), so "barge-in armed" was false.
+  // 'tool' uses the think ring — the mic isn't what's busy during a tool.
+  listening:{st:'listening…',mode:'listen',sub:'vad · mic open'},
   thinking:{st:'thinking…',mode:'think',sub:'llm'},
-  tool:{st:'running tool…',mode:'listen',sub:'mcp-bridge'},
-  speaking:{st:'speaking…',mode:'talk',sub:'tts · streaming'}
+  tool:{st:'running tool…',mode:'think',sub:'mcp-bridge'},
+  speaking:{st:'speaking…',mode:'talk',sub:'tts · mic muted (no AEC)'}
 };
 const TOOL_TO_CHIP = {
   // Names MUST match the tool specs in me2_tools.py / spotify_tools.py /
@@ -823,14 +912,26 @@ const TOOL_TO_CHIP = {
   boots_make_call:'p-call',
   spotify_pause:'p-pause', spotify_resume:'p-play', spotify_next:'p-next',
   spotify_previous:'p-next',
-  check_weather:'p-weather', web_search:'p-weather', fetch_url:'p-weather',
-  write_website:'p-weather'
+  // Only check_weather lights the WEATHER card (2026-11-07): web_search /
+  // fetch_url / write_website used to flash it green too (no web card).
+  check_weather:'p-weather'
 };
 let LIVE=false;
 let last={heard:'',thinking:'',response:'',phase:'idle',mic:0,tool:null,ts:0};
 function setModePill(mode){const p=$('p-mode');if(!p)return;if(mode==='live'){p.className='pill live';p.textContent='live';}else{p.className='pill demo';p.textContent='demo';}}
 function escapeHtml(s){return String(s).replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));}
-function liveHeard(text){if(!text||text===last.heard)return;const d=document.createElement('div');d.className='heard';d.innerHTML=`<span class="tag">🎧 HEARD</span><div class="body">${escapeHtml(text)}</div>`;add(d);last.heard=text;}
+// Escape FIRST, then wrap http(s) URLs in links (new tab) — so reply text can
+// never inject markup. Quotes are excluded from the URL match so the href
+// attribute can't be broken out of; trailing sentence punctuation
+// ("…/taal.html.") stays outside the link.
+function linkify(s){
+  return escapeHtml(s).replace(/https?:\/\/[^\s<>"']+/g, u=>{
+    const m=u.match(/[.,;:!?)\]]+$/); const tail=m?m[0]:''; const url=tail?u.slice(0,-tail.length):u;
+    return '<a href="'+url+'" target="_blank" rel="noopener noreferrer">'+url+'</a>'+tail; });
+}
+// force: a REPEATED voice utterance ("hey" twice) is a new turn with the same
+// text — the server's heard_seq says so; the text check alone dropped it.
+function liveHeard(text,force){if(!text||(!force&&text===last.heard))return;const d=document.createElement('div');d.className='heard';d.innerHTML=`<span class="tag">🎧 HEARD</span><div class="body">${escapeHtml(text)}</div>`;add(d);last.heard=text;}
 // (thinkEl/liveThinking/endThinking removed — the orange in-thread
 //  THINKING bubble showed the REPLY text, not the thought, and duplicated
 //  the CoT box. The CoT box is the single thinking surface: SSE for typed
@@ -852,11 +953,14 @@ function liveReply(text,ts,turnId){
   // replyShown && ts===renderedTs (rebuildChat already drew the bubble and
   // synced both) — creating reply() first left a hollow empty BOOTS bubble
   // behind (the refresh duplicate).
-  if(text===replyShown && ts===renderedTs)return;
+  // Keyed on the TURN, not ts (2026-11-07): m3.ts moves on every push (the
+  // 2 s heartbeat too), so after a refresh the same reply looked "new" and
+  // minted a second BOOTS bubble under the chip.
+  if(text===replyShown && (turnId||0)===renderedTurn)return;
   const isNewTurn=!replyEl||turnId!==renderedTurn;
   if(isNewTurn)replyEl=reply();
   replyShown=text; renderedTs=ts||0; renderedTurn=turnId||0;
-  replyEl.querySelector('.body').textContent=text; scroll();
+  replyEl.querySelector('.body').innerHTML=linkify(text); scroll();   // URLs clickable (escaped first)
   // NOTE: the CoT reply row is driven from live() (only when the turn is OUT
   // of the thinking phase) — during thinking, m3.response is in-flight text
   // and belongs in the think row, not a reply row.
@@ -913,12 +1017,15 @@ function rebuildChat(s){
       // Tool chips FIRST (persisted on the assistant entry's tools field),
       // each rendered green — the turn is over by the time history has it.
       (h[i].tools||[]).forEach(t=>{
-        const td=tool(t.name, JSON.stringify(t.args||{}));
+        if(t.kind==='progress'){ progressBubble(t.text||''); return; }   // spoken update
+        // voice turns store args as the agent's string ("text='Nadie'"),
+        // typed turns as a dict
+        const td=tool(t.name, typeof t.args==='string'?t.args:JSON.stringify(t.args||{}));
         toolOk(td,t.result||'ok',t.ms);
         lastToolSeq=Math.max(lastToolSeq,t.seq||0);
       });
       const d=document.createElement('div');d.className='m agent reply';
-      d.innerHTML=`<div class="who">BOOTS</div><div class="body">${escapeHtml(h[i].content)}</div>`;
+      d.innerHTML=`<div class="who">BOOTS</div><div class="body">${linkify(h[i].content)}</div>`;
       add(d);
     }
   }
@@ -942,16 +1049,20 @@ function rebuildChat(s){
   // A voice turn in flight (or just finished) that history doesn't have
   // yet: chip BEFORE the bubble, same order as live turns.
   if(m3.tool && !turnCovered && (!lastAsst || !lastAsst.tools)){
-    toolChip(m3.tool, m3.tool_args, m3.tool_result, m3.tool_ms);
-    if(m3.tool_seq)lastToolSeq=Math.max(lastToolSeq,m3.tool_seq);
+    lastToolEl=toolChip(m3.tool, m3.tool_args, m3.tool_result, m3.tool_ms);  // a late result flips THIS chip
   }
+  // The live tool call is drawn by now (history chip, or the in-flight chip
+  // above): sync the seq marker ALWAYS — otherwise the first poll after a
+  // refresh re-minted the finished turn's chip BELOW its reply.
+  if(m3.tool_seq)lastToolSeq=Math.max(lastToolSeq,m3.tool_seq);
+  lastProgressSeq=m3.progress_seq||0;   // updates already drawn from history
   // The content!== check alone fails on REPEATED identical replies
   // ("Lights are on." twice) — the model reuses phrasing, so a newer turn's
   // response can equal the last history entry's. turnCovered is the real
   // gate: heard text present in history with an assistant entry after it.
   if(m3.response && !turnCovered && (!lastAsst || lastAsst.content!==m3.response)){
     const d=document.createElement('div');d.className='m agent reply';
-    d.innerHTML=`<div class="who">BOOTS</div><div class="body">${escapeHtml(m3.response)}</div>`;
+    d.innerHTML=`<div class="who">BOOTS</div><div class="body">${linkify(m3.response)}</div>`;
     add(d);
   }
   last.heard=m3.heard||last.heard;
@@ -970,6 +1081,9 @@ function rebuildChat(s){
   // lastCotText='' in the heard-change block above anyway.
   lastCotText=m3.thinking||m3.cot||'';
   replyShown=m3.response||'';
+  // Re-attach to the last drawn reply bubble: a refresh MID-turn keeps
+  // streaming into it instead of minting a second one.
+  { const le=msgs.lastElementChild; replyEl=(le&&le.classList.contains('reply'))?le:null; }
   renderedTs=m3.ts||0;  // the last bubble is already drawn by the loop above —
                         // mark its turn rendered so the first poll doesn't
                         // re-append it (the refresh-duplicate fix)
@@ -977,6 +1091,7 @@ function rebuildChat(s){
   last.tool=m3.tool||null;
   last.tool_seq=m3.tool_seq||0;
   last.ts=m3.ts||0;
+  last.heard_seq=m3.heard_seq||0;  // the last voice turn is already drawn
   last.turn=m3.turn||0;  // without this the first poll after a refresh sees a
                          // turn mismatch and drops/re-mints the last bubble
   pinBottom();
@@ -997,6 +1112,7 @@ function renderCmdlog(s){
 }
 let chatRebuilt=false;
 let liveBusy=false;
+let BOOT_ID=null;
 async function live(){
   if(liveBusy)return; liveBusy=true;   // re-entrancy guard: an in-flight poll
   // (slow fetch / heavy tick) overlapping the next 1s tick used to interleave
@@ -1005,10 +1121,22 @@ async function live(){
   // bubble and dropping the CoT think row.
   let s; try { s=await (await fetch('/ui_state')).json(); } catch(e){ liveBusy=false; return; }
   LIVE=true; setModePill('live');
+  // Server restarted (new boot_id) -> reload: its turn/tool_seq/heard_seq
+  // counters reset to 0 and this tab's de-dupe markers would be stale.
+  if(s.boot_id){
+    if(BOOT_ID && s.boot_id!==BOOT_ID){ location.reload(); return; }
+    BOOT_ID=s.boot_id;
+  }
   if(!chatRebuilt){ chatRebuilt=true; rebuildChat(s); }  // restore thread on load
   renderCmdlog(s);
   if(s.llm && $('llm-sel').value!==s.llm.provider && s.llm.provider!=='custom'){
     $('llm-sel').value=s.llm.provider;  // keep dropdown in sync with server
+  }
+  // Option label = the provider's ACTIVE model (was hardcoded qwen3.8-27b).
+  if(s.llm && (s.llm.provider==='groq'||s.llm.provider==='hpc')){
+    const o=$('llm-sel').querySelector('option[value="'+s.llm.provider+'"]');
+    const t=(s.llm.provider==='groq'?'Groq · ':'HPC · ')+String(s.llm.model||'').split('/').pop();
+    if(o && o.textContent!==t) o.textContent=t;
   }
   if(s.llm){ const t=btnThink; const want=(s.llm.thinking==='on');
     if(t.dataset.on!==(want?'1':'0')){ t.dataset.on=want?'1':'0';
@@ -1020,7 +1148,11 @@ async function live(){
   // the agent hasn't pushed yet (fresh server / agent down).
   const _vm=(m3.voice&&m3.voice.model)?m3.voice:(s.llm&&s.llm.model?s.llm:null);
   const _vlab=_vm?_vm.model+' · '+_vm.provider:'llm';
-  const _sub=(ph==='thinking')?_vlab:(ph==='tool')?('mcp-bridge · '+(m3.tool||'…')):pm.sub;
+  // Speaking label follows the agent's real mic gate (ME3_GATE_MIC):
+  // gate off = the M1A's hardware AEC keeps the mic open -> barge-in armed.
+  const _gateOff = !!(m3.voice && m3.voice.gate===false);
+  const _speakSub = _gateOff ? 'tts · barge-in armed (hw AEC)' : 'tts · mic muted (no barge-in)';
+  const _sub=(ph==='thinking')?_vlab:(ph==='tool')?('mcp-bridge · '+(m3.tool||'…')):(ph==='speaking')?_speakSub:pm.sub;
   setVoice(pm.mode, pm.st, _sub);
   setMicLevel(Math.round((m3.mic_level||0)*100));
   // turn boundary: a NEW heard text (2026-11-06). A (heard,response) pair
@@ -1033,8 +1165,9 @@ async function live(){
   // (A ts-based boundary was rejected earlier: m3.ts moves on every server
   // push, so the first poll after a refresh fired a "new turn" reset, then
   // liveReply re-appended the last bubble — duplicate after refresh.)
-  if(m3.heard && m3.heard!==last.heard){
-    liveHeard(m3.heard); endThinking(); clearPulse();  // new turn: latest-call pulse is stale
+  const _seqNew = !!(m3.heard_seq && m3.heard_seq!==(last.heard_seq||0));
+  if(m3.heard && (m3.heard!==last.heard || _seqNew)){
+    liveHeard(m3.heard, _seqNew); endThinking(); clearPulse();  // new turn: latest-call pulse is stale
     if(replyEl){replyShown='';replyEl=null;} renderedTs=0; renderedTurn=0;
     cotReset();                                        // new turn: CoT streams fresh
     voiceCotRound=0;                                   // new turn: first round fires
@@ -1083,12 +1216,18 @@ async function live(){
   // Runs BEFORE the reply check on purpose: when a turn finishes between
   // two polls, both the final chip and the reply land in the same tick —
   // the chip must be appended first (chip -> bubble order).
+  // Text spoken BEFORE a tool call ("Let me look that up.") streams during
+  // the thinking phase, when bubbles are held back — draw it now, ABOVE the
+  // tool line that is about to be appended (it rendered below it before).
+  if(m3.tool && m3.tool_seq && m3.tool_seq!==lastToolSeq && m3.response && m3.response!==replyShown){
+    liveReply(m3.response, m3.ts, m3.turn||0);
+  }
   if(m3.tool){
     // lastToolSeq (not last.tool_seq) is the render marker: the SSE handler
     // already minted the chip for this seq (and set lastToolSeq), so the
     // poll must dedupe against it or it double-renders the chip + CoT row.
     if(m3.tool_seq && m3.tool_seq!==lastToolSeq){
-      lastToolSeq=m3.tool_seq; lastToolEl=toolChip(m3.tool, m3.tool_args, m3.tool_result, m3.tool_ms);
+      lastToolSeq=m3.tool_seq; lastToolEl=toolChip(m3.tool, m3.tool_args, m3.tool_result, m3.tool_ms); lastToolEl.dataset.seq=m3.tool_seq; replyEl=null;  /* text AFTER a tool line starts a NEW bubble below it (no in-place mutation) */ 
       // START+RESULT in one tick: the card never pulsed — it settles green,
       // but the settle is HELD until the pulse has been visible for a minimum
       // (inFlightMin) so even a 1 ms tool still shows its purple beat.
@@ -1109,13 +1248,25 @@ async function live(){
       const p=TOOL_TO_CHIP[m3.tool]; if(chipsExist(p))settleCard(p);
       cotToolOk(m3.tool_ms);
     } else if(!m3.tool_seq && m3.tool!==last.tool){
-      liveTool(m3.tool, m3.tool_args, m3.tool_result, m3.tool_ms);
+      liveTool(m3.tool, m3.tool_args, m3.tool_result, m3.tool_ms); replyEl=null;  /* text AFTER a tool line starts a NEW bubble below it (no in-place mutation) */ 
       if(m3.tool_result){
         const p=TOOL_TO_CHIP[m3.tool]; if(chipsExist(p))settleCard(p);
         cotTool(m3.tool, m3.tool_args, true, m3.tool_ms);
       } else { cotTool(m3.tool, m3.tool_args, false); }
     }
   }
+  // Progress update (spoken mid-turn): its own dimmed bubble, in order with
+  // the tool lines; the next reply text starts a fresh bubble after it.
+  if(m3.progress_seq && m3.progress_seq!==lastProgressSeq){
+    lastProgressSeq=m3.progress_seq; if(m3.progress)progressBubble(m3.progress); replyEl=null;
+  }
+  // Settle EARLIER tool lines too (2026-11-07): the poll only tracks the
+  // latest line, so a fast tool whose result came and went between two
+  // polls stayed purple forever. The server keeps every call of the turn
+  // with its result (m3._turn_tools) — flip any line still in flight.
+  (m3._turn_tools||[]).forEach(t=>{ if(!t.result)return;
+    const el=msgs.querySelector('.tool[data-seq="'+t.seq+'"]');
+    if(el&&!el.classList.contains('ok'))toolOk(el,t.result,t.ms); });
   // (purple in-flight pulse + its settle block stay removed 2026-11-05 —
   // the boss disabled the purple; the green result settle lives in the
   // tool-chip block above via settleCard)
@@ -1148,13 +1299,9 @@ async function live(){
   // No CoT reply row (boss, 2026-11-05): the CoT box keeps only think + tool
   // rows — the reply already lives in the chat thread bubble.
   if(m3.tool_seq)lastToolSeq=Math.max(lastToolSeq,m3.tool_seq);  // poll-side render marker (SSE sets it too)
-  last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null,tool_seq:m3.tool_seq||0,ts:m3.ts||0,turn:m3.turn||0,cotTotal:last.cotTotal,cotReply:last.cotReply};
+  last={heard:m3.heard||last.heard,thinking:m3.thinking||'',response:m3.response||'',phase:ph,mic:m3.mic_level||0,tool:m3.tool||null,tool_seq:m3.tool_seq||0,ts:m3.ts||0,turn:m3.turn||0,heard_seq:m3.heard_seq||0,cotTotal:last.cotTotal,cotReply:last.cotReply};
   { const L=m3.latency||{};   // null = reset to "–" (turn cleared/in flight)
-    [['asr','b-asr','l-asr'],['llm','b-llm','l-llm'],['tool','b-tool','l-tool'],['tts','b-tts','l-tts']].forEach(([k,b,l])=>{
-      const v=L[k];
-      if(v!=null){ $(l).textContent=v+' ms'; $(b).style.width=Math.min(100,v/2500*100)+'%'; }
-      else { $(l).textContent='–'; $(b).style.width='0'; } });
-    $('l-total').textContent = L.total!=null ? L.total+' ms' : '–';
+    renderLatency(L);
     // Turn close: the server pushes per-leg latency when the turn finishes —
     // that's the settle signal for the CoT panel (green + one-line summary).
     if(L.total!=null && L.total!==last.cotTotal){
@@ -1198,11 +1345,30 @@ function applyDevices(s){
   if(s.thermo!=null){ $('s-climate').textContent = Math.round(s.thermo)+'°C'+(s.tmode?(' · '+s.tmode):'');
     $('c-climate').classList.toggle('breathing', /cool|heat/i.test(s.tmode||'')); }
   if(s.weather){ $('s-weather').textContent=(s.weather.icon||'')+' '+s.weather.temp+'° '+(s.weather.condition||'');
+    // Chip = the PLACE of this reading (the last check_weather lookup for
+    // 30 min, else home) — it used to repeat the word "weather" under the
+    // WEATHER title and never said where.
+    const pw=$('p-weather'), pl='📍 '+(s.weather.place||'home');
+    if(pw && pw.textContent!==pl) pw.textContent=pl;
     // no 'hit' — every-poll re-add blocked the pulse (see music note).
   }
-  if(s.timer){ $('s-time').textContent = s.timer.done? 'done' : (s.timer.remaining+'s left');
-    $('c-time').classList.toggle('wobble', !!s.timer.done); }
-  else { $('s-time').textContent = new Date().toTimeString().slice(0,5); $('c-time').classList.remove('wobble'); }
+  // REMINDERS: list the open reminders' TEXT (the card only ever showed a
+  // count badge). Newest first (server inserts at 0), 3 shown + "+N more".
+  { const R=(s.reminders||[]).filter(r=>!r.done), el=$('s-rem');
+    const html=R.length
+      ? R.slice(0,3).map(r=>'<div title="'+escapeHtml(r.text)+'">• '+escapeHtml(r.text)+'</div>').join('')
+        +(R.length>3?'<div class="more">+'+(R.length-3)+' more</div>':'')
+      : 'none';
+    if(el && el.innerHTML!==html) el.innerHTML=html; }
+  // TIME card (2026-11-07): timer as m:ss (was "112s left") + the set
+  // alarms (they were stored but never shown anywhere on the card).
+  { const fmtS=n=>{n=Math.max(0,Math.round(n));const h=Math.floor(n/3600),m=Math.floor(n%3600/60),x=n%60;
+      return h?`${h}:${String(m).padStart(2,'0')}:${String(x).padStart(2,'0')}`:`${m}:${String(x).padStart(2,'0')}`;};
+    const al=(s.alarms||[]).map(a=>{const [h,m]=String(a).split(':').map(Number);return `${h%12||12}:${String(m).padStart(2,'0')} ${h<12?'AM':'PM'}`;});
+    const alTxt=al.length?' · ⏰ '+al.slice(0,2).join(', ')+(al.length>2?' +'+(al.length-2):''):'';
+    if(s.timer){ $('s-time').textContent = (s.timer.done? 'timer done' : fmtS(s.timer.remaining)+' left')+alTxt;
+      $('c-time').classList.toggle('wobble', !!s.timer.done); }
+    else { $('s-time').textContent = new Date().toTimeString().slice(0,5)+alTxt; $('c-time').classList.remove('wobble'); } }
   if(s.speaking){ setVoice('talk','speaking…','tts · streaming'); }
   vizApply(s);
 }
@@ -1231,7 +1397,8 @@ function vizApply(s){
     const lvRaw=L.level||0;
     const lv=lvRaw<=1?Math.round(lvRaw*100):Math.round(lvRaw);
     c.style.setProperty('--lamp-lv',Math.max(0,Math.min(100,lv)));
-    if(L.color)c.style.setProperty('--lampc',LAMP_COLORS[L.color]||'#ffd97a');
+    // any CSS colour name now works ("chartreuse"); the map only softens a few
+    if(L.color)c.style.setProperty('--lampc',LAMP_COLORS[L.color]||L.color);
   }
   // MUSIC — EQ bars animate while playing, flat+dim when paused, frozen when stopped
   const M=s.music||{};
@@ -1292,17 +1459,20 @@ function vizApply(s){
     if(sec)sec.textContent='';
     vizPrev.timer=null;
   }
-  // CALL — sonar rings + phone shake while a call is in flight.
-  // /ui_state has no call field yet; driven by the tool chip lifecycle:
-  // boots_make_call START pulses the card (existing), RESULT settles it.
-  // The sonar fires on the in-flight pulse itself:
-  const callCard=$('c-call');
-  const callRun=callCard.classList.contains('run');
+  // CALL — sonar rings + phone shake while ringing (2026-11-07). Driven by
+  // the server's s.call {number, ts, active}: it used to key on the purple
+  // in-flight pulse ('run'), which is disabled, so it never animated.
+  const callCard=$('c-call'), C=s.call;
+  const callRun=!!(C&&C.active);
   if(callRun!==vizPrev.callRun){
     callCard.classList.toggle('calling',callRun);
     $('callic').classList.toggle('calling',callRun);
     vizPrev.callRun=callRun;
   }
+  { const who=C?(C.number||'unknown number'):'';
+    const t=C?new Date(C.ts*1000).toTimeString().slice(0,5):'';
+    const txt=!C?'–':(callRun?'calling '+who+'…':'last: '+who+' · '+t);
+    const sc=$('s-call'); if(sc&&sc.textContent!==txt)sc.textContent=txt; }
   // MESSAGE — typing dots while the send is in flight (same pattern as CALL)
   const msgCard=$('c-msg');
   const msgRun=msgCard.classList.contains('run');
@@ -1320,7 +1490,14 @@ function vizApply(s){
     vizPrev.remSet=set;
   }
 }
-function startLive(){ if(LIVE) return; live(); setInterval(live,1000); }
+// Adaptive poll (2026-11-07): 4 Hz while a voice turn is in flight so the
+// CoT reasoning streams like the typed SSE path (it was a 1 Hz snapshot);
+// 1 Hz when idle to keep the Pi's load down.
+function startLive(){ if(LIVE) return;
+  const tick=async()=>{ try{ await live(); }catch(e){}
+    const busy=['thinking','tool','speaking'].includes(last.phase);
+    setTimeout(tick, busy?250:1000); };
+  tick(); }
 function startDemo(){ setModePill('demo'); demo(); }
 $('btn-theme').onclick=function(){ const h=document.documentElement; h.setAttribute('data-theme', h.getAttribute('data-theme')==='light'?'':'light'); };
 const btnThink=$('btn-think');
@@ -1332,8 +1509,8 @@ btnThink.onclick=async function(){
     const j=await r.json().catch(()=>({}));
     if(!r.ok||!j.ok) throw new Error(j.error||('HTTP '+r.status));
     this.dataset.on=next==='on'?'1':'0'; this.textContent=next==='on'?'💭 on':'💭 off'; this.classList.toggle('on',next==='on');
-    logCmd('thinking '+next,'ok');
-  }catch(e){ logCmd('thinking toggle failed: '+e.message,'err'); }
+    log('thinking '+next,'ok');   // was logCmd() — undefined (ReferenceError)
+  }catch(e){ log('thinking toggle failed: '+escapeHtml(e.message),'err'); }
 };
 $('llm-sel').onchange=async function(){
   const p=this.value; this.disabled=true;
@@ -1341,9 +1518,11 @@ $('llm-sel').onchange=async function(){
     const r=await fetch('/llm',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({provider:p})});
     const j=await r.json().catch(()=>({}));
     if(!r.ok||!j.ok) throw new Error(j.error||('HTTP '+r.status));
-    logCmd('llm → '+j.provider+' ('+j.model+')','ok');
-  }catch(e){ logCmd('llm switch failed: '+e.message,'err'); }
-  this.disabled=false;
+    log('llm → '+escapeHtml(j.provider+' ('+j.model+')'),'ok');
+  }catch(e){ log('llm switch failed: '+escapeHtml(e.message),'err'); }
+  // finally: logCmd() was undefined, so the throw inside catch skipped the
+  // re-enable and the dropdown stayed greyed until a refresh (2026-11-07).
+  finally{ this.disabled=false; }
 };
 /* ================= TYPED CHAT (POST /chat — no STT/TTS) ====================
    Composer is live when served by the Boots UI server (same Groq LLM + tools
@@ -1407,7 +1586,7 @@ async function sendChat(){
           cotThink(d.text||'');
         } else if(ev==='tool_start'){
           step(4,'active');
-          const el=toolChip(d.name, JSON.stringify(d.args||{}), '', 0);
+          const el=toolChip(d.name, JSON.stringify(d.args||{}), '', 0); replyEl=null;  /* text AFTER a tool line starts a NEW bubble below it (no in-place mutation) */ 
           lastToolSeq=Math.max(lastToolSeq,d.seq||0); lastToolEl=el;
           // purple in-flight card pulse stays DISABLED (boss, 2026-11-05) —
           // the chip line + CoT row carry the in-flight state.
@@ -1446,7 +1625,7 @@ async function sendChat(){
     log('chat error: '+e,'err');
     setVoice('idle','idle','chat error — retry');
   }
-  setVoice('idle','idle','turn complete · barge-in armed');   // typed turn: no TTS leg, rest on idle (Zzz)
+  setVoice('idle','idle','turn complete');   // typed turn: no TTS leg, rest on idle (Zzz)
   chatBusy=false; if($('chatinput'))$('chatinput').focus();
 }
 (function(){

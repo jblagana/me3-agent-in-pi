@@ -48,14 +48,22 @@ def _make_tool(mod, name, desc, params):
         return await asyncio.to_thread(mod.dispatch, name, **kwargs)
 
     if not params:
-        @functools.wraps(base)
+        # NO functools.wraps here (2026-11-07): it set __wrapped__ = base, and
+        # FastMCP's signature inspection followed it to base(**kwargs) -> a
+        # REQUIRED "kwargs" field -> every zero-arg tool (play/pause/resume/
+        # next/stop/volume up/down) failed validation on every voice call.
         async def fn():
-            return await base()
+            return await asyncio.to_thread(mod.dispatch, name)
         fn.__doc__ = desc
+        fn.__signature__ = inspect.Signature([])
     else:
         # Build a closure that takes exactly the declared params. Map the
         # JSON-schema type to the Python annotation (str/int/float/bool).
-        _T = {"string": str, "integer": int, "number": float, "boolean": bool}
+        # array/object MUST map to list/dict (2026-11-07): they fell through
+        # to str, so write_website's sections/stats/sources failed pydantic
+        # validation ("Input should be a valid string") on EVERY voice call.
+        _T = {"string": str, "integer": int, "number": float, "boolean": bool,
+              "array": list, "object": dict}
 
         def _ann(pschema):
             t = pschema.get("type") if isinstance(pschema, dict) else pschema

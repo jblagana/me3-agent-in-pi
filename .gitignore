@@ -6,3 +6,11 @@ boots_ui.py
 boots_ui.html
 _sync_staging/
 __pycache__/
+fd-benchmark/
+
+# runtime (2026-11-07)
+bootsui/llm.json
+bootsui/sites/*.html
+fd-benchmark/
+agent.log
+bootsui/ui.log

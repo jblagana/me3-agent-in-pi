@@ -116,9 +116,38 @@ def _num(slot):
     return int(m.group()) if m else None
 
 
-def _confirm(cmd, slot):
-    '''Value-specific, speakable confirmation the LLM reads back.'''
+def _confirm(cmd, slot, requested=None):
+    '''Value-specific, speakable confirmation the LLM reads back. `slot` is the
+    APPLIED value when the server reported one (fired:<value>).'''
     try:
+        if cmd == 'TIMER' and str(slot).isdigit():
+            return f'Timer set for {_human_secs(slot)}.'
+        if cmd == 'ALARM' and _re.fullmatch(r'\d{2}:\d{2}', str(slot)):
+            h, mm = (int(x) for x in str(slot).split(':'))
+            return f"Alarm set for {h % 12 or 12}:{mm:02d} {'AM' if h < 12 else 'PM'}."
+        if cmd == 'TEMPERATURE':
+            d, r = _num(slot), _num(requested)
+            if d is not None and r is not None and r != d:
+                return f"Temperature set to {d} degrees, the {'highest' if r > d else 'lowest'} it goes."
+        # Music: natural confirmations (were "PLAY_MUSIC done." etc).
+        if cmd == 'PLAY_MUSIC':
+            return f'Playing {slot}.' if slot else 'Playing music.'
+        if cmd == 'NEXT':
+            return f'Next song: {slot}.' if slot else 'Skipping to the next song.'
+        if cmd == 'PAUSE':
+            return 'Music paused.'
+        if cmd == 'RESUME':
+            return 'Music resumed.'
+        if cmd == 'STOP':
+            return 'Music stopped.'
+        if cmd in ('VOLUME_UP', 'VOLUME_DOWN'):
+            v = _num(slot)
+            word = 'up' if cmd == 'VOLUME_UP' else 'down'
+            return f'Volume {word} to {v} percent.' if v is not None else f'Volume {word}.'
+        if cmd == 'SET_VOLUME':
+            v, r = _num(slot), _num(requested)
+            if v is not None and r is not None and r < v:
+                return f'Volume set to {v} percent, the lowest I go so you can still hear me.'
         if cmd == 'BRIGHTNESS':
             p = _pct(slot)
             return f'Brightness set to {p} percent.' if p is not None else 'Brightness updated.'
@@ -170,10 +199,44 @@ def _fire(cmd: str, slot=None) -> str:
         headers={"Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(req, timeout=BOOTS_UI_TIMEOUT) as r:
-            r.read()
-        return _confirm(cmd, slot)
+            resp = r.read().decode("utf-8", "replace")
     except Exception:
         return OFFLINE_MSG
+    # Confirm what the device ACTUALLY did (2026-11-07 stress test): the
+    # server answers "ok:fired:<applied value>" or "ok:invalid". The old
+    # confirmation echoed the REQUEST, so "Light color set to chartreuse",
+    # "Timer set for 1 hour" (1 s), "Alarm set for noon" (nothing) were lies.
+    outcome = resp[3:] if resp.startswith("ok:") else resp
+    if outcome == "invalid":
+        return _ask_again(cmd, slot)
+    if outcome == "nomedia":
+        return ("I can't play local music: there are no song files on the device. "
+                "I can play it on Spotify instead if you tell me what to play.")
+    applied = outcome[6:] if outcome.startswith("fired:") else None
+    return _confirm(cmd, applied if applied else slot, requested=slot)
+
+
+def _ask_again(cmd, slot):
+    """Spoken line when the device could not read the value (nothing changed)."""
+    s = str(slot or "").strip()
+    return {
+        "BRIGHTNESS": f"I couldn't read '{s}' as a brightness. Give me a percent, like 40 percent.",
+        "COLOR": f"I don't know the color '{s}'. Try a common color name, like teal or orange.",
+        "TEMPERATURE": f"I couldn't read '{s}' as a temperature. Say a number of degrees, like 22.",
+        "TIMER": f"I couldn't tell how long '{s}' is. Say something like 5 minutes.",
+        "ALARM": f"I couldn't read '{s}' as a time. Say something like 7:30 AM.",
+        "CREATE_REMINDER": "What should the reminder say?",
+        "CALL": "Who should I call? I need a number or a name.",
+    }.get(cmd, "I couldn't do that. Could you say it another way?")
+
+
+def _human_secs(n):
+    """3600 -> '1 hour', 90 -> '1 minute 30 seconds', 120 -> '2 minutes'."""
+    n = int(n)
+    h, rem = divmod(n, 3600)
+    m, s = divmod(rem, 60)
+    parts = [f"{v} {u}{'' if v == 1 else 's'}" for v, u in ((h, "hour"), (m, "minute"), (s, "second")) if v]
+    return " ".join(parts) or "0 seconds"
 
 
 def dispatch(tool: str, **kw) -> str:

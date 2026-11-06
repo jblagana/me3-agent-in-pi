@@ -79,6 +79,12 @@ STATE = {
             "mic_level": 0.0, "last_hb": 0.0, "ts": 0.0},
 }
 
+_BOOT_ID = "%d-%d" % (os.getpid(), int(time.time() * 1000))  # per server start
+CALL_RING_S = float(os.environ.get("ME2_CALL_RING_S", "8"))  # CALL card ring window
+# Lowest volume a command may set: the music volume IS the EMEET's ALSA PCM
+# volume, which Boots also speaks through (0 = Boots goes silent; the stress
+# test did exactly that, 2026-11-07).
+VOL_MIN = int(os.environ.get("ME2_VOL_MIN", "10"))
 _PAGE_HTML = None  # boots_ui.html bytes (the ME3 observability dashboard) or None
 
 # ---------------------------------------------------------------- typed chat
@@ -111,16 +117,67 @@ V3_PCT = {"20 percent": 20, "60 percent": 60, "100 percent": 100}
 V3_COLOR = {"red": "red", "blue": "blue", "green": "green"}
 
 
+# --- Free-form slot parsing (2026-11-07 stress-test fixes) -------------------
+# The LLM passes the user's own words ("two minutes", "noon", "sixteen",
+# "chartreuse"). The old parsers only read digits + seconds/minutes and three
+# colours, so they silently did nothing while the tool confirmed success.
+# Every parser now returns None/0 when it truly can't read the value, and
+# apply_fire reports "invalid" so the tool asks instead of claiming success.
+_NUM_WORDS = {"zero": 0, "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+              "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+              "eleven": 11, "twelve": 12, "thirteen": 13, "fourteen": 14,
+              "fifteen": 15, "sixteen": 16, "seventeen": 17, "eighteen": 18,
+              "nineteen": 19, "twenty": 20, "thirty": 30, "forty": 40,
+              "fifty": 50, "sixty": 60, "seventy": 70, "eighty": 80, "ninety": 90}
+
+
+def _words_to_digits(text) -> str:
+    """'twenty five minutes' -> '25 minutes', 'an hour' -> '1 hour',
+    'seven thirty' -> '7 30'. Leaves everything else as-is."""
+    t = str(text or "").lower()
+    t = re.sub(r"\bhalf\s+an?\s+hour\b", "30 minutes", t)
+    t = re.sub(r"\ban?\s+(hour|minute|second)", r"1 \1", t)
+    out, acc, prev_tens = [], None, False
+    for tok in re.findall(r"[a-z]+|\d+(?:\.\d+)?|[^\sa-z\d]", t):
+        if tok in _NUM_WORDS:
+            v = _NUM_WORDS[tok]
+            if acc is not None and prev_tens and v < 10:
+                acc += v
+                prev_tens = False
+            else:
+                if acc is not None:
+                    out.append(str(acc))
+                acc, prev_tens = v, (v >= 20 and v % 10 == 0)
+            continue
+        if tok == "hundred" and acc is not None:
+            acc *= 100
+            prev_tens = False
+            continue
+        if acc is not None:
+            out.append(str(acc))
+            acc = None
+            prev_tens = False
+        out.append(tok)
+    if acc is not None:
+        out.append(str(acc))
+    return " ".join(out)
+
+
 def _free_secs(slot):
-    """any "N seconds" / "N min(utes)" / bare "N" -> seconds (V3 keys still work)."""
+    """'90 seconds' / '1 hour' / 'two minutes' / '1 hour 30 minutes' /
+    'half an hour' -> seconds (0 = unreadable). Bare number = seconds.
+    Capped at 24 h. (V3 keys still work.)"""
     if slot in V3_TIMER_SEC:
         return V3_TIMER_SEC[slot]
-    t = str(slot or "").lower()
-    m = re.search(r"(\d+)\s*(minute|min|sec|second|s|\bmin\b|\bsec\b)?", t)
-    if not m:
-        return 0
-    n = int(m.group(1)); unit = (m.group(2) or "").lower()
-    return n * 60 if unit.startswith("min") else n
+    t = _words_to_digits(slot)
+    total, found = 0.0, False
+    for n, unit in re.findall(
+            r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h\b|minutes?|mins?|m\b|seconds?|secs?|s\b)?", t):
+        n = float(n)
+        u = unit or ""
+        total += n * 3600 if u.startswith("h") else n * 60 if u.startswith("m") else n
+        found = True
+    return int(min(total, 24 * 3600)) if found else 0
 
 
 def _timer_secs(slot: str) -> int:
@@ -129,21 +186,30 @@ def _timer_secs(slot: str) -> int:
 
 
 def _free_mark(slot):
-    """any "H AM/PM" / "H:MM AM/PM" / "HH:MM" -> "HH:MM" (V3 keys still work)."""
+    """'7:30 AM' / '6 pm' / '18:00' / 'noon' / 'midnight' / 'seven thirty am'
+    -> 'HH:MM' (None = unreadable). (V3 keys still work.)"""
     if slot in V3_ALARM_MARK:
         return V3_ALARM_MARK[slot]
-    t = str(slot or "").upper()
-    m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(AM|PM)?", t)
+    t = re.sub(r"(\d)\s*\.\s*(\d)", r"\1:\2", _words_to_digits(slot))   # 7.30 -> 7:30
+    t = t.upper().replace(".", "")                                        # p.m. -> PM
+    t = re.sub(r"\b([AP])\s+M\b", r"\1M", t)                            # "P M" -> PM
+    if "NOON" in t:
+        return "12:00"
+    if "MIDNIGHT" in t:
+        return "00:00"
+    m = re.search(r"\b(\d{1,2})(?:\s*[:\s]\s*(\d{2}))?\s*(AM|PM)?\b", t)
     if not m:
         return None
-    h = int(m.group(1)); mm = int(m.group(2) or 0); ap = m.group(3)
+    h = int(m.group(1))
+    mm = int(m.group(2) or 0)
+    ap = m.group(3)
     if ap == "PM" and h < 12:
         h += 12
     if ap == "AM" and h == 12:
         h = 0
-    if ap is None and h <= 7:
-        pass  # naive "6" treated as PM-ish morning? keep as-is (h:00)
-    return f"{h % 24:02d}:{mm:02d}"
+    if h > 23 or mm > 59:
+        return None
+    return f"{h:02d}:{mm:02d}"
 
 
 def _alarm_mark(slot: str):
@@ -151,12 +217,16 @@ def _alarm_mark(slot: str):
     return _free_mark(slot)
 
 
+TEMP_MIN, TEMP_MAX = 16, 30   # a real thermostat's range (100 was accepted)
+
+
 def _free_deg(slot):
-    """any "N degrees" / "N" -> int degrees (V3 keys still work)."""
+    """'24 degrees' / 'sixteen' -> int degrees, clamped to TEMP_MIN..TEMP_MAX
+    (None = unreadable). (V3 keys still work.)"""
     if slot in V3_DEG:
         return V3_DEG[slot]
-    m = re.search(r"(\d+)", str(slot or ""))
-    return int(m.group(1)) if m else None
+    m = re.search(r"(\d+)", _words_to_digits(slot))
+    return max(TEMP_MIN, min(TEMP_MAX, int(m.group(1)))) if m else None
 
 
 def _temp_deg(slot: str):
@@ -164,14 +234,24 @@ def _temp_deg(slot: str):
     return _free_deg(slot)
 
 
+_PCT_WORDS = {"off": 0, "dim": 20, "dimmer": 20, "low": 20, "half": 50,
+              "medium": 50, "bright": 100, "brighter": 100, "full": 100,
+              "max": 100, "maximum": 100}
+
+
 def _free_pct(slot):
-    """any "N percent" / "N%" / "N" -> int 0-100 (V3 keys still work)."""
+    """'40 percent' / '40%' / 'forty' / 'dim' / 'half' / 'full' -> 0..100
+    (None = unreadable). (V3 keys still work.)"""
     if slot in V3_PCT:
         return V3_PCT[slot]
-    m = re.search(r"(\d+)", str(slot or ""))
-    if not m:
-        return None
-    return max(0, min(100, int(m.group(1))))
+    t = _words_to_digits(slot)
+    m = re.search(r"(\d+)", t)
+    if m:
+        return max(0, min(100, int(m.group(1))))
+    for w in re.findall(r"[a-z]+", t):
+        if w in _PCT_WORDS:
+            return _PCT_WORDS[w]
+    return None
 
 
 def _bright_pct(slot: str):
@@ -179,9 +259,35 @@ def _bright_pct(slot: str):
     return _free_pct(slot)
 
 
+# Any CSS named colour (the tool promises "any color name"; it used to accept
+# only red/blue/green) + two lamp whites the UI already styles.
+_CSS_COLORS = set("""aliceblue antiquewhite aqua aquamarine azure beige bisque black
+blanchedalmond blue blueviolet brown burlywood cadetblue chartreuse chocolate coral
+cornflowerblue cornsilk crimson cyan darkblue darkcyan darkgoldenrod darkgray darkgreen
+darkgrey darkkhaki darkmagenta darkolivegreen darkorange darkorchid darkred darksalmon
+darkseagreen darkslateblue darkslategray darkslategrey darkturquoise darkviolet deeppink
+deepskyblue dimgray dimgrey dodgerblue firebrick floralwhite forestgreen fuchsia gainsboro
+ghostwhite gold goldenrod gray green greenyellow grey honeydew hotpink indianred indigo ivory
+khaki lavender lavenderblush lawngreen lemonchiffon lightblue lightcoral lightcyan
+lightgoldenrodyellow lightgray lightgreen lightgrey lightpink lightsalmon lightseagreen
+lightskyblue lightslategray lightslategrey lightsteelblue lightyellow lime limegreen linen
+magenta maroon mediumaquamarine mediumblue mediumorchid mediumpurple mediumseagreen
+mediumslateblue mediumspringgreen mediumturquoise mediumvioletred midnightblue mintcream
+mistyrose moccasin navajowhite navy oldlace olive olivedrab orange orangered orchid
+palegoldenrod palegreen paleturquoise palevioletred papayawhip peachpuff peru pink plum
+powderblue purple rebeccapurple red rosybrown royalblue saddlebrown salmon sandybrown
+seagreen seashell sienna silver skyblue slateblue slategray slategrey snow springgreen
+steelblue tan teal thistle tomato turquoise violet wheat white whitesmoke yellow
+yellowgreen""".split()) | {"warm", "amber"}
+
+
 def _lamp_color(slot: str):
-    """V3 COLOR slot -> lamp color name (red / blue / green)."""
-    return V3_COLOR.get(slot)
+    """Colour name -> lamp colour (None = unknown). 'Light Blue' -> 'lightblue',
+    'warm white' -> 'warm'."""
+    c = re.sub(r"[^a-z]", "", str(slot or "").lower())
+    if c in ("warmwhite", "softwhite"):
+        c = "warm"
+    return c if c in _CSS_COLORS else None
 
 
 def _timer_word(slot):
@@ -221,6 +327,7 @@ DEV = {
     "music": {"playing": False, "paused": False, "track": None, "vol": 60,
               "user_paused": False},
     "reminders": [],
+    "call": None,       # {"number", "ts"} of the last CALL (CALL card)
     "chips": deque(maxlen=6),  # (text, ts)
     "speaking_until": 0.0,     # TTS self-trigger window (pi_demo guard)
 }
@@ -861,19 +968,25 @@ def apply_fire(f: dict) -> str:
         _DUCK.update(awake=False, defer=False)  # new track, fresh state
         if not _music_play(track):  # real audio (instruction 15)
             m["playing"] = False  # fail-soft: don't claim it's playing
+            m["track"] = "nothing playing"
             add_chip(f"music: no audio for “{track}”")
-        else:
-            speak_clips([_clip_name(cmd, slot)])
+            return "nomedia"      # the tool says so instead of "done" (2026-11-07)
+        speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{track}"
     elif cmd == "VOLUME_UP":
         DEV["music"]["vol"] = min(100, DEV["music"]["vol"] + 20)
         _apply_alsa_volume(DEV["music"]["vol"])
         add_chip(f"volume {DEV['music']['vol']}")
         speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{DEV['music']['vol']}"
     elif cmd == "VOLUME_DOWN":
-        DEV["music"]["vol"] = max(0, DEV["music"]["vol"] - 20)
+        # floor = VOL_MIN: this is the SAME ALSA volume Boots speaks with, so
+        # 0 would leave the user unable to hear Boots at all (2026-11-07).
+        DEV["music"]["vol"] = max(VOL_MIN, DEV["music"]["vol"] - 20)
         _apply_alsa_volume(DEV["music"]["vol"])
         add_chip(f"volume {DEV['music']['vol']}")
         speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{DEV['music']['vol']}"
     elif cmd == "SET_VOLUME":
         # UI slider: set the M1A HW volume to the exact value. The
         # 1 Hz sync loop keeps the tile in lockstep with the HW.
@@ -881,10 +994,11 @@ def apply_fire(f: dict) -> str:
             v = int(slot)
         except (TypeError, ValueError):
             v = DEV["music"]["vol"]
-        v = max(0, min(100, v))
+        v = max(VOL_MIN, min(100, v))   # never mute Boots' own voice (see VOL_MIN)
         DEV["music"]["vol"] = v
         _apply_alsa_volume(v)
         add_chip(f"volume {v}")
+        return f"fired:{v}"
     elif cmd == "NEXT":
         m = DEV["music"]
         if not m["track"]:
@@ -892,9 +1006,12 @@ def apply_fire(f: dict) -> str:
         else:
             nxt = (SONGS[(SONGS.index(m["track"]) + 1) % len(SONGS)]
                    if m["track"] in SONGS else random.choice(SONGS))
+            if not _music_play(nxt):          # no audio file: don't fake it
+                m.update(playing=False, track="nothing playing")
+                return "nomedia"
             m.update(playing=True, paused=False, track=nxt)
-            _music_play(nxt)
             speak_clips([_clip_name(cmd, slot)])
+            return f"fired:{nxt}"
     elif cmd == "PAUSE":
         # ONE-WAY (2026-10-03): "pause music" always stops, never resumes.
         # It was a toggle before — the wake-duck pauses the music on "hey
@@ -948,21 +1065,30 @@ def apply_fire(f: dict) -> str:
         DEV["lights"]["on"] = False
         speak_clips([_clip_name(cmd, slot)])
     elif cmd == "BRIGHTNESS":
+        # (2026-11-07) "invalid" / "fired:<applied>" outcomes: the tool's
+        # spoken confirmation now reports what was ACTUALLY applied, and an
+        # unreadable value is asked about instead of confirmed.
         p = _bright_pct(slot)
-        if p is not None:
-            L = DEV["lights"]; L["on"] = True; L["level"] = p
-            speak_clips([_clip_name(cmd, slot)])
+        if p is None:
+            return "invalid"
+        L = DEV["lights"]; L["on"] = True; L["level"] = p
+        speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{p}"
     elif cmd == "COLOR":
         c = _lamp_color(slot)
-        if c:
-            L = DEV["lights"]; L["color"] = c; L["on"] = True
-            speak_clips([_clip_name(cmd, slot)])
+        if not c:
+            return "invalid"
+        L = DEV["lights"]; L["color"] = c; L["on"] = True
+        speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{c}"
     # --- temperature ---
     elif cmd == "TEMPERATURE":
         d = _temp_deg(slot)
-        if d is not None:
-            DEV["temp"]["target"] = d
-            speak_clips([_clip_name(cmd, slot)])
+        if d is None:
+            return "invalid"
+        DEV["temp"]["target"] = d
+        speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{d}"
     # --- information ---
     elif cmd == "TIME":
         # Pre-record lead-in (Roger) + TTS tail (live clock).
@@ -976,7 +1102,7 @@ def apply_fire(f: dict) -> str:
             # All-TTS reply (2026-10-06): no lead clip, no glue — weather
             # is internet-dependent anyway, so the TTS round-trip is
             # already in the path. speak_text carries the location itself
-            # ("In UP Diliman, sunny, 29 degrees") — no prefix here.
+            # ("In U.P. Diliman, sunny, 29 degrees") — no prefix here.
             speak_clips([], tail=speak_text)
         else:
             # Offline: default clip only — no glue, no stale tail.
@@ -984,26 +1110,39 @@ def apply_fire(f: dict) -> str:
     # --- timers & alarms ---
     elif cmd == "TIMER":
         secs = _timer_secs(slot)
-        if secs:
-            DEV["timer"] = {"until": now + secs, "secs": secs,
-                            "mins": secs / 60.0, "done": False}
-            speak_clips([_clip_name(cmd, slot)])
+        if not secs:
+            return "invalid"
+        DEV["timer"] = {"until": now + secs, "secs": secs,
+                        "mins": secs / 60.0, "done": False}
+        speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{secs}"
     elif cmd == "ALARM":
         mark = _alarm_mark(slot)
-        if mark and mark not in DEV["alarms"]:
+        if not mark:
+            return "invalid"
+        if mark not in DEV["alarms"]:
             DEV["alarms"].append(mark)
             DEV["alarms"].sort()
             DEV["alarms"] = DEV["alarms"][:20]
             speak_clips([_clip_name(cmd, slot)])
+        return f"fired:{mark}"
     # --- communication ---
     elif cmd == "CALL":
+        if not str(slot or "").strip():
+            return "invalid"          # no number: ask, don't "ring nobody"
         add_chip("dialing…")
+        # Call state for the CALL card (2026-11-07): the card's ring/shake
+        # animation keyed on the disabled purple tool pulse and the server
+        # kept no number/time, so it never animated and its status stayed "–".
+        DEV["call"] = {"number": str(slot or "").strip()[:40], "ts": now}
         speak_clips([_clip_name(cmd, slot)])
     elif cmd == "MESSAGE":
         add_chip("opening messages…")
         speak_clips([_clip_name(cmd, slot)])
     # --- reminders (structured: {text, done, ts}) ---
     elif cmd == "CREATE_REMINDER":
+        if not str(slot or "").strip():
+            return "invalid"          # empty reminder: ask what it should say
         if slot:
             if not any(r["text"] == slot for r in DEV["reminders"]):
                 DEV["reminders"].insert(0,
@@ -1091,10 +1230,10 @@ def state_json() -> dict:
 # open-meteo, stdlib only, 15-min cache. Fail-soft: no internet (Pi on a
 # phone hotspot) -> last good value, or None until the first success.
 # Location is BOSS-SET, not geocoded (Opt 1, 2026-10-06): the exact point
-# is hardcoded here (UP Diliman campus) and overridable via env vars
+# is hardcoded here (U.P. Diliman campus) and overridable via env vars
 # ME2_LOCATION / ME2_LAT / ME2_LON. The name is spoken back in the reply
 # so the answer is specific about WHERE the number is from.
-ME2_LOCATION = os.environ.get("ME2_LOCATION", "UP Diliman")
+ME2_LOCATION = os.environ.get("ME2_LOCATION", "U.P. Diliman")
 WMO = {
     0: (chr(0x2600)+chr(0xFE0F), "clear"),
     1: (chr(0x2600)+chr(0xFE0F), "mainly clear"),
@@ -1131,7 +1270,7 @@ def _weather_fetch():
     import urllib.request
     # Exact campus point (14.6532, 121.0806) — the geocoder would return
     # Quezon City's centroid, not the campus; boss-set, env-overridable.
-    lat = os.environ.get("ME2_LAT", "14.6532")   # UP Diliman, Quezon City
+    lat = os.environ.get("ME2_LAT", "14.6532")   # U.P. Diliman, Quezon City
     lon = os.environ.get("ME2_LON", "121.0806")
     url = ("https://api.open-meteo.com/v1/forecast"
            f"?latitude={lat}&longitude={lon}"
@@ -1142,7 +1281,8 @@ def _weather_fetch():
     icon, cond = WMO.get(int(cur["weather_code"]), ("\u2753", "unknown"))
     STATE["weather"] = {"icon": icon,
                         "temp": round(float(cur["temperature_2m"])),
-                        "condition": cond, "ts": time.time()}
+                        "condition": cond, "ts": time.time(),
+                        "place": os.environ.get("ME2_PLACE", "U.P. Diliman")}
     STATE["weather_online"] = True
 
 
@@ -1198,7 +1338,17 @@ def ui_state_json() -> dict:
         last_good = STATE["last_good"]
         last_dim = STATE.get("last_dim")
         weather = STATE.get("weather")
+        # The place the user ASKED about (check_weather -> POST /weather)
+        # wins for 30 min, then the card falls back to the home reading.
+        _asked = STATE.get("weather_asked")
+        if _asked and now - _asked.get("ts", 0) < 1800:
+            weather = _asked
         dev = dev_view(now)
+        _c = DEV.get("call")
+        # active = the ~8 s "ringing" window the card animates for; after
+        # that the card shows it as the last call.
+        call = ({"number": _c["number"], "ts": _c["ts"],
+                 "active": now - _c["ts"] < CALL_RING_S} if _c else None)
     if mode == "awake":
         umode = "awake"                       # "Listening…" + edge glow
     elif mode == "reject":
@@ -1248,10 +1398,15 @@ def ui_state_json() -> dict:
         "music": _ui_music(dev),
         "notes": [c for c, _ts in dev["chips"]],
         "reminders": dev["reminders"],
+        "call": call,
         "weather": weather,
         "speaking": time.time() < STATE.get("speaking_until", 0.0),
         "slotPrompt": None, "candidates": None, "retries": None,
         "me3": STATE["me3"],
+        # Server instance id (2026-11-07): the page reloads when it changes —
+        # a restart resets turn/tool_seq/heard_seq to 0, and a tab kept open
+        # across it de-duped against the OLD counters (missing/misplaced chips).
+        "boot_id": _BOOT_ID,
         "chat_history": list(STATE["chat_history"]),
         "cmdlog": list(STATE["cmdlog"]),
         # getattr: _CHAT_LLM is None until the first /chat call (lazy load)
@@ -1281,7 +1436,7 @@ _VOICE_LAST = {"phase": None, "heard": None}
 # cot_round, exactly like the typed path keys on the SSE stream.
 _VOICE_ROUND = {"prev": "", "round": 0, "first": True, "t0": 0.0}
 
-def _append_turn(heard: str, response: str) -> None:
+def _append_turn(heard: str, response: str, tools=None) -> None:
     """Append one completed turn (user text + assistant reply) to the shared
     conversation memory (full thread; the LLM window is sliced in _chat_run)."""
     try:
@@ -1303,14 +1458,18 @@ def _append_turn(heard: str, response: str) -> None:
             _h = STATE["chat_history"]
             _prev = _h[-1] if _h else None
             if _prev and _prev.get("role") == "assistant" \
-                    and _prev.get("content") == response[:400] \
+                    and _prev.get("content") == response[:4000] \
                     and (not heard or (len(_h) >= 2 and _h[-2].get("content") == heard[:400])):
                 return
             if heard:
                 STATE["chat_history"].append(
                     {"role": "user", "content": heard[:400]})
-            STATE["chat_history"].append(
-                {"role": "assistant", "content": response[:400]})
+            _entry = {"role": "assistant", "content": response[:4000]}
+            if tools:
+                # UI-only chip payload (dropped from the LLM prompt window,
+                # same as typed turns' "tools").
+                _entry["tools"] = [dict(t) for t in tools]
+            STATE["chat_history"].append(_entry)
     except Exception:
         pass
 
@@ -1406,7 +1565,8 @@ def _chat_load_impl():
                     "name": n, "description": d,
                     "parameters": {"type": "object",
                                    "properties": _norm_props(p),
-                                   "required": list(p.keys())},
+                                   "required": [k for k in p if k not in
+                                                getattr(mod, "OPTIONAL_PARAMS", {}).get(n, ())]},
                 },
             })
 
@@ -1421,7 +1581,7 @@ def _chat_load_impl():
 # ---------------------------------------------------------------------------
 _LLM_PRESETS = {
     "groq": {
-        "label": "Groq · qwen3.8-27b",
+        "label": "Groq · " + os.environ.get("LLM_MODEL", "qwen/qwen3.8-27b").split("/")[-1],
         "base_url": "https://api.groq.com/openai/v1",
         "api_key": os.environ.get("LLM_API_KEY")
                   or os.environ.get("GROQ_API_KEY", ""),
@@ -1436,13 +1596,17 @@ _LLM_PRESETS = {
         # ASR/TTS only and needs SHARC VPN — not an LLM target.
         # Env-overridable: ME3_DGX3_LLM_BASE / ME3_DGX3_API_KEY /
         # ME3_DGX3_LLM_MODEL
+        # ME3_HPC_* (2026-11-07, shared with agent.py's fallback) win over
+        # the legacy ME3_DGX3_* names.
         "label": "HPC · vLLM",
-        "base_url": os.environ.get("ME3_DGX3_LLM_BASE",
-                                   "http://202.92.159.240:8001/v1"),
-        "api_key": os.environ.get("ME3_DGX3_API_KEY",
-                                  "***REMOVED-HPC-KEY***"),
-        "model": os.environ.get("ME3_DGX3_LLM_MODEL",
-                                "Qwen/Qwen3.8-27B"),
+        "base_url": os.environ.get("ME3_HPC_LLM_BASE") or os.environ.get(
+            "ME3_DGX3_LLM_BASE", "http://202.92.159.240:8001/v1"),
+        # key from the environment ONLY (/etc/me3/groq.env); no hardcoded
+        # fallback (public repo). NOT ME3_DGX3_API_KEY: that is the DGX3
+        # ASR/TTS key, a different server.
+        "api_key": os.environ.get("ME3_HPC_API_KEY", ""),
+        "model": os.environ.get("ME3_HPC_LLM_MODEL") or os.environ.get(
+            "ME3_DGX3_LLM_MODEL", "Qwen/Qwen3.8-27B"),
         # HPC is self-hosted (no rate limit to save) and its Qwen3 returns
         # the reasoning stream in the 'reasoning' field — default ON so the
         # CoT think row has a real stream to show. Groq stays "off": its
@@ -1491,8 +1655,34 @@ def _apply_llm_cfg(cfg: dict):
     _CHAT_LLM.provider = cfg.get("provider", "custom")
     _CHAT_LLM.thinking = cfg.get("thinking", "off")
 
+_HPC_FB = {"s": None}
+# "website/web page" anywhere, or a bare "site" ONLY right after a build
+# verb ("build a site") -- "visit the site office" must not match.
+_SITE_INTENT = re.compile(
+    r"\b(web ?site|web ?page|landing page)\b"
+    r"|\b(make|build|create|write|generate|design)\b\s+(me\s+|us\s+)?(a|an|my|the|our)?\s*(new\s+|simple\s+|small\s+)?site\b",
+    re.I)
+
+
+def _hpc_fallback_session():
+    """requests.Session for the HPC preset (typed-chat fallback), or None."""
+    if _requests is None:
+        return None
+    if _HPC_FB["s"] is None:
+        p = _LLM_PRESETS["hpc"]
+        if not (p.get("base_url") and p.get("api_key")):
+            return None
+        s = _requests.Session()
+        s.headers.update({"Authorization": f"Bearer {p['api_key']}",
+                          "Content-Type": "application/json"})
+        s.base_url = p["base_url"].rstrip("/")
+        s.model = p["model"]
+        _HPC_FB["s"] = s
+    return _HPC_FB["s"]
+
+
 def _chat_run(msg: str, emit=None):
-    """One typed turn: LLM -> tools (max 5 rounds), like agent.py. Returns
+    """One typed turn: LLM -> tools (max 10 rounds), like agent.py. Returns
     (reply_text, [tool calls made]). emit(kind, payload) is the SSE hook —
     /chat_stream passes a callback that pushes {"thinking","tool_start",
     "tool_result","reply","done"} events to the browser as they happen
@@ -1533,13 +1723,22 @@ def _chat_run(msg: str, emit=None):
     messages.extend(prior)
     messages.append({"role": "user", "content": msg})
     calls = []
-    reply = "(stopped after 5 tool rounds)"
+    reply = "(stopped after 10 tool rounds)"
     # Empty reply guard: an empty assistant entry in the prompt window is
     # invalid for strict OpenAI-compatible providers (and it made the UI
     # skip the bubble via the replyShown dedupe). Fall back to a short
     # spoken line instead of storing "" in history.
     llm_ms = 0   # total LLM round-trip time across all rounds
-    for _ in range(5):
+    # Unexecuted-action guard (2026-11-07): gpt-oss sometimes ENDS a website
+    # turn with text claiming the site is built ("verified working") plus a
+    # made-up URL, without ever calling write_website (reasoning literally
+    # said "Now create website."). When the user asked for a site and the
+    # turn tries to end without the call, the claim is discarded, the model
+    # is told nothing was built, and the next round FORCES write_website.
+    _wants_site = bool(_SITE_INTENT.search(msg))
+    _nudged = False
+    _force_tool = None
+    for _ in range(10):  # research (2-3 search + 2 fetch) + write needs >5 (2026-11-07)
         body = {"model": _CHAT_LLM.model, "messages": messages,
                 "tools": _CHAT_TOOLS, "temperature": 0.3,
                 # Groq stays capped (replies are 1-2 sentences; without this
@@ -1550,14 +1749,21 @@ def _chat_run(msg: str, emit=None):
                 # At 256 the stream died mid-args (finish=length, empty
                 # args -> {} -> empty reply -> "didn't catch that" — the
                 # 2026-11-05 "write me anything" failure, reproduced live).
-                "max_tokens": 256 if _CHAT_LLM.provider == "groq" else 8000}
+                # (2026-11-07) Groq too: the 256 cap (free-tier OTPM era)
+                # starved write_website — its ~1.5k-token argument JSON +
+                # reasoning came back EMPTY -> "Done." and no site.
+                "max_tokens": 8000}
         # Groq Qwen3 thinking switch. "off" -> reasoning_effort:"none"
         # (no reasoning tokens, faster, cheaper). "on" -> omit the param
         # (Groq default = model reasons). Groq-only: other providers
         # (vLLM) don't accept this param.
-        if getattr(_CHAT_LLM, "thinking", "off") == "off" \
-                and _CHAT_LLM.provider == "groq":
-            body["reasoning_effort"] = "none"
+        # gpt-oss rejects "none" (HTTP 400: low|medium|high only) -> "low".
+        if _CHAT_LLM.provider == "groq":
+            _oss = "gpt-oss" in (_CHAT_LLM.model or "")
+            if getattr(_CHAT_LLM, "thinking", "off") == "off":
+                body["reasoning_effort"] = "low" if _oss else "none"
+            elif _oss:
+                body["reasoning_effort"] = "medium"
         # STREAMED: the CoT think row must show the reasoning as it
         # happens, not a blob that appears when the whole round finishes
         # (the non-streamed fetch only exposed it post-hoc). Verified
@@ -1565,11 +1771,31 @@ def _chat_run(msg: str, emit=None):
         # delta["reasoning"] (Groq-style APIs: delta["reasoning_content"]);
         # tool_calls arrive as per-chunk fragments (index + name on the
         # first, arguments in pieces) and are reassembled below.
+        if _force_tool:
+            body["tool_choice"] = {"type": "function",
+                                   "function": {"name": _force_tool}}
+            _force_tool = None
         t_llm = time.time()
         body["stream"] = True
-        r = _CHAT_LLM.post(
-            _CHAT_LLM.base_url + "/chat/completions", json=body, timeout=60)
-        r.raise_for_status()
+        # HPC FALLBACK (2026-11-07): Groq is primary; any failure to OPEN the
+        # stream (429/5xx/401/timeout/network) re-sends this round to the
+        # HPC vLLM. Not mid-stream: a stream that dies after tokens raises.
+        try:
+            r = _CHAT_LLM.post(
+                _CHAT_LLM.base_url + "/chat/completions", json=body,
+                timeout=(5, 60))
+            r.raise_for_status()
+        except Exception as _e:
+            _fb = _hpc_fallback_session()
+            if _fb is None or _fb.base_url == _CHAT_LLM.base_url:
+                raise
+            _cmdlog(f"LLM {_CHAT_LLM.provider} failed ({type(_e).__name__}) "
+                    f"-> HPC fallback", "err")
+            _b2 = dict(body, model=_fb.model, max_tokens=8000)
+            _b2.pop("reasoning_effort", None)
+            r = _fb.post(_fb.base_url + "/chat/completions", json=_b2,
+                         timeout=(10, 120))
+            r.raise_for_status()
         _think = ""
         _content = ""
         _tc = {}   # index -> {"id","name","args"}
@@ -1619,7 +1845,7 @@ def _chat_run(msg: str, emit=None):
                 # so pushing it here (same throttle) makes the bubble
                 # type out live instead of popping in whole.
                 with STATE["lock"]:
-                    STATE["me3"]["response"] = _clean[:400]
+                    STATE["me3"]["response"] = _clean[:4000]
                 if emit:
                     emit("reply", {"text": _clean})
             for _f in _d.get("tool_calls") or []:
@@ -1656,6 +1882,21 @@ def _chat_run(msg: str, emit=None):
             reply = (ch.get("content") or "").strip()
             # Drop Qwen's leading "\n\n" habit from the stored/spoken reply.
             reply = reply.lstrip("\n").strip()
+            if (_wants_site and not _nudged
+                    and not any(c["name"] == "write_website" for c in calls)):
+                _nudged = True
+                _force_tool = "write_website"
+                _cmdlog("guard: website claimed without write_website -> forcing the call", "err")
+                messages.append({"role": "assistant", "content": reply or "(no reply)"})
+                messages.append({"role": "user", "content": (
+                    "You have NOT called write_website — nothing was built and "
+                    "any link you gave is not real. Call write_website now, "
+                    "using what your research found (sections, stats, sources).")})
+                if emit:
+                    emit("reply", {"text": ""})   # drop the false claim from the bubble
+                with STATE["lock"]:
+                    STATE["me3"]["response"] = ""
+                continue
             break
         messages.append({
             "role": "assistant", "content": ch.get("content") or "",
@@ -1724,7 +1965,7 @@ def _chat_run(msg: str, emit=None):
         # on reload.
         if not (reply or "").strip():
             reply = "Done." if calls else "Sorry, I didn't catch that — try again?"
-        entry = {"role": "assistant", "content": reply[:400],
+        entry = {"role": "assistant", "content": reply[:4000],
                  # UI chip payload (dropped before the LLM prompt — Groq
                  # 400s on unknown message fields).
                  "tools": [{"seq": c["seq"], "name": c["name"],
@@ -1845,7 +2086,7 @@ class Handler(BaseHTTPRequestHandler):
                 STATE["last"] = obj
                 STATE["history"].appendleft(obj)
                 STATE["total"] += 1
-                if outcome == "gated":
+                if outcome in ("gated", "invalid"):   # not applied
                     STATE["mode"] = "reject"  # red RETRY card, decays in 8 s
                 else:
                     STATE["last_good"] = obj
@@ -1861,6 +2102,7 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(400, b"bad phase", "text/plain")
                 return
             _prev_tool = None
+            _log_tool = None  # set once per NEW tool call (logged after the lock)
             with STATE["lock"]:
                 m3 = STATE["me3"]
                 _prev_tool = m3.get("tool") or ""
@@ -1869,6 +2111,12 @@ class Handler(BaseHTTPRequestHandler):
                 # (not on m3.ts, which moves on EVERY push — a mid-turn ts bump
                 # made the poll mint a fresh bubble per re-push, and the
                 # heard-only boundary reset mid-stream did the same).
+                # Greeting (2026-11-07): the boot welcome has no utterance —
+                # clear the stale last-heard so it isn't paired with the
+                # previous session's last words (duplicated HEARD bubble).
+                if obj.get("greeting") and phase == "speaking":
+                    m3["heard"] = ""
+                    m3["turn"] = m3.get("turn", 0) + 1
                 _new_heard = (obj.get("heard") or m3["heard"])[:300]
                 # New-turn boundary = a 'listening' push with a fresh heard.
                 # NOT 'any push with a different heard' (2026-11-06): the
@@ -1881,8 +2129,27 @@ class Handler(BaseHTTPRequestHandler):
                 # swallowed it as a generic "bad json" 400, so the Pi's
                 # real voice turns were all 400ing while same-heard pushes
                 # short-circuited past the bug and worked. 2026-11-06.)
-                if (_new_heard and _new_heard != m3["heard"]
+                # new_turn (2026-11-07): the ASR pushes it once per transcript,
+                # so a REPEATED utterance ("hey" twice) also starts a turn —
+                # heard-text change alone can't see a repeat (the 2nd reply
+                # overwrote the 1st bubble). Two pushes carry each transcript
+                # (ASR + StatusIndicator); _turn_heard/_turn_ts dedupe them.
+                _now = time.time()
+                _same_recent = (_new_heard == m3.get("_turn_heard")
+                                and _now - m3.get("_turn_ts", 0) < 3.0)
+                _bump = False
+                if obj.get("new_turn") and _new_heard and not _same_recent:
+                    _bump = True
+                elif (_new_heard and _new_heard != m3["heard"]
+                        and _new_heard != m3.get("_turn_heard")
                         and phase in ("listening", "transcribing")):
+                    _bump = True
+                if _bump:
+                    m3["_turn_heard"] = _new_heard
+                    m3["_turn_ts"] = _now
+                    m3["heard_seq"] = m3.get("heard_seq", 0) + 1  # voice-only HEARD key
+                    m3["latency"] = None  # new turn: the old readout goes now, not mid-turn
+                    m3["_turn_tools"] = []  # this turn's tool calls (for history)
                     m3["turn"] = m3.get("turn", 0) + 1
                     # New turn: drop the PREVIOUS turn's tool result so the
                     # UI's seq-keyed path can't re-flip the old chip green
@@ -1913,7 +2180,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the key is actually PRESENT in the payload (via a sentinel).
                 _absent = object()
                 if obj.get("thinking", _absent) is not _absent:
-                    _nt = (obj.get("thinking") or "")[:300]
+                    _nt = (obj.get("thinking") or "")[:1500]  # same cap as the typed path (was 300)
                     m3["thinking"] = _nt
                     # CoT round tracking (see _VOICE_ROUND above): the agent
                     # (2026-11-06) pushes its OWN round number (cot_round,
@@ -1927,9 +2194,10 @@ class Handler(BaseHTTPRequestHandler):
                         if int(obj["cot_round"]) != m3.get("cot_round", 0):
                             m3["cot_round"] = int(obj["cot_round"])
                             _VOICE_ROUND["t0"] = time.time()
-                    elif _nt and not _VOICE_ROUND["prev"]:
-                        m3["cot_round"] = m3.get("cot_round", 0) + 1
-                        _VOICE_ROUND["t0"] = time.time()
+                    # (no fallback round-guessing any more, 2026-11-07: a push
+                    # without cot_round — e.g. StatusIndicator's — used to bump
+                    # the round when reasoning text reappeared after a clear,
+                    # which drew a duplicate think row in the CoT)
                     if _nt:
                         m3["cot"] = _nt
                     _VOICE_ROUND["prev"] = _nt
@@ -1939,13 +2207,43 @@ class Handler(BaseHTTPRequestHandler):
                 # the tool result ("Lights are on, boo." is both), so only an
                 # explicit field is unambiguous. This is what flips the voice
                 # chip green + settles the card.
+                # Progress update (2026-11-07): the agent spoke a short
+                # mid-turn line ("Searching the web for …"). Numbered so the
+                # UI draws each once, and kept in the turn's ordered step list
+                # (with the tool calls) so a refresh redraws it in place.
+                # Pre-tool text (agent 'preamble'): kept as an update step
+                # BEFORE the tool call it introduced (that call's entry has
+                # no result yet), so a refresh redraws it in order. No
+                # progress_seq bump: live, it is already a bubble.
+                if obj.get("preamble"):
+                    _tl = m3.setdefault("_turn_tools", [])
+                    _ix = len(_tl)
+                    if _tl and _tl[-1].get("kind") != "progress" and not _tl[-1].get("result"):
+                        _ix -= 1
+                    _tl.insert(_ix, {"kind": "progress", "text": str(obj["preamble"])[:400]})
+                if obj.get("progress"):
+                    m3["progress_seq"] = m3.get("progress_seq", 0) + 1
+                    m3["progress"] = str(obj["progress"])[:200]
+                    m3.setdefault("_turn_tools", []).append(
+                        {"kind": "progress", "text": m3["progress"],
+                         "pseq": m3["progress_seq"]})
                 if obj.get("tool_result", _absent) is not _absent:
-                    m3["tool_result"] = (obj.get("tool_result") or "")[:200]
-                    if m3["tool_result"]:
-                        m3["tool_ms"] = int((time.time() - _VOICE_ROUND.get("t0", time.time())) * 1000) \
-                            if _VOICE_ROUND.get("t0") else 0
+                    _nres = (obj.get("tool_result") or "")[:200]
+                    # tool_ms ONCE, on the result's first arrival, measured from
+                    # the tool call's START (2026-11-07). It used to be "now -
+                    # LLM round start", recomputed on EVERY push that carried
+                    # the result -> 11670 ms shown for a 61 ms tool.
+                    if _nres and _nres != m3.get("tool_result"):
+                        _t0 = m3.get("_tool_t0") or 0
+                        m3["tool_ms"] = int((time.time() - _t0) * 1000) if _t0 else 0
+                        # latest TOOL entry (progress items share the list)
+                        for _t in reversed(m3.get("_turn_tools") or []):
+                            if _t.get("kind") != "progress":
+                                _t.update(result=_nres, ms=m3["tool_ms"])
+                                break
+                    m3["tool_result"] = _nres
                 if obj.get("response", _absent) is not _absent:
-                    m3["response"] = (obj.get("response") or "")[:400]
+                    m3["response"] = (obj.get("response") or "")[:4000]
                 if obj.get("tool", _absent) is not _absent:
                     _ntool = (obj.get("tool") or "")[:120]
                     _nargs = (obj.get("tool_args") or "")[:400] \
@@ -1966,6 +2264,14 @@ class Handler(BaseHTTPRequestHandler):
                         m3["tool_seq"] = m3.get("tool_seq", 0) + 1
                         m3["tool_result"] = ""
                         m3["tool_ms"] = 0
+                        m3["_tool_t0"] = time.time()
+                        # Voice turns keep their tool calls (2026-11-07) so the
+                        # history entry carries chips like typed turns do — a
+                        # refresh used to draw the chip BELOW the reply.
+                        m3.setdefault("_turn_tools", []).append(
+                            {"seq": m3["tool_seq"], "name": _ntool,
+                             "args": _nargs, "result": "", "ms": 0})
+                        _log_tool = f"{_ntool} · {_nargs}" if _nargs else _ntool
                     m3["tool"] = _ntool
                     if _ntool:
                         m3["tool_args"] = _nargs
@@ -1981,7 +2287,10 @@ class Handler(BaseHTTPRequestHandler):
                     if not obj.get("tool"):
                         m3["tool_result"] = ""
                         m3["tool_ms"] = 0
-                        m3["latency"] = None  # stale readout must not leak
+                        # (latency is NOT cleared here any more: every agent
+                        # status push carries tool="", so this wiped the voice
+                        # readout ~2.5 s after each turn. It resets at the
+                        # new-turn boundary above instead.)
                 # latency: the voice agent (Pi) can push per-leg timings
                 # {"asr","llm","tool","tts","total"} — merged in when present
                 # (heartbeat omits it). Today's agent doesn't send it, so
@@ -2004,7 +2313,8 @@ class Handler(BaseHTTPRequestHandler):
                 v = obj.get("voice")
                 if isinstance(v, dict) and v.get("model"):
                     m3["voice"] = {"provider": str(v.get("provider", "llm")),
-                                   "model": str(v.get("model", "llm"))}
+                                   "model": str(v.get("model", "llm")),
+                                   "gate": bool(v.get("gate", True))}
                 # active = agent alive (any push, incl. the 2s heartbeat) OR a
                 # non-idle phase. A heartbeat omits 'active', so treat its
                 # presence (last_hb set below) as "alive".
@@ -2022,15 +2332,32 @@ class Handler(BaseHTTPRequestHandler):
             # agent's [me3push] "Remote end closed connection" spam, voice
             # turns never appended to chat history, and no command-log lines
             # for voice activity. Now: default empty + log only real tools.
-            _tool = str(obj.get("tool") or "")
-            if _tool:
-                _cls = ("boots" if _tool.startswith("boots_")
-                        else "spotify" if _tool.startswith("spotify_") else "web")
-                _cmdlog(_tool[:120], _cls)
+            # ONE log line per tool CALL (2026-11-07): this used to log on every
+            # push that carried the tool name -> 11 identical lines per call.
+            if _log_tool:
+                _cls = ("boots" if _log_tool.startswith("boots_")
+                        else "spotify" if _log_tool.startswith("spotify_") else "web")
+                _cmdlog(_log_tool[:120], _cls)
             _lp = _VOICE_LAST["phase"]
             _VOICE_LAST["phase"] = phase
-            if _lp == "speaking" and phase != "speaking" \
-                    and m3.get("response"):
+            # final (2026-11-07): the agent flags the LLM round that produced
+            # SPOKEN text — append that, so a tool turn's placeholder phrase
+            # ("Playing music…") never becomes its own history turn. The
+            # speaking->listening append below stays as a backstop (greeting,
+            # older agents); _append_turn dedupes the repeat.
+            if obj.get("final") and m3.get("response"):
+                _append_turn(m3.get("heard") or "", m3.get("response") or "",
+                             tools=list(m3.get("_turn_tools") or []))
+            # Backstop append on speaking->non-speaking: GREETING ONLY now
+            # (2026-11-07). Every real reply is flagged 'final' by the agent;
+            # with spoken progress updates the phase also leaves 'speaking'
+            # MID-turn, and this used to store pre-tool text ("Let me look
+            # that up.") as its own turn -> duplicate HEARD after a refresh.
+            # The greeting's closing push (greeting flag, phase leaves
+            # 'speaking') stores it DIRECTLY — not via the transition: the
+            # agent's 2 s heartbeat pushes 'listening' mid-greeting, so the
+            # speaking->X transition had already passed without the flag.
+            if obj.get("greeting") and phase != "speaking" and m3.get("response"):
                 _append_turn(m3.get("heard") or "", m3.get("response") or "")
                 _cmdlog(f"voice reply · {m3.get('heard', '')[:40]}", "reply")
             self._send(200, b"ok", "text/plain")
@@ -2043,6 +2370,26 @@ class Handler(BaseHTTPRequestHandler):
             with STATE["lock"]:
                 STATE["me3"]["mic_level"] = lvl
                 STATE["me3"]["last_hb"] = time.time()  # mic activity => alive
+            self._send(200, b"ok", "text/plain")
+        elif self.path == "/weather":
+            # check_weather tool result (web_tools posts it, 2026-11-07): the
+            # WEATHER card shows the place actually asked about, not only the
+            # home fetch. Body: {"place","temp","condition","code"}.
+            try:
+                # half-up (round() is banker's: 14.5 -> 14 while Boots said 14.5)
+                import math as _math
+                temp = int(_math.floor(float(obj.get("temp")) + 0.5))
+            except (TypeError, ValueError):
+                self._send(400, b"bad temp", "text/plain")
+                return
+            code = obj.get("code")
+            icon, cond = WMO.get(int(code), ("⛅", "")) if isinstance(code, (int, float)) else ("⛅", "")
+            with STATE["lock"]:
+                STATE["weather_asked"] = {
+                    "icon": icon, "temp": temp,
+                    "condition": str(obj.get("condition") or cond)[:40],
+                    "place": str(obj.get("place") or "")[:60],
+                    "ts": time.time()}
             self._send(200, b"ok", "text/plain")
         elif self.path == "/location":
             # Browser-shared GPS (the dashboard's "use my location" pin). The
@@ -2137,9 +2484,15 @@ class Handler(BaseHTTPRequestHandler):
             if obj.get("thinking") in ("on", "off"):
                 cfg["thinking"] = obj["thinking"]
             _apply_llm_cfg(cfg)
+            # Never persist a PRESET's key into llm.json (it lives in
+            # /etc/me3/groq.env; agent.py + _llm_cfg fall back to env when
+            # the saved key is empty). Custom endpoints keep theirs.
+            _saved = dict(cfg)
+            if prov in _LLM_PRESETS:
+                _saved["api_key"] = ""
             try:
                 with open(_LLM_CFG_PATH, "w", encoding="utf-8") as f:
-                    json.dump(cfg, f)
+                    json.dump(_saved, f)
             except Exception:
                 pass  # switch still applies for this process
             self._send(200, json.dumps({"ok": True, "provider":
@@ -2191,7 +2544,7 @@ class Handler(BaseHTTPRequestHandler):
                     with STATE["lock"]:
                         m3 = STATE["me3"]
                         m3["phase"] = "idle"
-                        m3["response"] = (reply or "")[:400]
+                        m3["response"] = (reply or "")[:4000]
                         if calls:
                             m3["tool"] = calls[-1]["name"][:120]
                             m3["tool_args"] = (
@@ -2315,7 +2668,7 @@ class Handler(BaseHTTPRequestHandler):
                 # the UI on that phase (only the voice agent pushes the
                 # done-speaking transition on the Pi), so rest on "idle".
                 m3["phase"] = "idle"
-                m3["response"] = (reply or "")[:400]
+                m3["response"] = (reply or "")[:4000]
                 if calls:
                     # The per-call loop already pushed this state (with
                     # tool_seq); re-assert it so a poll racing the loop
