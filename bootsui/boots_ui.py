@@ -2166,7 +2166,7 @@ class Handler(BaseHTTPRequestHandler):
             # {"phase","heard","thinking","response","tool","active"}
             phase = obj.get("phase")
             if phase not in ("idle", "listening", "transcribing", "thinking",
-                             "tool", "speaking"):
+                             "tool", "speaking", "nomic"):   # nomic: waiting for the EMEET (2026-11-07)
                 self._send(400, b"bad phase", "text/plain")
                 return
             _prev_tool = None

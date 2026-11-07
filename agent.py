@@ -190,10 +190,51 @@ def _find_mic_index():
 # Benchmark mode (fd-benchmark direct feed): no audio device is used, so the
 # EMEET check is skipped (the live agent must not hold it anyway).
 BENCH_MODE = os.environ.get("ME3_BENCH", "0") == "1"
+# EMEET hot-plug (2026-11-07). Without the speakerphone the agent used to exit
+# (status 2) and systemd restart-looped it every 8 s. Now it WAITS: the voice
+# panel shows "no mic" (typed chat runs in me2-ui regardless), and voice starts
+# within ~2 s of plugging the EMEET in. A watchdog in main() exits cleanly when
+# it is unplugged, so systemd restarts it straight back into this wait.
+_EMEET_KEYS = ("emeet", "m1a", "officecore")
+
+
+def _emeet_present() -> bool:
+    try:
+        with open("/proc/asound/cards") as f:
+            txt = f.read().lower()
+    except OSError:
+        return True            # not Linux (laptop dev): don't block on ALSA
+    return any(k in txt for k in _EMEET_KEYS)
+
+
+def _push_nomic():
+    try:
+        import json as _j, urllib.request as _u
+        req = _u.Request(os.environ.get("ME3_BOOTSUI", "http://127.0.0.1:8330") + "/me3",
+                         data=_j.dumps({"hb": True, "active": True, "phase": "nomic"}).encode(),
+                         headers={"Content-Type": "application/json"}, method="POST")
+        _u.urlopen(req, timeout=1.0).read()
+    except Exception:
+        pass
+
+
+def _wait_for_emeet():
+    if _emeet_present():
+        return
+    logger.warning("Voice offline: plug in the EMEET speakerphone (typed chat still works). Waiting...")
+    while not _emeet_present():
+        _push_nomic()
+        time.sleep(2)
+    logger.info("EMEET plugged in: starting the voice path")
+    time.sleep(2)              # let ALSA/PortAudio finish enumerating the card
+
+
+if not BENCH_MODE:
+    _wait_for_emeet()
 MIC_DEV = None if BENCH_MODE else _find_mic_index()
 if MIC_DEV is None and not BENCH_MODE:
-    logger.error("NO MICROPHONE FOUND (no input devices). Plug in the EMEET M1A and re-run.")
-    raise SystemExit(2)
+    logger.error("EMEET listed by ALSA but PortAudio has no input for it yet; retrying shortly.")
+    raise SystemExit(3)        # systemd restarts us (RestartSec) into the wait above
 SPK_DEV = None if BENCH_MODE else int(os.environ.get("ME3_SPK_DEV", MIC_DEV))  # EMEET is mic+speaker
 if SPK_DEV == 0 and MIC_DEV != 0:
     SPK_DEV = MIC_DEV  # never fall back to the dead jack when the EMEET is present
@@ -2194,7 +2235,26 @@ async def run_bot():
     pa.terminate()
 
 
+def _emeet_watchdog():
+    """Exit cleanly if the EMEET is unplugged while voice runs: the audio
+    streams die with it, and systemd restarts us into _wait_for_emeet()."""
+    import threading as _t
+
+    def _loop():
+        gone = 0
+        while True:
+            time.sleep(2)
+            gone = gone + 1 if not _emeet_present() else 0
+            if gone >= 2:
+                logger.warning("EMEET unplugged: voice going offline (typed chat still works)")
+                _push_nomic()
+                os._exit(3)
+    _t.Thread(target=_loop, daemon=True, name="emeet-watchdog").start()
+
+
 async def main():
+    if not BENCH_MODE:
+        _emeet_watchdog()
     logger.info("starting local audio (mic #%s -> speaker #%s)", MIC_DEV, SPK_DEV)
     await run_bot()
 

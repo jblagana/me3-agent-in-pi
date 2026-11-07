@@ -896,7 +896,9 @@ const PHASE_MAP = {
   listening:{st:'listening…',mode:'listen',sub:'vad · mic open'},
   thinking:{st:'thinking…',mode:'think',sub:'llm'},
   tool:{st:'running tool…',mode:'think',sub:'mcp-bridge'},
-  speaking:{st:'speaking…',mode:'talk',sub:'tts · mic muted (no AEC)'}
+  speaking:{st:'speaking…',mode:'talk',sub:'tts · mic muted (no AEC)'},
+  // (2026-11-07) voice agent waiting for the speakerphone; typed chat works
+  nomic:{st:'no mic',mode:'idle',sub:'plug in the EMEET speakerphone · typed chat works'}
 };
 const TOOL_TO_CHIP = {
   // Names MUST match the tool specs in me2_tools.py / spotify_tools.py /
