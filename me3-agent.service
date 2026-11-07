@@ -22,6 +22,11 @@ Environment=ME3_NOISE_FLOOR_RMS=0.006
 # Set to 1 to restore the old "mute mic during TTS" behaviour (no code change),
 # then: sudo systemctl daemon-reload && sudo systemctl restart me3-agent
 Environment=ME3_GATE_MIC=0
+# 2026-11-07: Deepgram Nova-3 streaming ASR. Voice stays edge-tts Roger: Deepgram's
+# Aura voice (ME3_TTS=deepgram) streamed slower than real time from this network
+# (choppy), while Microsoft's nearby servers keep up.
+Environment=ME3_STT=deepgram
+Environment=ME3_SMART_TURN=0
 Type=simple
 User=jan
 WorkingDirectory=/home/jan/me3

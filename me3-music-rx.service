@@ -1,0 +1,23 @@
+[Unit]
+# Laptop -> Boots speaker music path (2026-11-07). Spotify plays in the
+# official app on the laptop (librespot can't decrypt this account's tracks);
+# tools/laptop_audio_sender.py streams the laptop's audio here, and this
+# receiver feeds the agent's music mixer FIFO (EMEET, ducked while Boots talks).
+Description=Boots music receiver (laptop audio -> FIFO -> agent mixer)
+After=network-online.target
+Wants=network-online.target
+Before=me3-agent.service
+
+[Service]
+Type=simple
+User=jan
+RuntimeDirectory=me3-spotify
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+ExecStartPre=/bin/sh -c '[ -p /run/me3-spotify/spotify.pcm ] || mkfifo -m 0660 /run/me3-spotify/spotify.pcm'
+ExecStart=/home/jan/me3/.venv/bin/python /home/jan/me3/tools/music_receiver.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

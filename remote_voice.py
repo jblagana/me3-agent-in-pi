@@ -283,6 +283,12 @@ class Qwen2AudioSTTService(SegmentedSTTService):
     async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
         if direction == FrameDirection.DOWNSTREAM and isinstance(
                 frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+            if isinstance(frame, TranscriptionFrame):
+                # (2026-11-07) SegmentedSTTService.push_frame marks every segment
+                # transcript finalized; this bypass skipped that, so Pipecat's
+                # turn-stop strategy waited out its 1.0 s STT safety timer
+                # (~0.3 s of dead air once early transcription made ASR fast).
+                frame.finalized = True
             try:
                 # Walk the processor chain: self -> status -> user_aggregator.
                 nxt = getattr(self, "_next", None)

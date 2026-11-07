@@ -695,7 +695,12 @@ class StatusIndicator(FrameProcessor):
             try:
                 import remote_voice as _rvw
                 _rvw.prewarm_asr()
-                _rvw.prewarm_tts()     # and the edge-tts socket (2026-11-07)
+                # and the socket of the voice actually in use (2026-11-07)
+                if os.environ.get("ME3_TTS", "").lower() == "deepgram":
+                    import deepgram_voice as _dgv
+                    _dgv.prewarm_tts()
+                else:
+                    _rvw.prewarm_tts()
             except Exception:
                 pass
             if self._bot_talking and (_RECENT_TEXT.get("reply") or "").strip():
@@ -1907,7 +1912,8 @@ class _SpotifyPipe:
                 if not os.path.exists(self.path):
                     time.sleep(2)
                     continue
-                rs = soxr.ResampleStream(44100, 48000, 1, dtype="int16")
+                rs = (soxr.ResampleStream(MUSIC_IN_SR, 48000, 1, dtype="int16")
+                      if MUSIC_IN_SR != 48000 else None)
                 with open(self.path, "rb", buffering=0) as f:   # blocks until librespot opens it
                     while True:
                         with self.lock:
@@ -1915,12 +1921,12 @@ class _SpotifyPipe:
                         if full:
                             time.sleep(0.01)
                             continue
-                        chunk = f.read(4 * 882)                 # ~20 ms of stereo s16
+                        chunk = f.read(4 * (MUSIC_IN_SR // 50))  # ~20 ms of stereo s16
                         if not chunk:
                             break                               # writer closed: reopen
                         st = _np.frombuffer(chunk[:len(chunk) // 4 * 4], dtype=_np.int16).reshape(-1, 2)
                         mono = st.astype(_np.int32).mean(axis=1).astype(_np.int16)
-                        out = rs.resample_chunk(mono)
+                        out = rs.resample_chunk(mono) if rs is not None else mono
                         with self.lock:
                             self.buf += out.tobytes()
             except Exception as e:
@@ -1971,6 +1977,9 @@ class _MusicOutputTransport(LocalAudioOutputTransport):
 
 
 SPOTIFY_FIFO = os.environ.get("ME3_SPOTIFY_FIFO", "/run/me3-spotify/spotify.pcm")
+# Music input rate (2026-11-07): 48000 for the laptop audio sender
+# (tools/laptop_audio_sender.py), 44100 for librespot.
+MUSIC_IN_SR = int(os.environ.get("ME3_MUSIC_IN_SR", "48000"))
 
 
 async def build_bot(transport=None):
@@ -1990,7 +1999,13 @@ async def build_bot(transport=None):
     # neural legs to the DGX3 GPUs via the SHARC UP VPN; local is the
     # offline fallback. VAD stays local either way.
     _voice = os.environ.get("ME3_VOICE", "remote")
-    if _voice == "remote":
+    # Deepgram switches (2026-11-07): ME3_STT=deepgram / ME3_TTS=deepgram.
+    _use_dg_stt = os.environ.get("ME3_STT", "").lower() == "deepgram" and os.environ.get("DEEPGRAM_API_KEY")
+    _use_dg_tts = os.environ.get("ME3_TTS", "").lower() == "deepgram" and os.environ.get("DEEPGRAM_API_KEY")
+    if _voice == "remote" and _use_dg_stt:
+        import deepgram_voice as _dgv
+        stt = _dgv.make_stt()
+    elif _voice == "remote":
         stt = Qwen2AudioSTTService()
     else:
         stt = WhisperCPPSTTService()
@@ -2017,7 +2032,10 @@ async def build_bot(transport=None):
     # on_after_push_frame fires for every LLMTextFrame it streams, so the UI
     # reply bubble can stream live tokens without disturbing the TTS flow.
     _install_reply_tap(llm)
-    if _voice == "remote":
+    if _voice == "remote" and _use_dg_tts:
+        import deepgram_voice as _dgv
+        tts = _dgv.DeepgramBootsTTS()  # Aura-2 voice, edge-tts Roger fallback
+    elif _voice == "remote":
         tts = BootsTTSService()  # edge-tts (Roger) primary, qwen3 fallback
     else:
         tts = PiperLocalTTSService()
@@ -2062,9 +2080,24 @@ async def build_bot(transport=None):
 
     await _MCP.start()
     context = LLMContext(tools=_function_schemas())
+    # Turn end (2026-11-07): Pipecat 1.12's default runs the Smart Turn model
+    # on the Pi CPU after every utterance -- measured ~0.55 s of dead air per
+    # turn once ASR got fast. ME3_SMART_TURN=0 (default) ends the turn on the
+    # VAD's own 0.6 s silence + a transcript; =1 restores Smart Turn (better
+    # at not cutting in on long mid-thought pauses, slower).
+    _turn_kw = {}
+    if os.environ.get("ME3_SMART_TURN", "0") != "1":
+        from pipecat.turns.user_turn_strategies import UserTurnStrategies
+        from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
+            SpeechTimeoutUserTurnStopStrategy)
+        _turn_kw["user_turn_strategies"] = UserTurnStrategies(
+            stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.0)])
+        logger.info("[me3] turn end: VAD silence + transcript (Smart Turn off)")
+    else:
+        logger.info("[me3] turn end: Smart Turn v3 model")
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context, user_params=LLMUserAggregatorParams(vad_analyzer=vad,
-                                                     empty_user_turn=None))
+                                                     empty_user_turn=None, **_turn_kw))
 
     if bench:
         in_transport, out_transport = transport.input(), transport.output()
