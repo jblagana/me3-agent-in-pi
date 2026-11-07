@@ -378,7 +378,7 @@ PROGRESS_MIN_GAP_S = float(os.environ.get("ME3_PROGRESS_GAP_S", "15"))
 PROGRESS_IDLE_S = float(os.environ.get("ME3_PROGRESS_IDLE_S", "15"))
 PROGRESS_MAX = int(os.environ.get("ME3_PROGRESS_MAX", "1"))
 _SLOW_TOOLS = {"web_search", "fetch_url", "write_website", "spotify_play_search",
-               "search_files", "run_command"}
+               "search_files", "run_command", "build_app", "run_python", "publish_website"}
 _PROGRESS = {"tts": None, "last": 0.0, "count": 0, "turn": None}
 
 
@@ -400,6 +400,12 @@ def _progress_text(name, args):
             return "Reading the page."
     if name == "write_website":
         return "Writing the website now, this takes a few seconds."
+    if name == "build_app":
+        return "Building the app now and testing it."
+    if name == "run_python":
+        return "Running that now."
+    if name == "publish_website":
+        return "Publishing it to your GitHub page."
     if name == "spotify_play_search":
         return "Looking that up on Spotify."
     if name == "search_files":
@@ -497,6 +503,9 @@ _TOOL_PHRASE = {
     "web_search": "Searching the web",
     "fetch_url": "Opening a page",
     "write_website": "Building a website",
+    "build_app": "Building an app",
+    "run_python": "Running Python",
+    "publish_website": "Publishing to GitHub",
 }
 
 

@@ -1816,7 +1816,7 @@ def _chat_run(msg: str, emit=None):
                 # (2026-11-07) Groq too: the 256 cap (free-tier OTPM era)
                 # starved write_website — its ~1.5k-token argument JSON +
                 # reasoning came back EMPTY -> "Done." and no site.
-                "max_tokens": 8000}
+                "max_tokens": 16000}
         # Groq Qwen3 thinking switch. "off" -> reasoning_effort:"none"
         # (no reasoning tokens, faster, cheaper). "on" -> omit the param
         # (Groq default = model reasons). Groq-only: other providers
@@ -1855,7 +1855,7 @@ def _chat_run(msg: str, emit=None):
                 raise
             _cmdlog(f"LLM {_CHAT_LLM.provider} failed ({type(_e).__name__}) "
                     f"-> HPC fallback", "err")
-            _b2 = dict(body, model=_fb.model, max_tokens=8000)
+            _b2 = dict(body, model=_fb.model, max_tokens=16000)
             _b2.pop("reasoning_effort", None)
             r = _fb.post(_fb.base_url + "/chat/completions", json=_b2,
                          timeout=(10, 120))
@@ -1995,7 +1995,7 @@ def _chat_run(msg: str, emit=None):
             elif name in ("list_dir", "read_file", "write_file",
                           "edit_file", "search_files"):
                 res = _ft_dispatch(name, args)
-            elif name == "run_command":
+            elif name in ("run_command", "run_python"):
                 res = _sh_dispatch(name, args)
             else:
                 res = _web_dispatch(name, args)

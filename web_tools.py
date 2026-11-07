@@ -424,6 +424,7 @@ def _check_weather(location: str = "") -> str:
 # without a place = U.P. Diliman; a required `location` made the model
 # ask "where?" instead of just calling (2026-11-07).
 OPTIONAL_PARAMS = {"check_weather": {"location"}, "write_website": {"hero_image", "publish"},
+                   "build_app": {"publish"},
                    "publish_website": {"name"}}
 
 TOOL_SPECS = [
@@ -443,6 +444,18 @@ TOOL_SPECS = [
      "Open a specific web page (a URL the user gives you) and read its text. "
      "Use when the user says 'open', 'read', or 'look at' a particular webpage.",
      {"url": {"type": "string"}}),
+    ("build_app",
+     "Make a small interactive app for the user (calculator, converter, timer, "
+     "quiz, to-do list, simple game, drawing pad...). YOU write it as ONE "
+     "complete, self-contained HTML file: inline <style> and <script>, plain "
+     "JavaScript, no build step, no external files (a library only from "
+     "cdnjs.cloudflare.com if truly needed), works on a phone, real working "
+     "logic (no placeholders). The tool saves it, opens it in a headless "
+     "browser to catch JavaScript errors, publishes it to the user's GitHub "
+     "Pages (publish=false keeps it local) and returns the link. If it reports "
+     "JS errors, fix the code and call again once.",
+     {"name": {"type": "string"}, "html": {"type": "string"},
+      "publish": {"type": "boolean"}}),
     ("publish_website",
      "Publish a website you already built to the user's public GitHub Pages "
      "site. Use when the user asks to publish / put live / share online a site. "
@@ -512,6 +525,11 @@ def dispatch(tool: str, **kw) -> str:
             return _web_search(kw.get("query", ""))
         if tool == "fetch_url":
             return _fetch_url(kw.get("url", ""))
+        if tool == "build_app":
+            pub = kw.get("publish")
+            return _build_app(kw.get("name", ""), kw.get("html", ""),
+                              os.environ.get("WEBSITE_PUBLISH_DEFAULT", "1") != "0"
+                              if pub is None else bool(pub))
         if tool == "publish_website":
             return _publish_existing(kw.get("name", ""))
         if tool == "write_website":
@@ -1077,6 +1095,42 @@ def _gh_publish(slug: str, html: str) -> str:
         return "Publishing to GitHub took too long, so I stopped. It's still live on the LAN."
     except Exception as e:
         return f"Publishing to GitHub failed ({e!r}). It's still live on the LAN."
+
+def _build_app(name: str, html: str, publish: bool = True) -> str:
+    """Save an LLM-written single-file app, verify it renders without JS
+    errors (headless Chromium), and publish it like a website (2026-11-07)."""
+    name = (name or "").strip() or "app"
+    html = (html or "").strip()
+    if len(html) < 80 or "<" not in html:
+        return "The app code was empty. Write the full HTML file and call build_app again."
+    if len(html) > 400_000:
+        return "That app is too large (400 KB max). Make it simpler."
+    if "<html" not in html.lower():
+        html = ('<!DOCTYPE html>\n<html lang="en"><head><meta charset="utf-8">'
+                '<meta name="viewport" content="width=device-width, initial-scale=1">'
+                f"<title>{_esc(name)}</title></head><body>\n{html}\n</body></html>")
+    elif "<title>" not in html.lower():
+        html = html.replace("<head>", f"<head><title>{_esc(name)}</title>", 1)
+    slug = "app-" + _slugify(name) + "-" + str(int(_time.time() * 1000) % 100000)
+    os.makedirs(SITES_DIR, exist_ok=True)
+    try:
+        with open(os.path.join(SITES_DIR, slug + ".html"), "w", encoding="utf-8") as f:
+            f.write(html)
+    except Exception as e:
+        return f"I couldn't save the app ({e!r})."
+    url = f"http://{_site_host()}:{_SITE_PORT}/site/{slug}.html"
+    verify = _verify_site(f"http://127.0.0.1:{_SITE_PORT}/site/{slug}.html", html)
+    if "JS errors" in verify:
+        return (f"The app has JavaScript errors, so I didn't publish it: {verify}. "
+                f"Fix the code and call build_app again. (Local copy: {url})")
+    msg = f"Built the app '{name}'. "
+    if publish:
+        pub = _gh_publish(slug, html)
+        if pub.startswith("Published"):
+            return msg + pub + f" (Also on the local network at {url}; {verify}.)"
+        msg += pub + " "
+    return msg + f"Open it on the local network at {url} ({verify})."
+
 
 def _publish_existing(name: str = "") -> str:
     """Publish an already-built site (newest, or best match on `name`)."""
