@@ -217,8 +217,15 @@ def _auth_error(res) -> bool:
     masked as 'no results' / 'paused' / 'nothing playing'."""
 
     err = res.get("error") if isinstance(res, dict) else None
-
-    return isinstance(err, dict) and err.get("status") in (401, 403)
+    if not isinstance(err, dict):
+        return False
+    if err.get("status") == 401:
+        return True
+    # (2026-11-07) Spotify also answers 403 "Player command failed: Restriction
+    # violated" when there is simply nothing to pause/skip -- that was being
+    # reported as "auth expired". Only token/scope 403s are auth problems.
+    msg = (err.get("message") or "").lower()
+    return err.get("status") == 403 and any(w in msg for w in ("token", "scope", "insufficient", "permission"))
 
 # ---- tool specs (name, description, param dict) ----
 
@@ -373,7 +380,8 @@ def _choose(query, kind, res):
 
     if scored and scored[0][0] >= PLAY_SURE:
         s, t = scored[0]
-        return {"action": "play", "type": "track", "uri": t["uri"], "name": t["name"], "artist": art(t)}
+        return {"action": "play", "type": "track", "uri": t["uri"], "name": t["name"], "artist": art(t),
+                "album": (t.get("album") or {}).get("uri")}
     if kind == "playlist" or (not scored and lists):
         if lists:
             p = lists[0]
@@ -384,7 +392,60 @@ def _choose(query, kind, res):
     return {"action": "none"}
 
 
+def _state():
+    """Spotify player now: {active, playing, id, name, artist, device} (2026-11-07)."""
+    r = _api("GET", "/me/player")
+    if not isinstance(r, dict) or not r or "error" in r:
+        return {"active": False, "playing": False, "id": None, "name": None, "artist": "", "device": None}
+    it = r.get("item") or {}
+    return {"active": True, "playing": bool(r.get("is_playing")), "id": it.get("id"),
+            "name": it.get("name"), "artist": (it.get("artists") or [{}])[0].get("name", ""),
+            "device": (r.get("device") or {}).get("name")}
+
+
+def _wait(pred, timeout=3.5):
+    """Poll the player until pred(state) holds; return (last state, verdict).
+    Every confirmation is checked against Spotify itself: the API accepts a
+    command (204) even when the target app never acts on it."""
+    t_end = time.time() + timeout
+    st = _state()
+    while not pred(st) and time.time() < t_end:
+        time.sleep(0.5)
+        st = _state()
+    return st, bool(pred(st))
+
+
+def _device_name(dev_id):
+    try:
+        for d in _api("GET", "/me/player/devices").get("devices", []):
+            if d.get("id") == dev_id:
+                return d.get("name")
+    except Exception:
+        pass
+    return SPOTIFY_DEVICE_NAME
+
+
+def _kick_card():
+    """Ask the Boots dashboard to refresh its music card now (fire and forget)."""
+    import threading, urllib.request
+    def _go():
+        try:
+            base = os.environ.get("ME3_BOOTSUI", "http://127.0.0.1:8330")
+            urllib.request.urlopen(urllib.request.Request(base + "/spotify_kick", data=b"{}",
+                                                          method="POST"), timeout=1).read()
+        except Exception:
+            pass
+    threading.Thread(target=_go, daemon=True).start()
+
+
 def dispatch(tool: str, **kw) -> str:
+    out = _dispatch(tool, **kw)
+    if tool != "spotify_search":
+        _kick_card()
+    return out
+
+
+def _dispatch(tool: str, **kw) -> str:
 
     """Execute a Spotify tool and return a short human-readable string."""
 
@@ -417,8 +478,17 @@ def dispatch(tool: str, **kw) -> str:
         # (artist/playlist) in the body and device_id as a QUERY parameter. The old
         # {"uri": ...} body was ignored -> Spotify just RESUMED whatever was playing.
         dev = _pick_device()
-        play_body = ({"uris": [pick["uri"]], "position_ms": 0} if pick["type"] == "track"
-                     else {"context_uri": pick["uri"]})
+        st_before = _state() if pick["type"] != "track" else {"id": None}
+        # (2026-11-07) a TRACK is started inside its album (context + offset):
+        # the laptop's Spotify app silently ignores bare {"uris": [...]} plays
+        # (tested: 0/2) but starts album+offset every time (2/2); the album then
+        # simply continues after the song.
+        if pick["type"] == "track" and pick.get("album"):
+            play_body = {"context_uri": pick["album"], "offset": {"uri": pick["uri"]}, "position_ms": 0}
+        elif pick["type"] == "track":
+            play_body = {"uris": [pick["uri"]], "position_ms": 0}
+        else:
+            play_body = {"context_uri": pick["uri"]}
         play = _api("PUT", "/me/player/play" + (f"?device_id={dev}" if dev else ""), play_body)
         if pick["type"] == "artist":
             name, artist = f"songs by {name}", ""
@@ -443,48 +513,66 @@ def dispatch(tool: str, **kw) -> str:
 
             return f"I found '{name}' by {artist} but couldn't start playback: {play.get('error', {}).get('message', reason)}."
 
+        # (2026-11-07) verify: the API answers OK even when the app ignores it
+        # (seen live: "Playing Glimpse of Us" while the laptop played nothing).
+        want_id = pick["uri"].rsplit(":", 1)[-1] if pick["type"] == "track" else None
+        # artist/playlist: wait until the song actually CHANGES, or the reply
+        # names the previous track ("starting with <old song>")
+        started = (lambda st: st["playing"] and (st["id"] == want_id if want_id
+                                                 else (st["id"] and st["id"] != st_before["id"])))
+        st, ok = _wait(started)
+        if not ok and dev:
+            _api("PUT", "/me/player", {"device_ids": [dev], "play": False})     # wake/transfer, retry once
+            time.sleep(0.7)
+            _api("PUT", "/me/player/play?device_id=" + dev, play_body)
+            st, ok = _wait(started)
+        if not ok:
+            where = _device_name(dev) if dev else "your Spotify app"
+            return (f"I asked Spotify on {where} to play {name}, but it didn't start. "
+                    f"Open the Spotify app there and press play once, then ask me again.")
+        if pick["type"] != "track" and st.get("name"):
+            return f"Playing {name}, starting with {st['name']}" + (f" by {st['artist']}." if st["artist"] else ".")
         return f"Playing {name}" + (f" by {artist}." if artist else ".")
 
     elif tool == "spotify_pause":
-
+        st0 = _state()
+        if not st0["playing"]:
+            return "Spotify isn't playing anything right now."
         res = _api("PUT", "/me/player/pause")
-
         if _auth_error(res):
-
             return AUTH_MSG
-
-        return "Paused."
+        st, ok = _wait(lambda st: not st["playing"])
+        return "Paused." if ok else "I asked Spotify to pause, but it's still playing."
 
     elif tool == "spotify_resume":
-
+        st0 = _state()
+        if st0["playing"]:
+            return f"Spotify is already playing {st0['name'] or 'music'}."
         dev = _pick_device()
         res = _api("PUT", "/me/player/play" + (f"?device_id={dev}" if dev else ""))
-
         if _auth_error(res):
-
             return AUTH_MSG
+        st, ok = _wait(lambda st: st["playing"])
+        if ok:
+            return f"Resuming {st['name']}." if st["name"] else "Resuming."
+        return ("Spotify didn't resume. There may be nothing to resume, or the Spotify app "
+                "needs a press of play first. Tell me a song and I'll start it.")
 
-        return "Resuming."
-
-    elif tool == "spotify_next":
-
-        res = _api("POST", "/me/player/next")
-
+    elif tool in ("spotify_next", "spotify_previous"):
+        st0 = _state()
+        if not st0["active"] or not st0["id"]:
+            return "Nothing is playing on Spotify, so there's nothing to skip."
+        nxt = tool == "spotify_next"
+        res = _api("POST", "/me/player/next" if nxt else "/me/player/previous")
         if _auth_error(res):
-
             return AUTH_MSG
-
-        return "Skipped to the next track."
-
-    elif tool == "spotify_previous":
-
-        res = _api("POST", "/me/player/previous")
-
-        if _auth_error(res):
-
-            return AUTH_MSG
-
-        return "Went back to the previous track."
+        st, ok = _wait(lambda st: st["id"] and st["id"] != st0["id"], timeout=3.0)
+        if ok:
+            what = st["name"] + (f" by {st['artist']}" if st["artist"] else "")
+            return (f"Skipped to {what}." if nxt else f"Went back to {what}.")
+        if not nxt:
+            return f"Back to the start of {st0['name']}."     # 'previous' restarts a song mid-way
+        return "I asked Spotify to skip, but the song didn't change."
 
     elif tool == "spotify_now_playing":
 
@@ -508,6 +596,8 @@ def dispatch(tool: str, **kw) -> str:
 
         artist = item["artists"][0]["name"] if item.get("artists") else ""
 
+        if not res.get("is_playing"):     # (2026-11-07) was "Currently playing" while paused
+            return f"Spotify is paused on {name}" + (f" by {artist}." if artist else ".")
         return f"Currently playing {name} by {artist}."
 
     elif tool == "spotify_search":

@@ -148,6 +148,8 @@ def _confirm(cmd, slot, requested=None):
             v, r = _num(slot), _num(requested)
             if v is not None and r is not None and r < v:
                 return f'Volume set to {v} percent, the lowest I go so you can still hear me.'
+            if v is not None and r is not None and r > v:
+                return f'Volume set to {v} percent, the maximum.'
         if cmd == 'BRIGHTNESS':
             p = _pct(slot)
             return f'Brightness set to {p} percent.' if p is not None else 'Brightness updated.'
@@ -209,6 +211,26 @@ def _fire(cmd: str, slot=None) -> str:
     outcome = resp[3:] if resp.startswith("ok:") else resp
     if outcome == "invalid":
         return _ask_again(cmd, slot)
+    if outcome == "nothing":
+        # (2026-11-07) the local player had nothing to act on. Spotify is the
+        # usual music source now (the LLM often picks the local tool for it):
+        # hand the command to Spotify; if Spotify has nothing either, say so.
+        sp_tool = {"PAUSE": "spotify_pause", "RESUME": "spotify_resume",
+                   "NEXT": "spotify_next", "STOP": "spotify_pause"}.get(cmd)
+        if sp_tool:
+            try:
+                import spotify_tools
+                msg = spotify_tools.dispatch(sp_tool)
+                if not _re.match(r"(Spotify isn't|Nothing is playing|Spotify didn't|Spotify auth)", msg):
+                    return msg
+            except Exception:
+                pass
+        return {
+            "PAUSE": "No local music is playing, so there was nothing to pause here. If it's Spotify, I can pause that.",
+            "RESUME": "There's no local music paused. If you mean Spotify, I can resume that.",
+            "STOP": "No local music is playing. If it's Spotify, I can pause that.",
+            "NEXT": "No local music is playing. If it's Spotify, I can skip the Spotify track.",
+        }.get(cmd, "There was nothing to do.")
     if outcome == "nomedia":
         return ("I can't play local music: there are no song files on the device. "
                 "I can play it on Spotify instead if you tell me what to play.")
@@ -227,6 +249,7 @@ def _ask_again(cmd, slot):
         "ALARM": f"I couldn't read '{s}' as a time. Say something like 7:30 AM.",
         "CREATE_REMINDER": "What should the reminder say?",
         "CALL": "Who should I call? I need a number or a name.",
+        "SET_VOLUME": f"I couldn't read '{s}' as a volume. Say a number from 10 to 100.",
     }.get(cmd, "I couldn't do that. Could you say it another way?")
 
 

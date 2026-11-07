@@ -1322,7 +1322,10 @@ function applyDevices(s){
     // no-op when the class already exists, so the CSS animation never
     // restarted. 'hit' is owned by the tool lifecycle (settleCard) only;
     // the music STATE is shown by the EQ viz + status text, not the card.
-    $('s-music').textContent = M.paused? 'paused' : (M.playing? (M.track||'playing') : 'stopped'); }
+    // (2026-11-07) Spotify shows here too: 'Spotify · NITROX · Song — Artist'
+    const _mt=(M.track&&M.track!=='nothing playing')?M.track:'';
+    const _ms=M.source?M.source+' · ':'';
+    $('s-music').textContent = M.paused? (_mt? 'paused · '+_ms+_mt : 'paused') : (M.playing? _ms+(_mt||'playing') : 'stopped'); }
   if(s.lamp){
     // No 'hit' ADD here — same reason as music: every-poll 'hit' re-adds
     // blocked the pulse (animation restart needs a real class change).

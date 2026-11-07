@@ -990,10 +990,15 @@ def apply_fire(f: dict) -> str:
     elif cmd == "SET_VOLUME":
         # UI slider: set the M1A HW volume to the exact value. The
         # 1 Hz sync loop keeps the tile in lockstep with the HW.
+        # (2026-11-07) number words ("fifty") parsed; unreadable -> "invalid"
+        # (ask again). It used to fall back silently and "fifty" set 10 %.
         try:
             v = int(slot)
         except (TypeError, ValueError):
-            v = DEV["music"]["vol"]
+            m_ = re.search(r"-?\d+", _words_to_digits(slot))
+            if not m_:
+                return "invalid"
+            v = int(m_.group(0))
         v = max(VOL_MIN, min(100, v))   # never mute Boots' own voice (see VOL_MIN)
         DEV["music"]["vol"] = v
         _apply_alsa_volume(v)
@@ -1003,6 +1008,7 @@ def apply_fire(f: dict) -> str:
         m = DEV["music"]
         if not m["track"]:
             add_chip("nothing playing yet")
+            return "nothing"
         else:
             nxt = (SONGS[(SONGS.index(m["track"]) + 1) % len(SONGS)]
                    if m["track"] in SONGS else random.choice(SONGS))
@@ -1030,7 +1036,7 @@ def apply_fire(f: dict) -> str:
             speak_clips([_clip_name(cmd, slot)])
         else:
             add_chip("nothing to pause")
-            speak_clips([_clip_name(cmd, slot)])
+            return "nothing"     # (2026-11-07) was spoken + confirmed as "Music paused."
     elif cmd == "RESUME":
         # "resume music" — relaunch from the paused sample offset.
         m = DEV["music"]
@@ -1042,11 +1048,15 @@ def apply_fire(f: dict) -> str:
             else:
                 m.update(paused=False, user_paused=False)
                 add_chip("nothing to resume")
+                return "nothing"
         else:
             add_chip("nothing to resume")
+            return "nothing"
     elif cmd == "STOP":
         m = DEV["music"]
-        if m["track"]:
+        # (2026-11-07) "nothing playing" is the placeholder a failed play/next
+        # leaves behind, not a song: stopping it was confirmed as "Music stopped."
+        if m["track"] and m["track"] != "nothing playing":
             with _M["lock"]:
                 _music_kill()
                 _M["track"] = None
@@ -1055,6 +1065,7 @@ def apply_fire(f: dict) -> str:
             speak_clips([_clip_name(cmd, slot)])
         else:
             add_chip("nothing playing")
+            return "nothing"
     # --- lighting ---
     elif cmd == "LIGHT_ON":
         L = DEV["lights"]; L["on"] = True
@@ -1320,6 +1331,19 @@ def _ui_music(dev: dict) -> dict:
         else:
             frac = max(0.0, min(1.0, elapsed / dur))
             elapsed = min(elapsed, dur)
+    # (2026-11-07) Spotify on the card: with no local song loaded, show what
+    # Spotify is doing (Boots plays music there now) instead of "nothing playing".
+    sp = _SPOT.get("state")
+    if not track_loaded and not playing and sp and time.time() - _SPOT.get("ts", 0) < 15:
+        sp_el = sp["progress"] + ((time.time() - _SPOT["ts"]) if sp["playing"] else 0.0)
+        sp_dur = sp["duration"] or 0.0
+        sp_el = min(sp_el, sp_dur) if sp_dur else sp_el
+        return {"track": sp["name"] + (f" — {sp['artist']}" if sp["artist"] else ""),
+                "playing": sp["playing"], "paused": not sp["playing"],
+                "elapsed": round(sp_el, 1), "duration": round(sp_dur, 1),
+                "fraction": round(sp_el / sp_dur, 4) if sp_dur else 0.0,
+                "vol": int(m.get("vol", 60)),
+                "source": "Spotify" + (f" · {sp['device']}" if sp["device"] else "")}
     return {"track": m["track"] or "nothing playing",
             "playing": playing,
             "paused": bool(m.get("paused")) and not playing,
@@ -1327,6 +1351,46 @@ def _ui_music(dev: dict) -> dict:
             "duration": round(dur, 1),
             "fraction": round(frac, 4),
             "vol": int(m.get("vol", 60))}
+
+
+# Spotify player state for the music card (2026-11-07): polled every 4 s by a
+# background thread through the same spotify_tools the MCP tools use.
+_SPOT = {"state": None, "ts": 0.0, "kick": threading.Event()}
+
+
+def _spotify_poll_loop():
+    import importlib
+    here = Path(__file__).resolve().parent
+    for cand in (here.parent, here):
+        if (cand / "spotify_tools.py").exists():
+            sys.path.insert(0, str(cand))
+            break
+    try:
+        sp_mod = importlib.import_module("spotify_tools")
+    except Exception as e:
+        print(f"spotify card: disabled ({e!r})", file=sys.stderr)
+        return
+    while True:
+        try:
+            r = sp_mod._api("GET", "/me/player")
+            it = (r or {}).get("item") if isinstance(r, dict) and "error" not in r else None
+            if it:
+                _SPOT["state"] = {
+                    "name": it.get("name") or "", "playing": bool(r.get("is_playing")),
+                    "artist": (it.get("artists") or [{}])[0].get("name", ""),
+                    "progress": (r.get("progress_ms") or 0) / 1000.0,
+                    "duration": (it.get("duration_ms") or 0) / 1000.0,
+                    "device": (r.get("device") or {}).get("name")}
+            else:
+                _SPOT["state"] = None
+            _SPOT["ts"] = time.time()
+        except Exception:
+            pass
+        # every 4 s, or at once when a Spotify tool just acted (/spotify_kick)
+        _SPOT["kick"].wait(4)
+        if _SPOT["kick"].is_set():
+            time.sleep(0.6)            # let Spotify's player state settle
+            _SPOT["kick"].clear()
 
 
 def ui_state_json() -> dict:
@@ -2080,6 +2144,10 @@ class Handler(BaseHTTPRequestHandler):
         except json.JSONDecodeError:
             self._send(400, b"bad json", "text/plain")
             return
+        if self.path == "/spotify_kick":     # (2026-11-07) refresh the music card now
+            _SPOT["kick"].set()
+            self._send(200, b"ok", "text/plain")
+            return
         if self.path == "/fire":
             with STATE["lock"]:
                 outcome = apply_fire(obj)
@@ -2712,6 +2780,7 @@ def main():
     load_meta(Path(args.dir))
     MUSIC_DIR = Path(args.dir) / "music"
     _music_init()
+    threading.Thread(target=_spotify_poll_loop, daemon=True, name="spotify-card").start()
     # The UI page (muji-styled dashboard). Look next to the script first
     # (boots_ui/ is where it lives on the Pi), then in --dir.
     for cand in (Path(__file__).with_name("boots_ui.html"),
