@@ -728,6 +728,9 @@ def _fetch_site_images(hero_q, section_qs):
     return got.get("hero"), [got.get(i) for i in range(len(section_qs))]
 
 
+_QUOTE_MARKS = "\"'“”‘’"   # the page adds its own quote marks
+
+
 def _credit_html(im):
     f = im.get("file", "")
     return ('<span class="credit">Wikimedia Commons</span>' if f else "")
@@ -765,7 +768,7 @@ def _render_site(title: str, topic: str, description: str, hue: int,
         secs.append({"id": "s" + str(len(secs) + 1), "heading": h or ("Section " + str(len(secs) + 1)),
                      "body": b, "points": pts, "kind": kind,
                      "image": (s.get("image") or "").strip() if isinstance(s.get("image"), str) else "",
-                     "quote": (s.get("quote") or "").strip().strip('"“”'').strip()
+                     "quote": (s.get("quote") or "").strip().strip(_QUOTE_MARKS).strip()
                      if isinstance(s.get("quote"), str) else ""})
     if not secs:
         secs = [{"id": "s1", "heading": "About", "body": desc, "points": [], "kind": "prose",
