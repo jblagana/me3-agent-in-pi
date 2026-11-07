@@ -423,7 +423,8 @@ def _check_weather(location: str = "") -> str:
 # Params the model may OMIT (not in the schema's `required`). check_weather
 # without a place = U.P. Diliman; a required `location` made the model
 # ask "where?" instead of just calling (2026-11-07).
-OPTIONAL_PARAMS = {"check_weather": {"location"}, "write_website": {"hero_image"}}
+OPTIONAL_PARAMS = {"check_weather": {"location"}, "write_website": {"hero_image"},
+                   "publish_website": {"name"}}
 
 TOOL_SPECS = [
     ("check_weather",
@@ -442,6 +443,12 @@ TOOL_SPECS = [
      "Open a specific web page (a URL the user gives you) and read its text. "
      "Use when the user says 'open', 'read', or 'look at' a particular webpage.",
      {"url": {"type": "string"}}),
+    ("publish_website",
+     "Publish a website you already built to the user's public GitHub Pages "
+     "site. Use when the user asks to publish / put live / share online a site. "
+     "name: words from the site's title or topic; leave empty for the most "
+     "recently built site. Do NOT rebuild the site to publish it.",
+     {"name": {"type": "string"}}),
     ("write_website",
      "Build a modern website about a topic and serve it in a browser. Use when "
      "the user asks you to 'make', 'create', 'build', or 'write' a website/"
@@ -504,6 +511,8 @@ def dispatch(tool: str, **kw) -> str:
             return _web_search(kw.get("query", ""))
         if tool == "fetch_url":
             return _fetch_url(kw.get("url", ""))
+        if tool == "publish_website":
+            return _publish_existing(kw.get("name", ""))
         if tool == "write_website":
             return _write_website(kw.get("topic", ""), kw.get("title", ""),
                                   kw.get("description", ""),
@@ -1025,9 +1034,20 @@ def _gh_publish(slug: str, html: str) -> str:
     if not shutil.which("git"):
         return "I couldn't publish it publicly (git isn't available on this machine)."
 
+    # (2026-11-07) auth: WEBSITE_GH_TOKEN (fine-grained token, Contents write on
+    # the sites repo, kept in /etc/me3/groq.env) sent as a per-command header,
+    # so it is never written to git config or a remote URL.
+    import base64
+    tok = os.environ.get("WEBSITE_GH_TOKEN", "").strip()
+    auth = (["-c", "http.extraheader=AUTHORIZATION: basic "
+             + base64.b64encode(f"x-access-token:{tok}".encode()).decode()] if tok else [])
+    ident = ["-c", "user.name=" + os.environ.get("WEBSITE_GH_USER", "Boots"),
+             "-c", "user.email=" + os.environ.get("WEBSITE_GH_EMAIL", "boots@users.noreply.github.com")]
+
     def _git(*args, cwd=None, timeout=90):
-        return subprocess.run(["git", *args], cwd=cwd, timeout=timeout,
-                              capture_output=True, text=True)
+        return subprocess.run(["git", *auth, *ident, *args], cwd=cwd, timeout=timeout,
+                              capture_output=True, text=True,
+                              env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
 
     try:
         if not os.path.isdir(os.path.join(_GH_CACHE, ".git")):
@@ -1047,12 +1067,33 @@ def _gh_publish(slug: str, html: str) -> str:
         if r.returncode != 0:
             return (f"I couldn't push the page to GitHub ({(r.stderr or r.stdout).strip()[:120]}). "
                     "It's still live on the LAN.")
-        return (f"It's also been published to GitHub Pages at "
-                f"{_GH_PAGES}/{slug}.html - it goes live in a couple of minutes.")
+        return (f"Published to GitHub Pages at {_GH_PAGES}/{slug}.html "
+                f"- it goes live in a minute or two.")
     except subprocess.TimeoutExpired:
         return "Publishing to GitHub took too long, so I stopped. It's still live on the LAN."
     except Exception as e:
         return f"Publishing to GitHub failed ({e!r}). It's still live on the LAN."
+
+def _publish_existing(name: str = "") -> str:
+    """Publish an already-built site (newest, or best match on `name`)."""
+    import glob
+    files = sorted(glob.glob(os.path.join(SITES_DIR, "*.html")), key=os.path.getmtime, reverse=True)
+    files = [f for f in files if not os.path.basename(f).startswith("voice-samples")]
+    if not files:
+        return "There's no website built yet. Tell me what it should be about and I'll make one."
+    pick = files[0]
+    words = [w for w in re.findall(r"[a-z0-9]+", (name or "").lower()) if len(w) > 2]
+    if words:
+        scored = [(sum(w in os.path.basename(f).lower() for w in words), f) for f in files]
+        best = max(scored, key=lambda x: x[0])
+        if best[0] == 0:
+            return f"I couldn't find a site matching '{name}'. The newest one is {os.path.basename(files[0])[:-5]}."
+        pick = best[1]
+    slug = os.path.basename(pick)[:-5]
+    with open(pick, encoding="utf-8") as f:
+        html = f.read()
+    return _gh_publish(slug, html)
+
 
 def _verify_site(url: str, html: str) -> str:
     """Tiered render verification. Returns an HONEST status string — the
