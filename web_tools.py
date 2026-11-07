@@ -423,7 +423,7 @@ def _check_weather(location: str = "") -> str:
 # Params the model may OMIT (not in the schema's `required`). check_weather
 # without a place = U.P. Diliman; a required `location` made the model
 # ask "where?" instead of just calling (2026-11-07).
-OPTIONAL_PARAMS = {"check_weather": {"location"}, "write_website": {"hero_image"},
+OPTIONAL_PARAMS = {"check_weather": {"location"}, "write_website": {"hero_image", "publish"},
                    "publish_website": {"name"}}
 
 TOOL_SPECS = [
@@ -469,8 +469,9 @@ TOOL_SPECS = [
      "line from your sources). The tool renders a themed page, verifies it renders, "
      "and returns the URL + verification status. Pick a hue (0-360) that fits "
      "the topic's mood (e.g. 195 ocean, 35 bakery, 265 space, 120 forest, 0 "
-     "red-alert); leave empty to auto-pick. Set publish=true ONLY when the "
-     "user explicitly asks to publish/host it publicly on GitHub.",
+     "red-alert); leave empty to auto-pick. Every site is PUBLISHED to the "
+     "user's GitHub Pages automatically; set publish=false ONLY if the user "
+     "asks to keep it private / local only.",
      {"topic": {"type": "string"},
       "title": {"type": "string"},
       "description": {"type": "string"},
@@ -516,7 +517,10 @@ def dispatch(tool: str, **kw) -> str:
         if tool == "write_website":
             return _write_website(kw.get("topic", ""), kw.get("title", ""),
                                   kw.get("description", ""),
-                                  kw.get("hue"), kw.get("publish", False),
+                                  kw.get("hue"),
+                                  # (2026-11-07) publish by default (WEBSITE_PUBLISH_DEFAULT=0 turns it off)
+                                  (os.environ.get("WEBSITE_PUBLISH_DEFAULT", "1") != "0"
+                                   if kw.get("publish") is None else bool(kw.get("publish"))),
                                   sections=kw.get("sections"),
                                   sources=kw.get("sources"),
                                   stats=kw.get("stats"),
@@ -1197,12 +1201,14 @@ def _write_website(topic: str, title: str, description: str,
     msg = (f"Done! I built a website about {topic or title} with {n_sec} "
            f"{'section' if n_sec == 1 else 'sections'}"
            + (f" and {n_img} photo{'s' if n_img != 1 else ''}" if n_img else "")
-           + " and saved it. "
-           f"You can open it in your browser at {url} "
-           f"({verify}).")
+           + ". ")
     if publish:
-        msg += " " + _gh_publish(slug, html)
-    return msg
+        pub = _gh_publish(slug, html)
+        if pub.startswith("Published"):
+            # public link first; the LAN copy is the fallback
+            return msg + pub + f" (Also on the local network at {url}; {verify}.)"
+        msg += pub + " "
+    return msg + f"You can open it on the local network at {url} ({verify})."
 
 # NOTE: the standalone FastMCP server that used to live here was removed -
 # the canonical MCP server is mcp_server.py (one process, all tools).
