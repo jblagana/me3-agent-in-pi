@@ -26,7 +26,12 @@ Environment=ME3_GATE_MIC=0
 # Aura voice (ME3_TTS=deepgram) streamed slower than real time from this network
 # (choppy), while Microsoft's nearby servers keep up.
 Environment=ME3_STT=deepgram
-Environment=ME3_SMART_TURN=0
+# Smart Turn ON with VAD stop 0.2 s (2026-11-07): with it OFF, every pause
+# over 0.6 s ended the turn ("Okay. So", "search about", spelled letters were
+# answered as complete requests). 0.2 s + the model (~0.5 s) is about the old
+# 0.6 s for finished sentences, and unfinished ones are waited out.
+Environment=ME3_SMART_TURN=1
+Environment=ME3_VAD_STOP_SECS=0.2
 Type=simple
 User=jan
 WorkingDirectory=/home/jan/me3

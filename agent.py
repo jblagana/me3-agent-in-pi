@@ -1530,7 +1530,11 @@ def _stamp_system_and_strip(context, llm) -> None:
         import time as _t
         now = _t.localtime()
         stamp = _t.strftime("%A, %B %d, %Y %H:%M %Z", now)
-        line = f"\n\nCurrent date and time: {stamp} (the user's local time is Asia/Manila, UTC+8)."
+        line = (f"\n\nCurrent date and time: {stamp} (the user's local time is Asia/Manila, UTC+8). "
+                # (2026-11-07) seen live: with the date right here the model still
+                # said the 2026 midterms "haven't occurred" and searched 2022.
+                "Events up to this date have happened, even ones after your training; "
+                "search for them with the user's own words and year, never change the year.")
         if _BASE_SYSTEM_TEXT is None:
             _BASE_SYSTEM_TEXT = SYSTEM_PROMPT
         try:

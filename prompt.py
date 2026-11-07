@@ -61,4 +61,9 @@ def system_prompt(now=None):
     """
     import datetime
     t = now or datetime.datetime.now()
-    return SYSTEM_PROMPT + "\nCurrent time: " + t.strftime("%A, %I:%M %p") + "\n"
+    # (2026-11-07) the DATE, not just weekday + time: without it the model
+    # assumed its training year ("the 2026 midterms haven't happened yet",
+    # and it rewrote the user's search to 2022).
+    return (SYSTEM_PROMPT + "\nCurrent date and time: " + t.strftime("%A, %d %B %Y, %I:%M %p")
+            + ". Events up to this date have happened, even ones after your training; "
+              "search for them with the user's own words and year, never change the year.\n")

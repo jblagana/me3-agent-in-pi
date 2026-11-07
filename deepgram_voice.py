@@ -66,6 +66,33 @@ def make_stt():
                 self._fire_task = asyncio.ensure_future(self._fire_later(0.1))
             await super().process_frame(frame, direction)
 
+        async def _keepalive_handler(self):
+            """Keep-alive + WATCHDOG (2026-11-07). Pipecat only reconnects when
+            the socket closes cleanly; seen live: the socket went half-dead,
+            every keep-alive failed and Boots stayed deaf for minutes. Two
+            failures in a row (10 s) now force a reconnect."""
+            from pipecat.services.deepgram import stt as _dgstt
+            fails = 0
+            while True:
+                await asyncio.sleep(5)
+                if not self._connection:
+                    fails = 0
+                    continue
+                try:
+                    await self._connection.send_keep_alive(_dgstt.ListenV1KeepAlive(type="KeepAlive"))
+                    fails = 0
+                except Exception as e:
+                    fails += 1
+                    logger.warning(f"[asr-deepgram] keep-alive failed ({fails}): {e!r}")
+                    if fails >= 2:
+                        fails = 0
+                        logger.warning("[asr-deepgram] connection is dead: forcing a reconnect")
+                        try:
+                            await self._reconnect()
+                            logger.info("[asr-deepgram] reconnected")
+                        except Exception as e2:
+                            logger.error(f"[asr-deepgram] reconnect failed: {e2!r}")
+
         async def _fire_later(self, delay):
             await asyncio.sleep(delay)
             self._fire()
