@@ -301,6 +301,33 @@ _ROUND = {"tool": False}
 # the box mirrored the answer, not the deliberation). Reset at round start.
 _REASONING_SEEN = {"round": 0}
 
+# Barge-in memory fix (2026-11-07). Pipecat writes Boots' reply into the LLM
+# context only when a sentence FINISHES playing. Interrupt inside the first
+# (often long) sentence and the reply vanishes: the context then reads
+# "user: What can you do?" + "user: Got it." and the model answers the first
+# question AGAIN. So: remember the reply being spoken at barge-in, and if the
+# context lost it, put it back (marked as cut off) before the next LLM call.
+_INTERRUPTED_REPLY = {"text": "", "ts": 0.0}
+
+
+def _restore_interrupted_reply(context):
+    it = _INTERRUPTED_REPLY
+    txt, ts = it.get("text") or "", it.get("ts") or 0.0
+    it["text"], it["ts"] = "", 0.0
+    if not txt or time.monotonic() - ts > 300:
+        return
+    try:
+        msgs = context.messages
+        if (len(msgs) >= 2 and isinstance(msgs[-1], dict) and isinstance(msgs[-2], dict)
+                and msgs[-1].get("role") == "user" and msgs[-2].get("role") == "user"):
+            msgs.insert(len(msgs) - 1, {
+                "role": "assistant",
+                "content": txt + " [I was cut off here: the user interrupted me, so they "
+                                 "may not have heard all of this. Do not repeat it unless asked.]"})
+            logger.info(f"[me3] barge-in: restored the interrupted reply into context ({len(txt)} chars)")
+    except Exception as e:
+        logger.debug(f"[me3] restore interrupted reply failed: {e!r}")
+
 
 def _voice_turn_start():
     """A new utterance was transcribed — reset the per-turn latency stamps."""
@@ -671,6 +698,9 @@ class StatusIndicator(FrameProcessor):
                 _rvw.prewarm_tts()     # and the edge-tts socket (2026-11-07)
             except Exception:
                 pass
+            if self._bot_talking and (_RECENT_TEXT.get("reply") or "").strip():
+                _INTERRUPTED_REPLY["text"] = _RECENT_TEXT["reply"].strip()
+                _INTERRUPTED_REPLY["ts"] = time.monotonic()
             _RECENT_TEXT["reply"] = None
             _RECENT_TEXT["tool"] = None
             _RECENT_TEXT["tool_args"] = None
@@ -1660,6 +1690,7 @@ class GroqResilientLLM(OpenAILLMService):
         #    so the model always knows "now" (it otherwise has no clock and
         #    can't answer "what time is it?" or reason about relative times).
         _stamp_system_and_strip(context, self)
+        _restore_interrupted_reply(context)     # barge-in memory fix (2026-11-07)
         # (2026-11-07) reasoning_effort is no longer forced to 'medium' on
         # every request: _llm_extra() sets the provider-correct value at boot
         # and on every hot-swap (gpt-oss rejects 'none'; vLLM rejects
