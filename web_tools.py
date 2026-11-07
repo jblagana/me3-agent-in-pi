@@ -592,70 +592,140 @@ SITE_IMG_DEADLINE_S = float(os.environ.get("ME3_SITE_IMG_DEADLINE", "15"))
 _WIKI_API = "https://en.wikipedia.org/w/api.php"
 
 
-def _wiki_image(query: str, width: int = 960):
-    """Search phrase -> {'data','page','file','w'} or None."""
-    import base64
-    q = (query or "").strip()
+_IMG_STOP = {"the", "and", "with", "from", "for", "into", "near", "view", "photo", "image",
+             "picture", "its", "during", "over", "under", "after", "before", "this", "that"}
+_IMG_BAD = re.compile(r"journal|report|survey|flag|logo|seal|coat of arms|map|locator|"
+                      r"diagram|chart|icon|stamp|banknote|signature|\(\d{4}\) \(\d+\)", re.I)
+
+
+def _sig_tokens(text):
+    return {t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(t) >= 3 and t not in _IMG_STOP}
+
+
+_IMG_UA = "BootsVoiceAgent/1.0 (https://github.com/jblagana/me3-agent-in-pi; Raspberry Pi course project)"
+
+
+def _api_json(base, params, timeout=6):
+    """GET JSON; one polite retry when Wikimedia throttles (HTTP 429)."""
+    import time as _t
+    req = urllib.request.Request(base + "?" + urllib.parse.urlencode(params),
+                                 headers={"User-Agent": _IMG_UA})
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except urllib.error.HTTPError as e:
+            if e.code != 429 or attempt == 2:
+                raise
+            _t.sleep(min(3.0, float(e.headers.get("Retry-After") or 1.5)))
+
+
+def _relevant(title, query):
+    """File/page title must contain enough of the search phrase's words, so
+    'Chocolate Hills dry season' can't land on a chocolate labrador."""
+    q = _sig_tokens(query)
     if not q:
-        return None
-    params = {"action": "query", "format": "json", "formatversion": "2",
-              "generator": "search", "gsrsearch": q, "gsrlimit": "4",
-              "gsrnamespace": "0", "prop": "pageimages", "piprop": "thumbnail|name",
-              "pithumbsize": str(width), "pilicense": "free"}
+        return False
+    hit = len(q & _sig_tokens(title))
+    return hit >= min(2, len(q))
+
+
+def _image_candidates(query, width):
+    """Search phrase -> ordered photo candidates [{thumb, file, desc, page}].
+    1) Wikimedia Commons file search (many distinct photos of one subject),
+    2) the lead photo of the best-matching Wikipedia article (free licence)."""
+    q = (query or "").strip()
+    out = []
+    if not q:
+        return out
     try:
-        req = urllib.request.Request(_WIKI_API + "?" + urllib.parse.urlencode(params),
-                                     headers={"User-Agent": USER_AGENT})
-        with urllib.request.urlopen(req, timeout=6) as r:
-            pages = (json.loads(r.read().decode("utf-8")).get("query") or {}).get("pages") or []
-        pages.sort(key=lambda p: p.get("index", 99))
-        for p in pages:
-            th = p.get("thumbnail") or {}
-            src = th.get("source", "")
-            if not src or src.lower().endswith((".svg", ".svg.png")) or ".svg/" in src.lower():
-                continue                       # logos/maps/diagrams make poor photos
-            if th.get("width", 0) < 320:
+        r = _api_json("https://commons.wikimedia.org/w/api.php", {
+            "action": "query", "format": "json", "formatversion": "2",
+            "generator": "search", "gsrsearch": q + " filetype:bitmap", "gsrnamespace": "6",
+            "gsrlimit": "8", "prop": "imageinfo", "iiprop": "url|size|mime",
+            "iiurlwidth": str(width)})
+        for p in sorted((r.get("query") or {}).get("pages") or [], key=lambda p: p.get("index", 99)):
+            ii = (p.get("imageinfo") or [{}])[0]
+            name = p.get("title", "")[5:]                      # strip "File:"
+            if (ii.get("mime") not in ("image/jpeg", "image/png", "image/webp")
+                    or ii.get("width", 0) < 800 or _IMG_BAD.search(name)
+                    or not _relevant(name, q) or not ii.get("thumburl")):
                 continue
-            ireq = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
-            with urllib.request.urlopen(ireq, timeout=8) as ir:
-                ctype = ir.headers.get("Content-Type", "image/jpeg").split(";")[0]
-                blob = ir.read(1_500_000)
-            if not ctype.startswith("image/") or len(blob) < 2000:
-                continue
-            return {"data": f"data:{ctype};base64," + base64.b64encode(blob).decode(),
-                    "page": p.get("title", ""), "file": p.get("pageimage", ""),
-                    "w": th.get("width", width)}
+            out.append({"thumb": ii["thumburl"], "file": name.replace(" ", "_"),
+                        "desc": ii.get("descriptionurl", ""), "page": ""})
     except Exception as e:
-        print(f"[site-img] {q!r}: {e!r}", file=sys.stderr)
+        print(f"[site-img] commons {q!r}: {e!r}", file=sys.stderr)
+    if out and width < 1280:
+        return out                 # sections: Commons is enough; spare the API
+    try:
+        r = _api_json(_WIKI_API, {
+            "action": "query", "format": "json", "formatversion": "2",
+            "generator": "search", "gsrsearch": q, "gsrlimit": "3", "gsrnamespace": "0",
+            "prop": "pageimages", "piprop": "thumbnail|name", "pithumbsize": str(width),
+            "pilicense": "free"})
+        for p in sorted((r.get("query") or {}).get("pages") or [], key=lambda p: p.get("index", 99)):
+            th = p.get("thumbnail") or {}
+            f = p.get("pageimage", "")
+            if (not th.get("source") or th.get("width", 0) < 320 or ".svg" in th["source"].lower()
+                    or _IMG_BAD.search(f) or not _relevant(p.get("title", "") + " " + f, q)):
+                continue
+            item = {"thumb": th["source"], "file": f,
+                    "desc": "https://commons.wikimedia.org/wiki/File:" + urllib.parse.quote(f),
+                    "page": p.get("title", "")}
+            if width >= 1280:
+                out.insert(0, item)      # hero: the article's lead photo first
+                break
+            else:
+                out.append(item)
+    except Exception as e:
+        print(f"[site-img] wiki {q!r}: {e!r}", file=sys.stderr)
+    return out
+
+
+def _download_image(c):
+    import base64
+    try:
+        req = urllib.request.Request(c["thumb"], headers={"User-Agent": _IMG_UA})
+        with urllib.request.urlopen(req, timeout=8) as r:
+            ctype = r.headers.get("Content-Type", "image/jpeg").split(";")[0]
+            blob = r.read(1_500_000)
+        if ctype.startswith("image/") and len(blob) > 2000:
+            return dict(c, data=f"data:{ctype};base64," + base64.b64encode(blob).decode())
+    except Exception as e:
+        print(f"[site-img] download {c.get('file')!r}: {e!r}", file=sys.stderr)
     return None
 
 
 def _fetch_site_images(hero_q, section_qs):
-    """Fetch the hero + section photos in parallel; never the same photo twice.
+    """Hero + section photos: candidate searches in parallel, then each slot
+    takes its first candidate not used yet (never the same photo twice; never
+    an unrelated fallback), then downloads in parallel. One overall deadline.
     Returns (hero, [img|None per section])."""
+    import time as _t
     from concurrent.futures import ThreadPoolExecutor, wait
-    jobs = [("hero", hero_q, 1280)] + [(i, q, 960) for i, q in enumerate(section_qs)]
-    jobs = [j for j in jobs if (j[1] or "").strip()]
-    out = {}
-    if jobs:
-        ex = ThreadPoolExecutor(max_workers=min(6, len(jobs)))
-        futs = {ex.submit(_wiki_image, q, w): k for (k, q, w) in jobs}
-        done, _ = wait(futs, timeout=SITE_IMG_DEADLINE_S)
-        for f in done:
-            try:
-                out[futs[f]] = f.result()
-            except Exception:
-                pass
+    t_end = _t.monotonic() + SITE_IMG_DEADLINE_S
+    slots = [("hero", hero_q, 1280)] + [(i, q, 960) for i, q in enumerate(section_qs)]
+    slots = [s for s in slots if (s[1] or "").strip()]
+    if not slots:
+        return None, [None] * len(section_qs)
+    ex = ThreadPoolExecutor(max_workers=3)
+    try:
+        futs = {ex.submit(_image_candidates, q, w): k for (k, q, w) in slots}
+        done, _ = wait(futs, timeout=max(1.0, t_end - _t.monotonic()))
+        cands = {futs[f]: (f.result() if not f.exception() else []) for f in done}
+        chosen, used = {}, set()
+        for (k, _q, _w) in slots:
+            for c in cands.get(k, []):
+                if c["file"] not in used:
+                    used.add(c["file"]); chosen[k] = c
+                    break
+        dfuts = {ex.submit(_download_image, c): k for k, c in chosen.items()}
+        done, _ = wait(dfuts, timeout=max(1.0, t_end - _t.monotonic()))
+        got = {dfuts[f]: f.result() for f in done if not f.exception()}
+    finally:
         ex.shutdown(wait=False, cancel_futures=True)
-    seen = set()
-
-    def take(k):
-        im = out.get(k)
-        if not im or im["file"] in seen:
-            return None
-        seen.add(im["file"])
-        return im
-    hero = take("hero")
-    return hero, [take(i) for i in range(len(section_qs))]
+    return got.get("hero"), [got.get(i) for i in range(len(section_qs))]
 
 
 def _credit_html(im):
@@ -695,7 +765,8 @@ def _render_site(title: str, topic: str, description: str, hue: int,
         secs.append({"id": "s" + str(len(secs) + 1), "heading": h or ("Section " + str(len(secs) + 1)),
                      "body": b, "points": pts, "kind": kind,
                      "image": (s.get("image") or "").strip() if isinstance(s.get("image"), str) else "",
-                     "quote": (s.get("quote") or "").strip() if isinstance(s.get("quote"), str) else ""})
+                     "quote": (s.get("quote") or "").strip().strip('"“”'').strip()
+                     if isinstance(s.get("quote"), str) else ""})
     if not secs:
         secs = [{"id": "s1", "heading": "About", "body": desc, "points": [], "kind": "prose",
                  "image": "", "quote": ""}]
@@ -791,9 +862,9 @@ def _render_site(title: str, topic: str, description: str, hue: int,
         + ("</a>" if s.get("url") else "</div>") for s in srcs)
     credits = [im for im in [hero] + [s["img"] for s in secs] if im]
     cred_cards = "".join(
-        f'<a class="src" href="https://commons.wikimedia.org/wiki/File:{urllib.parse.quote(im["file"])}">'
+        f'<a class="src" href="{e(im.get("desc") or "https://commons.wikimedia.org")}">'
         f'<span class="ico">{j + 1}</span><span><span class="t">{e(im["file"].rsplit(".", 1)[0].replace("_", " "))}</span>'
-        f'<span class="d">from the Wikipedia article “{e(im["page"])}”</span></span></a>'
+        f'<span class="d">Wikimedia Commons</span></span></a>'
         for j, im in enumerate(credits) if im.get("file"))
     refs = ""
     if src_cards or cred_cards:
