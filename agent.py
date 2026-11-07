@@ -668,6 +668,7 @@ class StatusIndicator(FrameProcessor):
             try:
                 import remote_voice as _rvw
                 _rvw.prewarm_asr()
+                _rvw.prewarm_tts()     # and the edge-tts socket (2026-11-07)
             except Exception:
                 pass
             _RECENT_TEXT["reply"] = None

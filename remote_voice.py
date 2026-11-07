@@ -632,6 +632,152 @@ class EdgeTTSService(Qwen3TTSService):
         return super()._synthesize(text, sample_rate)
 
 
+# --- ONE reused edge-tts connection (2026-11-07) ----------------------------
+# edge_tts.Communicate opens a NEW websocket per sentence: ~0.4 s of TCP+TLS
+# (measured ~0.4-1.0 s from the Pi) before any audio. Microsoft's endpoint
+# accepts many requests on one socket (tested: 6 in a row, idle gaps up to
+# 30 s; closed somewhere before 60 s idle). So: keep ONE socket, send
+# speech.config once, then one SSML request per sentence. Re-opened in the
+# background when the user starts talking if it is >25 s idle (like the ASR
+# pre-warm). A turn abandoned mid-stream (barge-in) leaves unread audio on the
+# socket, so the next use discards that socket and opens a fresh one. Any
+# failure -> the caller falls back to the old edge_tts.Communicate path.
+EDGE_REUSE = os.environ.get("ME3_EDGE_REUSE", "1") != "0"
+EDGE_IDLE_REOPEN_S = float(os.environ.get("ME3_EDGE_IDLE_REOPEN_S", "25"))
+
+
+class _EdgeLink:
+    def __init__(self):
+        self.session = None
+        self.ws = None
+        self.last = 0.0          # last time the socket finished a turn / opened
+        self.busy = False        # a turn is in progress (or was abandoned)
+        self.opening = None      # asyncio.Task while a background open runs
+
+    def _stale(self):
+        return (self.ws is None or self.ws.closed or self.busy
+                or time.monotonic() - self.last > EDGE_IDLE_REOPEN_S)
+
+    async def _close(self):
+        ws, self.ws, self.busy = self.ws, None, False
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
+
+    async def _open(self):
+        import aiohttp
+        from edge_tts.communicate import connect_id, date_to_string, _SSL_CTX
+        from edge_tts.constants import WSS_URL, SEC_MS_GEC_VERSION, WSS_HEADERS
+        from edge_tts.drm import DRM
+        if self.session is None or self.session.closed:
+            self.session = aiohttp.ClientSession(trust_env=True)
+        t0 = time.monotonic()
+        ws = await self.session.ws_connect(
+            f"{WSS_URL}&ConnectionId={connect_id()}&Sec-MS-GEC={DRM.generate_sec_ms_gec()}"
+            f"&Sec-MS-GEC-Version={SEC_MS_GEC_VERSION}",
+            compress=15, headers=DRM.headers_with_muid(WSS_HEADERS), ssl=_SSL_CTX)
+        await ws.send_str(
+            f"X-Timestamp:{date_to_string()}\r\nContent-Type:application/json; charset=utf-8\r\n"
+            "Path:speech.config\r\n\r\n"
+            '{"context":{"synthesis":{"audio":{"metadataoptions":{"sentenceBoundaryEnabled":"true",'
+            '"wordBoundaryEnabled":"false"},"outputFormat":"audio-24khz-48kbitrate-mono-mp3"}}}}\r\n')
+        old, self.ws, self.last, self.busy = self.ws, ws, time.monotonic(), False
+        if old is not None and not old.closed:
+            # may still be streaming the sentence a barge-in is cutting off:
+            # retire it a little later instead of breaking it mid-read
+            asyncio.get_running_loop().call_later(
+                10, lambda: asyncio.ensure_future(old.close()))
+        logger.info(f"[tts-edge] connection opened ({time.monotonic()-t0:.2f}s), reused per sentence")
+
+    def prewarm(self):
+        """Called when the user starts talking: open a fresh socket in the
+        background if the current one is missing, abandoned or idle too long."""
+        if not EDGE_REUSE or (self.opening and not self.opening.done()) or not self._stale():
+            return
+        try:
+            self.opening = asyncio.get_running_loop().create_task(self._open_quiet())
+        except RuntimeError:
+            pass
+
+    async def _open_quiet(self):
+        try:
+            await self._open()
+        except Exception as e:
+            logger.debug(f"[tts-edge] pre-warm failed: {e!r}")
+
+    async def stream(self, text):
+        """Yield {'type': 'audio', 'data': mp3_bytes} for one sentence."""
+        from xml.sax.saxutils import escape
+        from edge_tts.communicate import (ssml_headers_plus_data, mkssml, connect_id,
+                                          date_to_string, get_headers_and_data)
+        from edge_tts.data_classes import TTSConfig
+        import aiohttp
+        if self.opening and not self.opening.done():
+            try:
+                await asyncio.wait_for(asyncio.shield(self.opening), timeout=EDGE_TIMEOUT_S)
+            except Exception:
+                pass
+        if self.ws is None or self.ws.closed or self.busy:
+            await self._open()                       # abandoned turn / closed -> fresh socket
+        tc = TTSConfig(EDGE_VOICE, EDGE_RATE, "+0%", EDGE_PITCH, "SentenceBoundary")
+        msg = ssml_headers_plus_data(connect_id(), date_to_string(), mkssml(tc, escape(text)))
+        try:
+            await self.ws.send_str(msg)
+        except Exception:
+            await self._open()                       # server closed it while idle: once more
+            await self.ws.send_str(msg)
+        ws = self.ws
+        self.busy = True
+        async for m in ws:
+            if m.type == aiohttp.WSMsgType.TEXT:
+                if "Path:turn.end" in m.data:
+                    if self.ws is ws:
+                        self.busy = False
+                        self.last = time.monotonic()
+                    return
+            elif m.type == aiohttp.WSMsgType.BINARY:
+                if len(m.data) < 2:
+                    continue
+                _, data = get_headers_and_data(m.data, int.from_bytes(m.data[:2], "big"))
+                if data:
+                    yield {"type": "audio", "data": data}
+            else:
+                break
+        if self.ws is ws:
+            await self._close()
+        raise RuntimeError("edge-tts socket closed mid-sentence")
+
+
+_EDGE_LINK = _EdgeLink()
+
+
+def prewarm_tts():
+    _EDGE_LINK.prewarm()
+
+
+async def _edge_chunks(text):
+    """Audio chunks for one sentence: the reused socket first; if it fails
+    BEFORE any audio, retry once the old way (new connection per sentence),
+    so a reuse problem costs speed, never the voice."""
+    if EDGE_REUSE:
+        got = False
+        try:
+            async for ch in _EDGE_LINK.stream(text):
+                got = True
+                yield ch
+            return
+        except Exception as e:
+            if got:
+                raise
+            logger.warning(f"[tts-edge] reused socket failed ({e!r}); new connection this time")
+            await _EDGE_LINK._close()
+    import edge_tts
+    async for ch in edge_tts.Communicate(text, EDGE_VOICE, pitch=EDGE_PITCH, rate=EDGE_RATE).stream():
+        yield ch
+
+
 def _mp3_to_pcm24k(buf):
     """Decode the MP3 received so far -> int16 mono 24 kHz (edge-tts's native rate)."""
     import miniaudio
@@ -683,8 +829,7 @@ class StreamingEdgeTTSService(EdgeTTSService):
             if REPLY_LEAD_S > 0:
                 yield TTSAudioRawFrame(b"\x00\x00" * int(TTS_SAMPLE_RATE * REPLY_LEAD_S),
                                        TTS_SAMPLE_RATE, 1, context_id=context_id)
-            comm = edge_tts.Communicate(text, EDGE_VOICE, pitch=EDGE_PITCH, rate=EDGE_RATE)
-            agen = comm.stream()
+            agen = _edge_chunks(text)   # reused socket, old path as backup (2026-11-07)
             while True:
                 try:
                     ch = await asyncio.wait_for(agen.__anext__(), timeout=EDGE_TIMEOUT_S)
