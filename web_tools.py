@@ -423,7 +423,7 @@ def _check_weather(location: str = "") -> str:
 # Params the model may OMIT (not in the schema's `required`). check_weather
 # without a place = U.P. Diliman; a required `location` made the model
 # ask "where?" instead of just calling (2026-11-07).
-OPTIONAL_PARAMS = {"check_weather": {"location"}}
+OPTIONAL_PARAMS = {"check_weather": {"location"}, "write_website": {"hero_image"}}
 
 TOOL_SPECS = [
     ("check_weather",
@@ -455,7 +455,11 @@ TOOL_SPECS = [
      "kind='timeline' (points become 'Year — event' entries on a vertical "
      "spine) when the topic has a clear history. Set stats to 3-4 headline "
      "numbers {value, label} (real figures from your sources) for a stat band "
-     "under the hero. The tool renders a themed page, verifies it renders, "
+     "under the hero. PHOTOS: set hero_image and, for 2-3 sections, image to a "
+     "short Wikipedia-style search phrase for a real photo (e.g. 'Taal Volcano "
+     "2020 eruption', 'Tagaytay ridge'); the tool finds free-licence photos and "
+     "credits them. A section may also set quote (one short real quote or fact "
+     "line from your sources). The tool renders a themed page, verifies it renders, "
      "and returns the URL + verification status. Pick a hue (0-360) that fits "
      "the topic's mood (e.g. 195 ocean, 35 bakery, 265 space, 120 forest, 0 "
      "red-alert); leave empty to auto-pick. Set publish=true ONLY when the "
@@ -471,7 +475,9 @@ TOOL_SPECS = [
                                  "kind": {"type": "string",
                                           "enum": ["prose", "timeline"]},
                                  "points": {"type": "array",
-                                            "items": {"type": "string"}}},
+                                            "items": {"type": "string"}},
+                                 "image": {"type": "string"},
+                                 "quote": {"type": "string"}},
                              "required": ["heading", "body"]}},
       "stats": {"type": "array",
                 "items": {"type": "object",
@@ -484,6 +490,7 @@ TOOL_SPECS = [
                             "properties": {
                                 "title": {"type": "string"},
                                 "url": {"type": "string"}}}},
+      "hero_image": {"type": "string"},
       "hue": {"type": "integer"},
       "publish": {"type": "boolean"}}),
 ]
@@ -503,7 +510,8 @@ def dispatch(tool: str, **kw) -> str:
                                   kw.get("hue"), kw.get("publish", False),
                                   sections=kw.get("sections"),
                                   sources=kw.get("sources"),
-                                  stats=kw.get("stats"))
+                                  stats=kw.get("stats"),
+                                  hero_image=kw.get("hero_image"))
         return f"I don't know how to do '{tool}'."
     except Exception as e:
         # Fail-soft: never crash the agent on a web error.
@@ -573,21 +581,104 @@ def _hue_for(topic: str, hue=None) -> int:
 def _esc(s: str) -> str:
     return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def _render_site(title: str, topic: str, description: str, hue: int,
-                 sections=None, sources=None, stats=None) -> str:
-    """Modern single-file page: one hue drives the whole palette (HSL vars).
+# ---- photos for write_website (2026-11-07) ---------------------------------
+# The LLM gives a search phrase per photo (hero_image, section.image). We look it
+# up on Wikipedia (PageImages, free-licence images only, no API key), download a
+# standard-width thumbnail and EMBED it as a data: URI, so every site stays one
+# self-contained file (the /site/ route serves only .html, and the GitHub
+# publish pushes one file). No match / timeout -> that block renders without a
+# photo. All lookups run in parallel under one overall deadline.
+SITE_IMG_DEADLINE_S = float(os.environ.get("ME3_SITE_IMG_DEADLINE", "15"))
+_WIKI_API = "https://en.wikipedia.org/w/api.php"
 
-    Content is LLM-authored: `sections` is a list of {heading, body,
-    points[], kind?} where kind='timeline' renders points as a vertical
-    spine of 'Year — event' entries; `stats` is a list of {value, label}
-    rendered as a stat band under the hero; `sources` a list of {title,
-    url}. When sections are empty the page falls back to a lede-only
-    layout (never a blank page)."""
+
+def _wiki_image(query: str, width: int = 960):
+    """Search phrase -> {'data','page','file','w'} or None."""
+    import base64
+    q = (query or "").strip()
+    if not q:
+        return None
+    params = {"action": "query", "format": "json", "formatversion": "2",
+              "generator": "search", "gsrsearch": q, "gsrlimit": "4",
+              "gsrnamespace": "0", "prop": "pageimages", "piprop": "thumbnail|name",
+              "pithumbsize": str(width), "pilicense": "free"}
+    try:
+        req = urllib.request.Request(_WIKI_API + "?" + urllib.parse.urlencode(params),
+                                     headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=6) as r:
+            pages = (json.loads(r.read().decode("utf-8")).get("query") or {}).get("pages") or []
+        pages.sort(key=lambda p: p.get("index", 99))
+        for p in pages:
+            th = p.get("thumbnail") or {}
+            src = th.get("source", "")
+            if not src or src.lower().endswith((".svg", ".svg.png")) or ".svg/" in src.lower():
+                continue                       # logos/maps/diagrams make poor photos
+            if th.get("width", 0) < 320:
+                continue
+            ireq = urllib.request.Request(src, headers={"User-Agent": USER_AGENT})
+            with urllib.request.urlopen(ireq, timeout=8) as ir:
+                ctype = ir.headers.get("Content-Type", "image/jpeg").split(";")[0]
+                blob = ir.read(1_500_000)
+            if not ctype.startswith("image/") or len(blob) < 2000:
+                continue
+            return {"data": f"data:{ctype};base64," + base64.b64encode(blob).decode(),
+                    "page": p.get("title", ""), "file": p.get("pageimage", ""),
+                    "w": th.get("width", width)}
+    except Exception as e:
+        print(f"[site-img] {q!r}: {e!r}", file=sys.stderr)
+    return None
+
+
+def _fetch_site_images(hero_q, section_qs):
+    """Fetch the hero + section photos in parallel; never the same photo twice.
+    Returns (hero, [img|None per section])."""
+    from concurrent.futures import ThreadPoolExecutor, wait
+    jobs = [("hero", hero_q, 1280)] + [(i, q, 960) for i, q in enumerate(section_qs)]
+    jobs = [j for j in jobs if (j[1] or "").strip()]
+    out = {}
+    if jobs:
+        ex = ThreadPoolExecutor(max_workers=min(6, len(jobs)))
+        futs = {ex.submit(_wiki_image, q, w): k for (k, q, w) in jobs}
+        done, _ = wait(futs, timeout=SITE_IMG_DEADLINE_S)
+        for f in done:
+            try:
+                out[futs[f]] = f.result()
+            except Exception:
+                pass
+        ex.shutdown(wait=False, cancel_futures=True)
+    seen = set()
+
+    def take(k):
+        im = out.get(k)
+        if not im or im["file"] in seen:
+            return None
+        seen.add(im["file"])
+        return im
+    hero = take("hero")
+    return hero, [take(i) for i in range(len(section_qs))]
+
+
+def _credit_html(im):
+    f = im.get("file", "")
+    return ('<span class="credit">Wikimedia Commons</span>' if f else "")
+
+
+def _render_site(title: str, topic: str, description: str, hue: int,
+                 sections=None, sources=None, stats=None, hero_image=None) -> str:
+    """Modern single-file page (2026-11-07 template): floating pill nav, rounded
+    photo hero, stat tiles, split sections with rounded photos, feature cards
+    for points, a dark timeline panel with year cards, pull quotes, and source
+    + image-credit cards. One hue drives the palette, light and dark.
+
+    Content is LLM-authored: sections = [{heading, body, points[], kind?,
+    image?, quote?}]; kind='timeline' renders points ('Year - event') as year
+    cards; image/hero_image are search phrases resolved to Wikipedia photos.
+    Empty sections fall back to a lede-only page (never blank)."""
+    e = _esc
     desc = (description or "").strip() or (
         "A page about " + (topic or "this topic") +
         ", generated by the Boots voice agent on a Raspberry Pi.")
 
-    # --- normalize sections -------------------------------------------------
     secs = []
     for i, s in enumerate(sections or []):
         if not isinstance(s, dict):
@@ -601,239 +692,252 @@ def _render_site(title: str, topic: str, description: str, hue: int,
             kind = "prose"
         if not h and not b:
             continue
-        secs.append({"id": "s" + str(i + 1),
-                     "heading": h or ("Section " + str(i + 1)),
-                     "body": b, "points": pts, "kind": kind})
+        secs.append({"id": "s" + str(len(secs) + 1), "heading": h or ("Section " + str(len(secs) + 1)),
+                     "body": b, "points": pts, "kind": kind,
+                     "image": (s.get("image") or "").strip() if isinstance(s.get("image"), str) else "",
+                     "quote": (s.get("quote") or "").strip() if isinstance(s.get("quote"), str) else ""})
+    if not secs:
+        secs = [{"id": "s1", "heading": "About", "body": desc, "points": [], "kind": "prose",
+                 "image": "", "quote": ""}]
 
-    # --- normalize stat band ------------------------------------------------
+    hero_q = (hero_image or "").strip() if isinstance(hero_image, str) else ""
+    if not hero_q:
+        hero_q = topic or title
+    hero, imgs = _fetch_site_images(hero_q, [s["image"] for s in secs])
+    for s, im in zip(secs, imgs):
+        s["img"] = im
+
     stat_items = []
     for st in (stats or []):
-        if not isinstance(st, dict):
-            continue
-        v = (st.get("value") or "").strip()
-        l = (st.get("label") or "").strip()
-        if v:
-            stat_items.append({"value": v, "label": l})
+        if isinstance(st, dict) and (st.get("value") or "").strip():
+            stat_items.append({"value": st["value"].strip(), "label": (st.get("label") or "").strip()})
     stat_items = stat_items[:4]
+
+    # ---- blocks ------------------------------------------------------------
+    def pic(im, cap):
+        if not im:
+            return ""
+        return (f'<figure class="pic"><img src="{im["data"]}" alt="{e(cap)}" loading="lazy">'
+                f'<figcaption><span class="chip">{e(cap)}</span>{_credit_html(im)}</figcaption></figure>')
+
+    def quote(s):
+        return (f'<div class="quote"><q>{e(s["quote"])}</q></div>' if s["quote"] else "")
+
+    def year_split(p):
+        m = re.match(r"^\s*([0-9][0-9 ,.]{1,12}(?:\s?(?:BCE|BC|CE|AD|ka|Ma))?|c\.\s?\d+|\d+s)\s*[-–—:]\s*(.+)$", p)
+        return (m.group(1).strip(), m.group(2).strip()) if m else ("", p)
+
+    blocks = []
+    n_split = 0
+    for idx, s in enumerate(secs):
+        head = (f'<span class="eyebrow">{e(topic)}</span>'
+                if idx == 0 and topic and topic.strip().lower() != title.strip().lower() else "")
+        body = f'<p class="lede">{e(s["body"])}</p>' if s["body"] else ""
+        if s["kind"] == "timeline" and s["points"]:
+            cards = []
+            for j, p in enumerate(s["points"]):
+                y, ev = year_split(p)
+                cls = ' class="now"' if j == len(s["points"]) - 1 else ""
+                cards.append(f'<li{cls}><b>{e(y or str(j + 1))}</b><span>{e(ev)}</span></li>')
+            top_pic = pic(s["img"], s["heading"])
+            blocks.append(
+                f'<section class="sec" id="{s["id"]}"><div class="panel">'
+                f'<div class="panel-top{" solo" if not top_pic else ""}"><div class="text">'
+                f'<span class="eyebrow">Timeline</span><h2>{e(s["heading"])}</h2>{body}</div>{top_pic}</div>'
+                f'<ol class="years">{"".join(cards)}</ol></div>{quote(s)}</section>')
+        elif s["img"] and not s["points"] and idx == len(secs) - 1 and len(secs) > 2:
+            im = s["img"]
+            blocks.append(
+                f'<section class="sec" id="{s["id"]}"><div class="wide">'
+                f'<img src="{im["data"]}" alt="{e(s["heading"])}" loading="lazy">{_credit_html(im)}'
+                f'<div class="over"><h2>{e(s["heading"])}</h2>'
+                f'{"<p>" + e(s["body"]) + "</p>" if s["body"] else ""}</div></div>{quote(s)}</section>')
+        elif s["img"]:
+            flip = " flip" if n_split % 2 else ""
+            n_split += 1
+            pts = ("<ul class='ticks'>" + "".join(f"<li>{e(p)}</li>" for p in s["points"]) + "</ul>"
+                   if s["points"] else "")
+            blocks.append(
+                f'<section class="sec" id="{s["id"]}"><div class="split{flip}"><div class="text">{head}'
+                f'<h2>{e(s["heading"])}</h2>{body}{pts}</div>{pic(s["img"], s["heading"])}</div>'
+                f'{quote(s)}</section>')
+        else:
+            feats = ""
+            if s["points"]:
+                feats = '<div class="features">' + "".join(
+                    f'<div class="feat"><span class="n">{j + 1:02d}</span><p>{e(p)}</p></div>'
+                    for j, p in enumerate(s["points"])) + "</div>"
+            blocks.append(
+                f'<section class="sec" id="{s["id"]}"><div class="head">{head}<h2>{e(s["heading"])}</h2>'
+                f'{body}</div>{feats}{quote(s)}</section>')
+
+    tiles = ""
     if stat_items:
-        stats_html = (
-            '  <section class="statband" id="stats">\n'
-            + "\n".join(
-                f'    <div class="stat"><span class="stat-v">{_esc(s["value"])}</span>'
-                f'<span class="stat-l">{_esc(s["label"])}</span></div>'
-                for s in stat_items)
-            + "\n  </section>")
-    else:
-        stats_html = ""
+        tiles = '<section class="tiles" aria-label="Key figures">' + "".join(
+            f'<div class="tile{" accent" if j == 0 else ""}"><span class="v">{e(st["value"])}</span>'
+            f'<span class="l">{e(st["label"])}</span></div>' for j, st in enumerate(stat_items)) + "</section>"
 
-    toc = "\n".join(
-        f'      <a href="#{s["id"]}">{_esc(s["heading"])}</a>' for s in secs)
-    toc_nav = (f'<nav class="toc"><span class="toc-label">Outline</span>'
-               f'<div class="toc-links">{toc}</div></nav>'
-               if secs else "")
+    srcs = [s for s in (sources or []) if isinstance(s, dict) and (s.get("url") or s.get("title"))][:10]
 
-    if secs:
-        cards = []
-        for s in secs:
-            body = (f'\n        <p>{_esc(s["body"])}</p>' if s["body"] else "")
-            if s["kind"] == "timeline" and s["points"]:
-                items = "\n".join(
-                    f'          <li><span class="tl-dot"></span>{_esc(p)}</li>'
-                    for p in s["points"])
-                extra = (f'\n        <ol class="timeline">\n{items}\n        </ol>')
-            elif s["points"]:
-                extra = ("\n        <ul>\n"
-                         + "\n".join(f"          <li>{_esc(p)}</li>"
-                                     for p in s["points"])
-                         + "\n        </ul>")
-            else:
-                extra = ""
-            cards.append(f'    <section class="sec" id="{s["id"]}">'
-                         f'\n      <h2>{_esc(s["heading"])}</h2>'
-                         f"{body}{extra}\n    </section>")
-        body_html = "\n".join(cards)
-    else:
-        body_html = (f'    <section class="sec" id="s1">'
-                     f'\n      <h2>About</h2>\n      <p>{_esc(desc)}</p>'
-                     f'\n    </section>')
+    def host(u):
+        try:
+            return urllib.parse.urlparse(u).netloc.replace("www.", "")
+        except Exception:
+            return ""
+    src_cards = "".join(
+        (f'<a class="src" href="{e(s["url"])}">' if s.get("url") else '<div class="src">')
+        + f'<span class="ico">{e((host(s.get("url", "")) or "?")[:1].upper())}</span><span><span class="t">'
+        f'{e(s.get("title") or s.get("url"))}</span><span class="d">{e(host(s.get("url", "")))}</span></span>'
+        + ("</a>" if s.get("url") else "</div>") for s in srcs)
+    credits = [im for im in [hero] + [s["img"] for s in secs] if im]
+    cred_cards = "".join(
+        f'<a class="src" href="https://commons.wikimedia.org/wiki/File:{urllib.parse.quote(im["file"])}">'
+        f'<span class="ico">{j + 1}</span><span><span class="t">{e(im["file"].rsplit(".", 1)[0].replace("_", " "))}</span>'
+        f'<span class="d">from the Wikipedia article “{e(im["page"])}”</span></span></a>'
+        for j, im in enumerate(credits) if im.get("file"))
+    refs = ""
+    if src_cards or cred_cards:
+        refs = ('<section class="sec" id="sources"><div class="head"><h2>Sources</h2></div>'
+                + (f'<div class="cards">{src_cards}</div>' if src_cards else "")
+                + (f'<h3 class="subhead">Image credits</h3><div class="cards">{cred_cards}</div>' if cred_cards else "")
+                + "</section>")
 
-    srcs = [s for s in (sources or [])
-            if isinstance(s, dict) and (s.get("url") or s.get("title"))][:10]
-    if srcs:
-        def _src_li(s):
-            if s.get("url"):
-                label = _esc(s.get("title") or s["url"])
-                return '      <li><a href="' + _esc(s["url"]) + '">' + label + "</a></li>"
-            return "      <li>" + _esc(s.get("title") or "") + "</li>"
-        items = "\n".join(_src_li(s) for s in srcs)
-        sources_html = (f'  <section class="sec sources" id="sources">'
-                        f'\n    <h2>Sources</h2>\n    <ol>\n{items}\n    </ol>\n  </section>')
-    else:
-        sources_html = ""
+    links = "".join(f'<a href="#{s["id"]}">{e(s["heading"][:28])}</a>' for s in secs[:5])
+    if refs:
+        links += '<a class="cta" href="#sources">Sources</a>'
+    hero_img = (f'<img src="{hero["data"]}" alt="{e(title)}">' if hero else "")
+    hero_credit = ('<span class="credit">Photo · Wikimedia Commons</span>' if hero else "")
+    n_src = len(srcs)
+    hero_eyebrow = ("" if (topic or "").strip().lower() == title.strip().lower()
+                    else f'<span class="eyebrow">{e(topic or "Boots site")}</span>')
+
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{_esc(title)}</title>
+<title>{e(title)}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Geist:wght@400..800&family=Geist+Mono:wght@400;500&display=swap">
 <style>
 :root {{
   --h: {hue};
-  --bg: hsl(var(--h) 25% 7%);
-  --surface: hsl(var(--h) 20% 11%);
-  --line: hsl(var(--h) 30% 24%);
-  --ink: hsl(var(--h) 15% 92%);
-  --muted: hsl(var(--h) 12% 62%);
-  --accent: hsl(var(--h) 85% 62%);
-  --accent-soft: hsl(var(--h) 85% 62% / .14);
+  --bg: hsl(var(--h) 20% 98%); --card: hsl(0 0% 100%); --tint: hsl(var(--h) 60% 95%);
+  --ink: hsl(var(--h) 18% 9%); --muted: hsl(var(--h) 8% 40%); --line: hsl(var(--h) 14% 89%);
+  --accent: hsl(var(--h) 80% 46%); --accent-ink: hsl(var(--h) 80% 34%); --glow: hsl(var(--h) 90% 60% / .18);
+  --panel: hsl(var(--h) 16% 9%); --panel-card: hsl(var(--h) 14% 14%); --panel-ink: hsl(var(--h) 12% 93%);
+  --panel-muted: hsl(var(--h) 8% 66%); --panel-line: hsl(var(--h) 12% 22%); --panel-accent: hsl(var(--h) 90% 66%);
+  --glass: hsl(0 0% 100% / .74);
+  --shadow: 0 1px 2px hsl(var(--h) 30% 20% / .06), 0 8px 28px hsl(var(--h) 30% 20% / .07);
+  --sans: "Geist", ui-sans-serif, system-ui, "Segoe UI", Roboto, sans-serif;
+  --mono: "Geist Mono", ui-monospace, Consolas, monospace;
 }}
+@media (prefers-color-scheme: dark) {{ :root {{
+  --bg: hsl(var(--h) 14% 6%); --card: hsl(var(--h) 12% 10%); --tint: hsl(var(--h) 40% 13%);
+  --ink: hsl(var(--h) 12% 94%); --muted: hsl(var(--h) 8% 66%); --line: hsl(var(--h) 10% 18%);
+  --accent: hsl(var(--h) 85% 52%); --accent-ink: hsl(var(--h) 90% 70%); --glow: hsl(var(--h) 90% 60% / .14);
+  --panel: hsl(var(--h) 14% 10%); --panel-card: hsl(var(--h) 12% 15%); --glass: hsl(var(--h) 14% 10% / .74);
+  --shadow: 0 1px 2px hsl(0 0% 0% / .3), 0 8px 28px hsl(0 0% 0% / .35); color-scheme: dark; }} }}
 * {{ box-sizing: border-box; }}
 html {{ scroll-behavior: smooth; }}
-body {{
-  margin: 0; background: var(--bg); color: var(--ink); line-height: 1.65;
-  font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-}}
-.hero {{
-  position: relative; overflow: hidden; text-align: center;
-  padding: 96px 24px 72px; border-bottom: 1px solid var(--line);
-}}
-.hero::before {{
-  content: ""; position: absolute; inset: -40% -10% auto; height: 160%;
-  background: radial-gradient(ellipse at 50% 0%,
-              hsl(var(--h) 85% 60% / .22), transparent 60%);
-  pointer-events: none;
-}}
-.eyebrow {{
-  display: inline-block; font-size: .8rem; letter-spacing: .18em;
-  text-transform: uppercase; color: var(--accent);
-  border: 1px solid var(--line); border-radius: 999px;
-  padding: 6px 14px; margin-bottom: 22px; background: var(--accent-soft);
-}}
-.hero h1 {{
-  margin: 0 auto 14px; max-width: 18ch; font-size: clamp(2.4rem, 6vw, 4.2rem);
-  line-height: 1.08; letter-spacing: -0.025em; font-weight: 750;
-}}
-.hero p {{
-  margin: 0 auto; max-width: 56ch; color: var(--muted); font-size: 1.05rem;
-}}
-.hero .rule {{
-  width: 72px; height: 3px; margin: 30px auto 0; border-radius: 2px;
-  background: linear-gradient(90deg, var(--accent), transparent);
-}}
-main {{ max-width: 880px; margin: 0 auto; padding: 48px 20px 24px; }}
-.grid {{
-  display: grid; gap: 18px; grid-template-columns: 1fr;
-}}
-@media (min-width: 720px) {{ .grid {{ grid-template-columns: 1fr 1fr; }} }}
-.card {{
-  background: var(--surface); border: 1px solid var(--line);
-  border-radius: 14px; padding: 26px;
-}}
-.card h2 {{
-  margin: 0 0 10px; font-size: 1.12rem; letter-spacing: -0.01em;
-  color: var(--accent);
-}}
-.card p, .card li {{ color: var(--muted); }}
-.card ul {{ margin: 0; padding-left: 18px; }}
-.card li {{ margin-bottom: 6px; }}
-main {{
-  max-width: 720px; margin: 0 auto; padding: 36px 24px 8px;
-}}
-.toc {{
-  position: sticky; top: 0; z-index: 5;
-  display: flex; flex-wrap: wrap; gap: 6px 14px; align-items: center;
-  padding: 12px 0; margin-bottom: 26px;
-  background: color-mix(in srgb, var(--bg) 88%, transparent);
-  backdrop-filter: blur(6px);
-  border-bottom: 1px solid var(--line);
-}}
-.toc-label {{
-  font-size: .72rem; letter-spacing: .16em; text-transform: uppercase;
-  color: var(--muted); margin-right: 6px;
-}}
-.toc-links {{ display: flex; flex-wrap: wrap; gap: 4px 14px; }}
-.toc-links a {{
-  color: var(--muted); text-decoration: none; font-size: .88rem;
-  padding: 2px 0; border-bottom: 1px solid transparent;
-}}
-.toc-links a:hover {{ color: var(--accent); border-bottom-color: var(--accent); }}
-.sec {{
-  margin-bottom: 34px; scroll-margin-top: 64px;
-}}
-.sec h2 {{
-  margin: 0 0 10px; font-size: 1.35rem; letter-spacing: -0.015em;
-  color: var(--ink);
-}}
-.sec p {{ color: var(--muted); margin: 0 0 12px; }}
-.sec ul {{
-  margin: 0; padding: 0; list-style: none;
-  display: grid; gap: 8px;
-}}
-.sec li {{
-  color: var(--muted); font-size: .95rem;
-  padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px;
-  background: var(--surface);
-}}
-.sec li::before {{
-  content: ""; display: inline-block; width: 7px; height: 7px;
-  border-radius: 50%; background: var(--accent);
-  margin-right: 10px; vertical-align: middle;
-}}
-.sources ol {{ padding-left: 20px; }}
-.sources li {{
-  background: none; border: none; padding: 0; margin-bottom: 6px;
-  font-size: .88rem;
-}}
-.sources li::before {{ display: none; }}
-.statband {{
-  display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
-  margin: 8px 0 40px;
-}}
-.stat {{
-  background: var(--surface); border: 1px solid var(--line);
-  border-radius: 14px; padding: 20px; text-align: center;
-}}
-.stat-v {{
-  display: block; font-size: 1.9rem; font-weight: 750; letter-spacing: -0.02em;
-  color: var(--accent);
-}}
-.stat-l {{
-  display: block; margin-top: 4px; font-size: .82rem; color: var(--muted);
-}}
-.timeline {{
-  list-style: none; margin: 14px 0 0; padding: 0 0 0 20px;
-  border-left: 2px solid var(--line);
-}}
-.timeline li {{
-  position: relative; padding: 0 0 14px 14px; color: var(--muted);
-}}
-.timeline li:last-child {{ padding-bottom: 0; }}
-.tl-dot {{
-  position: absolute; left: -26px; top: 6px; width: 10px; height: 10px;
-  border-radius: 50%; background: var(--accent);
-  box-shadow: 0 0 0 4px var(--accent-soft);
-}}
-footer {{
-  text-align: center; padding: 40px 20px 56px; color: var(--muted);
-  font-size: .85rem; border-top: 1px solid var(--line); margin-top: 32px;
-}}
-a {{ color: var(--accent); }}
+body {{ margin: 0; background: var(--bg); color: var(--ink); font-family: var(--sans); font-size: 1rem; line-height: 1.6;
+  -webkit-font-smoothing: antialiased; background-image: radial-gradient(60rem 30rem at 85% -10%, var(--glow), transparent 70%); background-repeat: no-repeat; }}
+.wrap {{ max-width: 1180px; margin: 0 auto; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }}
+a {{ color: var(--accent-ink); text-underline-offset: 3px; }}
+:focus-visible {{ outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 8px; }}
+h1, h2, h3 {{ margin: 0; text-wrap: balance; letter-spacing: -.035em; line-height: 1.05; font-weight: 700; }}
+p {{ margin: 0; }}
+.eyebrow {{ display: inline-flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: .75rem; letter-spacing: .04em; color: var(--accent-ink); }}
+.eyebrow::before {{ content: ""; width: 6px; height: 6px; border-radius: 50%; background: var(--accent); box-shadow: 0 0 0 4px var(--glow); }}
+.chip {{ display: inline-flex; padding: 6px 12px; border-radius: 999px; font-size: .8rem; font-weight: 500; background: var(--glass); backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); color: var(--ink); }}
+.credit {{ font-family: var(--mono); font-size: .7rem; color: hsl(0 0% 100% / .85); background: hsl(0 0% 0% / .35); padding: 3px 8px; border-radius: 6px; }}
+.nav {{ position: sticky; top: 0; z-index: 5; padding-block: 12px; }}
+.nav-in {{ display: flex; align-items: center; gap: 16px; padding: 8px 8px 8px 18px; border-radius: 999px; background: var(--glass); backdrop-filter: blur(16px) saturate(1.4); -webkit-backdrop-filter: blur(16px) saturate(1.4); border: 1px solid var(--line); box-shadow: var(--shadow); }}
+.brand {{ font-weight: 700; letter-spacing: -.02em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }}
+.links {{ display: flex; gap: 4px; margin-left: auto; overflow-x: auto; scrollbar-width: none; min-width: 0; }}
+.links a {{ color: var(--muted); text-decoration: none; font-size: .88rem; padding: 7px 12px; border-radius: 999px; white-space: nowrap; }}
+.links a:hover {{ background: var(--tint); color: var(--ink); }}
+.links a.cta {{ background: var(--ink); color: var(--bg); font-weight: 500; }}
+@media (max-width: 640px) {{ .links a:not(.cta) {{ display: none; }} }}
+.hero {{ position: relative; border-radius: 28px; overflow: hidden; min-height: 520px; display: flex; align-items: flex-end; isolation: isolate; box-shadow: var(--shadow);
+  background: radial-gradient(80% 120% at 80% 0%, hsl(var(--h) 85% 55%), hsl(var(--h) 40% 14%) 70%); }}
+.hero img {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -2; }}
+.hero::after {{ content: ""; position: absolute; inset: 0; z-index: -1; background: linear-gradient(180deg, hsl(var(--h) 30% 5% / .05) 20%, hsl(var(--h) 30% 5% / .8) 100%); }}
+.hero-in {{ width: 100%; padding: clamp(24px, 5vw, 56px); display: grid; gap: 16px; color: #fff; }}
+.hero h1 {{ font-size: clamp(2.6rem, 8vw, 6.4rem); font-weight: 800; letter-spacing: -.05em; line-height: .94; max-width: 16ch; }}
+.hero p {{ max-width: 52ch; font-size: clamp(1.05rem, 1.6vw, 1.22rem); line-height: 1.5; color: hsl(0 0% 100% / .88); }}
+.hero .eyebrow {{ color: hsl(0 0% 100% / .9); }}
+.hero .credit {{ justify-self: end; }}
+.tiles {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 150px), 1fr)); gap: 14px; padding-block: 14px 0; }}
+.tile {{ background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 20px; display: grid; gap: 12px; align-content: space-between; min-height: 130px; box-shadow: var(--shadow); min-width: 0; }}
+.tile .v {{ font-size: clamp(1.9rem, 3.6vw, 2.8rem); font-weight: 700; letter-spacing: -.05em; line-height: 1; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }}
+.tile .l {{ font-size: .9rem; color: var(--muted); line-height: 1.4; }}
+.tile.accent {{ background: var(--accent); border-color: transparent; color: #fff; }}
+.tile.accent .l {{ color: hsl(0 0% 100% / .88); }}
+.sec {{ padding-block: clamp(52px, 8vw, 92px) 0; scroll-margin-top: 90px; }}
+.sec h2 {{ font-size: clamp(1.9rem, 4.2vw, 3rem); }}
+.lede {{ font-size: 1.1rem; color: var(--muted); max-width: 60ch; }}
+.text, .head {{ display: grid; gap: 16px; min-width: 0; }}
+.head {{ max-width: 780px; }}
+.split {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: clamp(28px, 5vw, 64px); align-items: center; }}
+.split.flip > .text {{ order: 2; }}
+.pic {{ margin: 0; position: relative; border-radius: 28px; overflow: hidden; box-shadow: var(--shadow); background: var(--tint); min-width: 0; }}
+.pic img {{ display: block; width: 100%; aspect-ratio: 4 / 3; object-fit: cover; transition: transform .8s cubic-bezier(.2,.7,.2,1); }}
+.pic:hover img {{ transform: scale(1.03); }}
+.pic figcaption {{ position: absolute; left: 14px; right: 14px; bottom: 14px; display: flex; justify-content: space-between; align-items: end; gap: 10px; flex-wrap: wrap; }}
+.ticks {{ list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 8px; }}
+.ticks li {{ padding-left: 26px; position: relative; color: var(--ink); }}
+.ticks li::before {{ content: ""; position: absolute; left: 0; top: .45em; width: 14px; height: 14px; border-radius: 50%; background: var(--tint); box-shadow: inset 0 0 0 4px var(--accent); }}
+@media (max-width: 820px) {{ .split {{ grid-template-columns: minmax(0, 1fr); }} .split.flip > .text {{ order: 0; }} }}
+.features {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 240px), 1fr)); gap: 14px; margin-top: 28px; }}
+.feat {{ background: var(--card); border: 1px solid var(--line); border-radius: 20px; padding: 22px; display: grid; gap: 12px; align-content: start; box-shadow: var(--shadow); min-width: 0; }}
+.feat .n {{ width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center; background: var(--tint); color: var(--accent-ink); font-family: var(--mono); font-size: .8rem; font-weight: 500; }}
+.feat p {{ font-size: 1rem; }}
+.quote {{ margin-top: 18px; border-radius: 20px; padding: clamp(22px, 4vw, 38px); background: var(--tint); }}
+.quote q {{ font-size: clamp(1.3rem, 2.8vw, 2rem); font-weight: 600; letter-spacing: -.03em; line-height: 1.22; }}
+.panel {{ background: var(--panel); color: var(--panel-ink); border-radius: 28px; padding: clamp(24px, 5vw, 56px); display: grid; gap: 30px; overflow: hidden; position: relative; isolation: isolate; }}
+.panel::before {{ content: ""; position: absolute; inset: auto -20% -60% 30%; height: 120%; z-index: -1; background: radial-gradient(closest-side, hsl(var(--h) 90% 55% / .22), transparent); }}
+.panel .eyebrow {{ color: var(--panel-accent); }}
+.panel .lede {{ color: var(--panel-muted); }}
+.panel-top {{ display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, .9fr); gap: clamp(24px, 4vw, 56px); align-items: center; }}
+.panel-top.solo {{ grid-template-columns: minmax(0, 1fr); }}
+.panel .pic {{ box-shadow: none; background: var(--panel-card); }}
+.years {{ list-style: none; margin: 0; padding: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 170px), 1fr)); gap: 12px; }}
+.years li {{ background: var(--panel-card); border: 1px solid var(--panel-line); border-radius: 12px; padding: 16px; display: grid; gap: 6px; align-content: start; min-width: 0; }}
+.years b {{ font-size: 1.5rem; letter-spacing: -.04em; font-variant-numeric: tabular-nums; color: var(--panel-accent); line-height: 1.05; overflow-wrap: anywhere; }}
+.years span {{ font-size: .9rem; color: var(--panel-muted); line-height: 1.4; }}
+.years li.now {{ background: hsl(var(--h) 80% 46%); border-color: transparent; }}
+.years li.now b, .years li.now span {{ color: #fff; }}
+@media (max-width: 900px) {{ .panel-top {{ grid-template-columns: minmax(0, 1fr); }} }}
+.wide {{ position: relative; border-radius: 28px; overflow: hidden; min-height: 440px; display: flex; align-items: flex-end; box-shadow: var(--shadow); background: var(--tint); isolation: isolate; }}
+.wide img {{ position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; z-index: -1; }}
+.wide .credit {{ position: absolute; right: 14px; top: 14px; }}
+.over {{ margin: clamp(14px, 3vw, 28px); max-width: 540px; padding: 26px; border-radius: 20px; background: var(--glass); backdrop-filter: blur(18px) saturate(1.3); -webkit-backdrop-filter: blur(18px) saturate(1.3); display: grid; gap: 12px; }}
+.over h2 {{ font-size: clamp(1.7rem, 3.4vw, 2.5rem); }}
+.over p {{ color: var(--muted); }}
+.cards {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 260px), 1fr)); gap: 12px; margin-top: 22px; }}
+.src {{ display: grid; grid-template-columns: 40px minmax(0, 1fr); gap: 12px; align-items: center; padding: 14px; border-radius: 12px; background: var(--card); border: 1px solid var(--line); text-decoration: none; color: var(--ink); }}
+a.src:hover {{ border-color: var(--accent); }}
+.src .ico {{ width: 40px; height: 40px; border-radius: 10px; background: var(--tint); color: var(--accent-ink); display: grid; place-items: center; font-weight: 700; font-size: .9rem; }}
+.src .t {{ display: block; font-weight: 600; font-size: .92rem; line-height: 1.3; overflow-wrap: anywhere; }}
+.src .d {{ display: block; font-family: var(--mono); font-size: .72rem; color: var(--muted); overflow-wrap: anywhere; }}
+.subhead {{ font-size: 1.1rem; letter-spacing: -.02em; margin-top: 34px; }}
+footer {{ margin-top: clamp(52px, 8vw, 92px); border-top: 1px solid var(--line); }}
+footer .wrap {{ padding-block: 22px 40px; display: flex; justify-content: space-between; gap: 8px 24px; flex-wrap: wrap; font-size: .82rem; color: var(--muted); }}
+.dot {{ display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: hsl(145 60% 45%); margin-right: 8px; vertical-align: middle; }}
+@media (prefers-reduced-motion: reduce) {{ * {{ transition: none !important; animation: none !important; }} html {{ scroll-behavior: auto; }} }}
+@media (prefers-reduced-motion: no-preference) {{ .hero img {{ animation: settle 1.8s cubic-bezier(.2,.7,.2,1) both; }} @keyframes settle {{ from {{ transform: scale(1.06); }} to {{ transform: scale(1); }} }} }}
 </style>
 </head>
 <body>
-  <header class="hero">
-    <span class="eyebrow">{_esc(topic or "Boots site")}</span>
-    <h1>{_esc(title)}</h1>
-    <p>{_esc(desc)}</p>
-    <div class="rule"></div>
-  </header>
-  <main>
-{toc_nav}
-{stats_html}
-{body_html}
-{sources_html}
-  </main>
-  <footer>Generated by Boots &middot; Raspberry Pi &middot; {_esc(_time.strftime('%Y-%m-%d %H:%M'))}</footer>
+<div class="wrap nav"><nav class="nav-in" aria-label="Sections"><span class="brand">{e(title)}</span><div class="links">{links}</div></nav></div>
+<main class="wrap">
+<header class="hero">{hero_img}<div class="hero-in">{hero_eyebrow}<h1>{e(title)}</h1><p>{e(desc)}</p>{hero_credit}</div></header>
+{tiles}
+{"".join(blocks)}
+{refs}
+</main>
+<footer><div class="wrap"><span><span class="dot"></span>Built by Boots on a Raspberry Pi{" · researched from " + str(n_src) + " source" + ("s" if n_src != 1 else "") if n_src else ""}</span><span>{e(_time.strftime('%Y-%m-%d %H:%M'))}</span></div></footer>
 </body>
 </html>"""
 
@@ -941,7 +1045,7 @@ def _verify_site(url: str, html: str) -> str:
 
 def _write_website(topic: str, title: str, description: str,
                    hue=None, publish=False, sections=None, sources=None,
-                   stats=None) -> str:
+                   stats=None, hero_image=None) -> str:
     """Generate an adaptive-theme page, save to SITES_DIR, VERIFY the render,
     optionally publish. Content is LLM-authored (sections/stats/sources); the
     tool renders, serves, and checks. Returns a spoken message with the LAN
@@ -959,7 +1063,9 @@ def _write_website(topic: str, title: str, description: str,
     path = os.path.join(SITES_DIR, slug + ".html")
 
     html = _render_site(title, topic, description, h,
-                        sections=sections, sources=sources, stats=stats)
+                        sections=sections, sources=sources, stats=stats,
+                        hero_image=hero_image)
+    n_img = html.count('src="data:image/')
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(html)
@@ -974,7 +1080,9 @@ def _write_website(topic: str, title: str, description: str,
                  if isinstance(s, dict) and ((s.get("heading") or "").strip()
                                              or (s.get("body") or "").strip())])
     msg = (f"Done! I built a website about {topic or title} with {n_sec} "
-           f"{'section' if n_sec == 1 else 'sections'} and saved it. "
+           f"{'section' if n_sec == 1 else 'sections'}"
+           + (f" and {n_img} photo{'s' if n_img != 1 else ''}" if n_img else "")
+           + " and saved it. "
            f"You can open it in your browser at {url} "
            f"({verify}).")
     if publish:
