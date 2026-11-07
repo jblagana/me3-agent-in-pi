@@ -154,6 +154,16 @@ def _speakable(text: str) -> str:
 # ME3_ASR_LANGUAGE (e.g. "en") pins the language; unset = Whisper auto-detect
 # (keeps Taglish/Tagalog working; it made no speed difference in the test).
 ASR_LANGUAGE = os.environ.get("ME3_ASR_LANGUAGE", "").strip()
+# EARLY transcription (2026-11-07): the VAD waits stop_secs (0.6 s) of silence
+# before it ends the turn, and only THEN did we upload the audio. Now, after
+# EARLY_ASR_SILENCE_S of quiet (frame RMS below EARLY_ASR_VOICE_RMS) we start
+# transcribing the audio so far in the background; any voice after that
+# (RMS above EARLY_ASR_RESUME_RMS) throws it away. When the VAD does end the
+# turn, a still-valid early transcript is used instead of a fresh upload.
+EARLY_ASR = os.environ.get("ME3_EARLY_ASR", "1") != "0"
+EARLY_ASR_SILENCE_S = float(os.environ.get("ME3_EARLY_ASR_SILENCE_S", "0.2"))
+EARLY_ASR_VOICE_RMS = float(os.environ.get("ME3_EARLY_ASR_VOICE_RMS", "0.015"))
+EARLY_ASR_RESUME_RMS = float(os.environ.get("ME3_EARLY_ASR_RESUME_RMS", "0.009"))
 _GROQ = {"session": None, "warm_ts": 0.0}
 
 
@@ -256,6 +266,9 @@ class Qwen2AudioSTTService(SegmentedSTTService):
             timeout=httpx.Timeout(60.0, connect=10.0),
             headers={"Authorization": f"Bearer {DGX3_API_KEY}"},
         )
+        self._early = None            # {"task", "t0", "valid"} for the current utterance
+        self._quiet_since = None      # monotonic time the current quiet stretch began
+        self._heard_voice = False     # voice seen since the user started speaking
         logger.info(f"[asr-dgx3] Qwen2-Audio ASR ready ({ASR_BASE_URL})")
 
     # FIX (LLM never receives transcript): pipecat 1.12's SegmentedSTTService
@@ -358,6 +371,46 @@ class Qwen2AudioSTTService(SegmentedSTTService):
         return (data.get("choices", [{}])[0].get("message", {})
                 .get("content") or "").strip()
 
+    async def _handle_user_started_speaking(self, frame):
+        self._early, self._quiet_since, self._heard_voice = None, None, False
+        await super()._handle_user_started_speaking(frame)
+
+    async def process_audio_frame(self, frame, direction):
+        await super().process_audio_frame(frame, direction)
+        if not (EARLY_ASR and ASR_PROVIDER == "groq" and self._user_speaking):
+            return
+        try:
+            a = np.frombuffer(frame.audio, dtype=np.int16).astype(np.float32) / 32768.0
+            rms = float(np.sqrt(np.mean(a * a))) if a.size else 0.0
+        except Exception:
+            return
+        now = time.monotonic()
+        e = self._early
+        if rms >= EARLY_ASR_VOICE_RMS:
+            self._heard_voice = True
+        if e is not None and e["valid"] and rms >= EARLY_ASR_RESUME_RMS:
+            e["valid"] = False                     # the user kept talking: discard
+            self._quiet_since = None
+            return
+        if rms >= EARLY_ASR_VOICE_RMS:
+            self._quiet_since = None
+            return
+        if self._quiet_since is None:
+            self._quiet_since = now
+        if (self._heard_voice and (e is None or not e["valid"])
+                and now - self._quiet_since >= EARLY_ASR_SILENCE_S):
+            pcm = bytes(self._audio_buffer) + bytes(int(self.sample_rate * 0.3) * 2)
+            from pipecat.audio.utils import pcm_to_wav
+            b64 = base64.b64encode(pcm_to_wav(pcm, self.sample_rate)).decode("ascii")
+            task = asyncio.ensure_future(asyncio.to_thread(self._transcribe_sync, b64))
+            # a discarded early attempt's error is irrelevant: consume it quietly
+            task.add_done_callback(lambda t: t.cancelled() or t.exception())
+            self._early = {"task": task, "t0": now, "valid": True}
+
+    def _take_early(self):
+        e, self._early = self._early, None
+        return e if (e is not None and e["valid"]) else None
+
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
         """pipecat SegmentedSTTService hook. `audio` is the VAD-delimited
         segment -- a 16 kHz 16-bit mono WAV container by default
@@ -382,7 +435,19 @@ class Qwen2AudioSTTService(SegmentedSTTService):
             return
         wav_b64 = base64.b64encode(wav_bytes).decode("ascii")
         try:
-            text = await asyncio.to_thread(self._transcribe_sync, wav_b64)
+            early = self._take_early()
+            text = None
+            if early is not None:
+                try:
+                    t_wait = time.monotonic()
+                    text = await asyncio.wait_for(asyncio.shield(early["task"]), timeout=10)
+                    logger.info(f"[asr] early transcript used: started {t_wait - early['t0']:.2f}s "
+                                f"before the turn ended, waited {time.monotonic() - t_wait:.2f}s more")
+                except Exception as _e:
+                    logger.info(f"[asr] early transcript failed ({_e!r}); normal upload")
+                    text = None
+            if text is None:
+                text = await asyncio.to_thread(self._transcribe_sync, wav_b64)
             text = _clean_transcript(text)
             # No words at all (".", "…" from a noise burst) -> not a turn
             # (2026-11-07: "." was sent to the LLM as a user message).
