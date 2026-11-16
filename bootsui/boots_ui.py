@@ -169,7 +169,21 @@ def _free_secs(slot):
     Capped at 24 h. (V3 keys still work.)"""
     if slot in V3_TIMER_SEC:
         return V3_TIMER_SEC[slot]
-    t = _words_to_digits(slot)
+    raw = str(slot or "").lower()
+    # Phrases the number scan below misread (2026-11-16): "quarter of an hour"
+    # was 1 h, "half a minute" 1 min, "1:30" 31 s, "one and a half hours" 1 s.
+    raw = re.sub(r"\bthree\s+quarters\s+(?:of\s+)?(?:an?\s+)?hour\b", "45 minutes", raw)
+    raw = re.sub(r"\b(?:an?\s+)?quarter\s+(?:of\s+)?(?:an?\s+)?hour\b", "15 minutes", raw)
+    raw = re.sub(r"\bhalf\s+(?:of\s+)?an?\s+minute\b", "30 seconds", raw)
+    clock = re.fullmatch(r"\s*(\d+):(\d{1,2})(?::(\d{1,2}))?\s*", raw)
+    if clock:                               # "1:30" = m:ss, "1:05:00" = h:mm:ss
+        a, b, c = (int(x) if x else None for x in clock.groups())
+        secs = a * 3600 + b * 60 + c if c is not None else a * 60 + b
+        return min(secs, 24 * 3600)
+    t = _words_to_digits(raw)
+    _half = lambda m: f"{float(m.group(1)) + 0.5} {m.group(2)}"
+    t = re.sub(r"(\d+(?:\.\d+)?)\s+and\s+(?:a\s+|1\s+)?half\s+(hours?|hrs?|minutes?|mins?)", _half, t)
+    t = re.sub(r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|minutes?|mins?)\s+and\s+(?:a\s+|1\s+)?half\b", _half, t)
     total, found = 0.0, False
     for n, unit in re.findall(
             r"(\d+(?:\.\d+)?)\s*(hours?|hrs?|h\b|minutes?|mins?|m\b|seconds?|secs?|s\b)?", t):
@@ -190,7 +204,28 @@ def _free_mark(slot):
     -> 'HH:MM' (None = unreadable). (V3 keys still work.)"""
     if slot in V3_ALARM_MARK:
         return V3_ALARM_MARK[slot]
-    t = re.sub(r"(\d)\s*\.\s*(\d)", r"\1:\2", _words_to_digits(slot))   # 7.30 -> 7:30
+    raw = str(slot or "").lower()
+    # Relative times (2026-11-16): "in 30 minutes" / "an hour from now" were
+    # unreadable. Needs a duration unit, so "7 in the morning" stays absolute.
+    if re.search(r"\bin\b|from now|later", raw) and re.search(r"\b(hours?|hrs?|minutes?|mins?)\b", raw):
+        secs = _free_secs(re.sub(r"\b(in|from now|later)\b", " ", raw))
+        if secs:
+            lt = time.localtime(time.time() + secs)
+            return f"{lt.tm_hour:02d}:{lt.tm_min:02d}"
+    t = _words_to_digits(raw)
+    # "half past seven" / "quarter to eight" / "ten past 6" were read as 7:00
+    # and 8:00 (the minutes were dropped).
+    rel = re.search(r"\b(half|quarter|\d{1,2})\s+(past|after|to|before|till?)\s+(\d{1,2})\b", t)
+    if rel:
+        mins = {"half": 30, "quarter": 15}.get(rel.group(1)) or int(rel.group(1))
+        h = int(rel.group(3))
+        if rel.group(2) in ("past", "after"):
+            hh, mm_ = h, mins
+        else:
+            hh, mm_ = (h - 1) % 24, 60 - mins
+        if mm_ < 60:
+            t = t[:rel.start()] + f"{hh}:{mm_:02d}" + t[rel.end():]
+    t = re.sub(r"(\d)\s*\.\s*(\d)", r"\1:\2", t)                         # 7.30 -> 7:30
     t = t.upper().replace(".", "")                                        # p.m. -> PM
     t = re.sub(r"\b([AP])\s+M\b", r"\1M", t)                            # "P M" -> PM
     if "NOON" in t:
@@ -207,6 +242,14 @@ def _free_mark(slot):
         h += 12
     if ap == "AM" and h == 12:
         h = 0
+    if ap is None:                    # "7 in the morning" / "8 tonight" (was 08:00)
+        if re.search(r"\bMORNING\b", t) and h == 12:
+            h = 0
+        elif re.search(r"\b(AFTERNOON|EVENING|NIGHT|TONIGHT)\b", t):
+            if h == 12 and re.search(r"\bNIGHT\b", t):
+                h = 0
+            elif h < 12:
+                h += 12
     if h > 23 or mm > 59:
         return None
     return f"{h:02d}:{mm:02d}"
@@ -225,8 +268,17 @@ def _free_deg(slot):
     (None = unreadable). (V3 keys still work.)"""
     if slot in V3_DEG:
         return V3_DEG[slot]
-    m = re.search(r"(\d+)", _words_to_digits(slot))
-    return max(TEMP_MIN, min(TEMP_MAX, int(m.group(1)))) if m else None
+    t = _words_to_digits(slot).lower()
+    m = re.search(r"(\d+(?:\.\d+)?)", t)
+    if not m:
+        return None
+    v = float(m.group(1))
+    # Fahrenheit (2026-11-16): "72 fahrenheit" clamped to 30 °C. Explicit F, or
+    # a bare 50-95 (no room is set to 72 °C), is converted; explicit C is kept.
+    celsius = re.search(r"\bc\b|celsius|centigrade|°c", t)
+    if re.search(r"\bf\b|fahrenheit|°f", t) or (not celsius and 50 <= v <= 95):
+        v = (v - 32) * 5 / 9
+    return max(TEMP_MIN, min(TEMP_MAX, int(v + 0.5)))
 
 
 def _temp_deg(slot: str):
@@ -284,39 +336,78 @@ yellowgreen""".split()) | {"warm", "amber"}
 def _lamp_color(slot: str):
     """Colour name -> lamp colour (None = unknown). 'Light Blue' -> 'lightblue',
     'warm white' -> 'warm'."""
-    c = re.sub(r"[^a-z]", "", str(slot or "").lower())
-    if c in ("warmwhite", "softwhite"):
-        c = "warm"
-    return c if c in _CSS_COLORS else None
+    s = str(slot or "").strip().lower()
+    if re.fullmatch(r"#([0-9a-f]{3}|[0-9a-f]{6})", s):
+        return s                 # '#' required: 'facade' / 'bad' are hex letters
+    c = re.sub(r"[^a-z]", "", s)
+    # 'blue light' / 'red colour' / 'pinkish' (2026-11-16) were refused.
+    for cand in (c, re.sub(r"(colou?r|lights?)$", "", c)):
+        for cc in (cand, re.sub(r"ish$", "", cand)):
+            if cc in _COLOR_ALIASES:
+                return _COLOR_ALIASES[cc]
+            if cc in _CSS_COLORS:
+                return cc
+    return None
+
+
+# Everyday colour words that are not CSS names (2026-11-16: "cool white",
+# "daylight", "mint", "rose" were refused). Values are CSS colours; the UI
+# paints any CSS colour, so the lamp shows the actual shade.
+_COLOR_ALIASES = {
+    "warmwhite": "warm", "softwhite": "warm", "candlelight": "warm",
+    "coolwhite": "white", "coldwhite": "white", "daylight": "white",
+    "brightwhite": "white", "purewhite": "white", "rose": "#ff66a8",
+    "mint": "#98ffb3", "lilac": "#c8a2c8", "peach": "peachpuff", "cream": "#fff3c4",
+    "babyblue": "#89cff0", "sky": "skyblue", "neongreen": "#39ff14",
+    "emerald": "#2ecc71", "sapphire": "#2a52be", "ruby": "#e0115f",
+    "amethyst": "#9966cc", "sunset": "#ff7e5f", "ocean": "#1ca3ec",
+    "pastelpink": "#ffb7ce", "pastelblue": "#aec6cf", "pastelgreen": "#b2f2bb",
+}
+
+
+def _clock12(mark):
+    """'07:05' -> '7:05 AM' (None if not HH:MM)."""
+    if not mark or not re.fullmatch(r"\d{2}:\d{2}", str(mark)):
+        return None
+    h, mm = (int(x) for x in str(mark).split(":"))
+    return f"{h % 12 or 12}:{mm:02d} {'AM' if h < 12 else 'PM'}"
 
 
 def _timer_word(slot):
     """V3 TIMER slot -> done-card display ('0:10' / '0:30' / '1 min')."""
-    s = V3_TIMER_SEC.get(slot, 0)
+    # Any duration now (2026-11-16), from the applied seconds or the slot; it
+    # only knew the 3 V3 values, so "5 minutes" showed as raw words.
+    s = _free_secs(slot)
     if not s:
         return None
-    return f"0:{s:02d}" if s < 60 else f"{s // 60} min"
+    if s < 60:
+        return f"0:{s:02d}"
+    if s < 3600:
+        return f"{s // 60} min" if s % 60 == 0 else f"{s // 60}:{s % 60:02d}"
+    h, m = divmod(s // 60, 60)
+    return f"{h} h" if not m else f"{h} h {m:02d} min"
 
 
 def _alarm_word(slot):
     """V3 ALARM slot -> done-card display ('6:00 AM' / '8:00 AM' / '9:00 PM')."""
-    m = V3_ALARM_MARK.get(slot)
-    if not m:
+    # Any time now, and minutes zero-padded (it read "6:0 AM"). A relative
+    # slot ("in 30 minutes") without an applied time stays as words:
+    # re-parsing it on every poll would drift.
+    if re.search(r"\bin\b|from now|later", str(slot or "").lower()):
         return None
-    h, mm = (int(x) for x in m.split(":"))
-    return f"{h % 12 or 12}:{mm} {'AM' if h < 12 else 'PM'}"
+    return _clock12(_free_mark(slot))
 
 
 def _temp_word(slot):
     """V3 TEMPERATURE slot -> '22°' (done-card display)."""
-    d = V3_DEG.get(slot)
+    d = _free_deg(slot)
     return f"{d}\u00b0" if d is not None else None
 
 
 def _bright_word(slot):
     """V3 BRIGHTNESS slot -> '60%' (done-card display)."""
-    p = V3_PCT.get(slot)
-    return f"{p}%" if p is not None else None
+    p = _free_pct(slot)
+    return (f"{p}%" if p else "off") if p is not None else None
 
 
 DEV = {
@@ -996,9 +1087,12 @@ def apply_fire(f: dict) -> str:
             v = int(slot)
         except (TypeError, ValueError):
             m_ = re.search(r"-?\d+", _words_to_digits(slot))
-            if not m_:
-                return "invalid"
-            v = int(m_.group(0))
+            if m_:
+                v = int(m_.group(0))
+            else:                       # "max" / "half" / "full" (2026-11-16)
+                v = _free_pct(slot)
+                if v is None:
+                    return "invalid"
         v = max(VOL_MIN, min(100, v))   # never mute Boots' own voice (see VOL_MIN)
         DEV["music"]["vol"] = v
         _apply_alsa_volume(v)
@@ -1082,7 +1176,13 @@ def apply_fire(f: dict) -> str:
         p = _bright_pct(slot)
         if p is None:
             return "invalid"
-        L = DEV["lights"]; L["on"] = True; L["level"] = p
+        L = DEV["lights"]
+        if p == 0:
+            # "brightness 0" / "off" turns the lamp off and keeps the last
+            # level for the next "lights on" (it showed "on · 0%").
+            L["on"] = False
+        else:
+            L["on"] = True; L["level"] = p
         speak_clips([_clip_name(cmd, slot)])
         return f"fired:{p}"
     elif cmd == "COLOR":
@@ -1090,6 +1190,10 @@ def apply_fire(f: dict) -> str:
         if not c:
             return "invalid"
         L = DEV["lights"]; L["color"] = c; L["on"] = True
+        # Human name for the card ("sky blue", not "skyblue" / "#89cff0").
+        lab = re.sub(r"\s+", " ", str(slot).strip().lower())
+        lab = re.sub(r"(?:[\s-]*ish|\s+(?:colou?r|lights?))$", "", lab)   # "pinkish" -> "pink"
+        L["label"] = lab[:24]
         speak_clips([_clip_name(cmd, slot)])
         return f"fired:{c}"
     # --- temperature ---
@@ -1430,9 +1534,11 @@ def ui_state_json() -> dict:
         # done-card display formats (V3: '0:30' / '8:00 AM' / '22°' / '60%')
         disp = {"TIMER": _timer_word, "ALARM": _alarm_word,
                 "TEMPERATURE": _temp_word,
-                "BRIGHTNESS": _bright_word}.get(last_good.get("cmd"))
+                "BRIGHTNESS": _bright_word,
+                "SET_VOLUME": lambda s: (f"vol {_free_pct(s)}" if _free_pct(s) is not None else None),
+                }.get(last_good.get("cmd"))
         if disp:
-            w = disp(last_good.get("slot") or "")
+            w = disp(last_good.get("applied") or last_good.get("slot") or "")
             if w:
                 ulast["slot"] = w
         if last_good.get("slot_margin") is not None:
@@ -1442,9 +1548,10 @@ def ui_state_json() -> dict:
     t = dev["timer"]
     if t and not t["done"]:
         timer = {"remaining": t["remaining"],
-                 "frac_left": round(1.0 - t["frac"], 4), "done": False}
+                 "frac_left": round(1.0 - t["frac"], 4), "done": False,
+                 "secs": t.get("secs")}      # total length, for "of 1 min 30 s"
     elif t:
-        timer = {"remaining": 0, "frac_left": 0.0, "done": True}
+        timer = {"remaining": 0, "frac_left": 0.0, "done": True, "secs": t.get("secs")}
     else:
         timer = None
     p = dev["temp"]
@@ -1454,9 +1561,13 @@ def ui_state_json() -> dict:
         "mode": umode,
         "last": ulast,
         "lamp": {"on": dev["lights"]["on"], "level": dev["lights"]["level"],
-                 "color": dev["lights"]["color"]},
+                 "color": dev["lights"]["color"],
+                 "label": dev["lights"].get("label")},
         "thermo": p["current"],
         "tmode": tmode,
+        "temp": dict(p),                      # {current, target, mode} for the 2026-11-16 UI
+        "acts": list(STATE.get("acts", [])),  # smart-home activity feed (see /fire)
+        "now": time.time(),
         "timer": timer,
         "alarms": dev["alarms"],
         "music": _ui_music(dev),
@@ -2118,6 +2229,13 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/ui_state":
             self._send(200, json.dumps(ui_state_json()).encode(),
                        "application/json")
+        elif self.path == "/classic":
+            # The previous dashboard (archived 2026-11-16), kept as a fallback.
+            p = Path(__file__).with_name("archive") / "boots_ui_v2.html"
+            if p.is_file():
+                self._send(200, p.read_bytes(), "text/html; charset=utf-8")
+            else:
+                self._send(404, b"classic UI not found", "text/plain")
         elif self.path.startswith("/site/"):
             # Serve a generated website (write_website tool) from the sites/ dir.
             name = self.path[len("/site/"):]
@@ -2157,9 +2275,23 @@ class Handler(BaseHTTPRequestHandler):
                 if outcome in ("gated", "invalid"):   # not applied
                     STATE["mode"] = "reject"  # red RETRY card, decays in 8 s
                 else:
+                    # The value the device ACTUALLY applied (seconds, HH:MM,
+                    # degrees, percent): the done card shows this, so "in 30
+                    # minutes" or "72 fahrenheit" display as 4:42 PM / 22°.
+                    if outcome.startswith("fired:"):
+                        obj["applied"] = outcome[6:]
                     STATE["last_good"] = obj
                     STATE["mode"] = "idle"
                 STATE["mode_ts"] = time.time()
+                # Smart-home activity feed (2026-11-16 UI): every command the
+                # devices received, with what was applied and who sent it
+                # ("tap" from the UI's controls, else voice/chat via the tools).
+                if obj.get("cmd") and outcome not in ("debounced",):
+                    acts = STATE.setdefault("acts", [])
+                    acts.append({"ts": time.time(), "cmd": obj.get("cmd"),
+                                 "slot": obj.get("slot"), "applied": obj.get("applied"),
+                                 "outcome": outcome, "src": obj.get("src") or "voice"})
+                    del acts[:-40]
             self._send(200, f"ok:{outcome}".encode(), "text/plain")
         elif self.path == "/me3":
             # Live conversation state from the ME3 voice agent:

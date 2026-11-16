@@ -60,15 +60,15 @@ TOOL_SPECS = [
                             {"level": {"type": "integer", "minimum": 0, "maximum": 100}}),
     ("boots_lights",        "Turn the lights on or off.",
                             {"action": {"type": "string", "enum": ["on", "off"]}}),
-    ("boots_set_bright",    "Set the light brightness to any level from 0 to 100 percent.",
+    ("boots_set_bright",    "Set the light brightness to any level from 0 to 100 percent (0 turns the lights off).",
                             {"level": {"type": "string"}}),
-    ("boots_set_color",     "Set the light color (any color name).",
+    ("boots_set_color",     "Set the light color: any color name, e.g. teal, warm white, sky blue, mint.",
                             {"color": {"type": "string"}}),
-    ("boots_set_timer",     "Set a countdown timer for any duration.",
+    ("boots_set_timer",     "Set a countdown timer for any duration, e.g. '5 minutes', 'an hour and a half', '1:30'.",
                             {"duration": {"type": "string"}}),
-    ("boots_set_alarm",     "Set an alarm for any time of day.",
+    ("boots_set_alarm",     "Set an alarm for a clock time ('7:30 AM', 'half past six') or a relative time ('in 20 minutes').",
                             {"time": {"type": "string"}}),
-    ("boots_set_temperature", "Set the room temperature to any target.",
+    ("boots_set_temperature", "Set the room temperature (16-30 Celsius; Fahrenheit is converted).",
                             {"degrees": {"type": "string"}}),
     ("boots_set_reminder",  "Set a reminder.",
                             {"text": {"type": "string"}}),
@@ -101,6 +101,9 @@ TOOL_TO_FIRE = {
 
 import re as _re
 
+# The Boots UI thermostat's range (bootsui/boots_ui.py TEMP_MIN, TEMP_MAX).
+TEMP_LIMITS = (16, 30)
+
 
 def _pct(slot):
     '''free-form -> int 0-100 (first number, sign included), clamped. None if no number.'''
@@ -127,7 +130,10 @@ def _confirm(cmd, slot, requested=None):
             return f"Alarm set for {h % 12 or 12}:{mm:02d} {'AM' if h < 12 else 'PM'}."
         if cmd == 'TEMPERATURE':
             d, r = _num(slot), _num(requested)
-            if d is not None and r is not None and r != d:
+            # Only at the thermostat's limits (boots_ui TEMP_MIN/TEMP_MAX):
+            # "72 fahrenheit" -> 22 differs from 72 but is a conversion, not
+            # a clamp (2026-11-16).
+            if d is not None and r is not None and r != d and d in TEMP_LIMITS:
                 return f"Temperature set to {d} degrees, the {'highest' if r > d else 'lowest'} it goes."
         # Music: natural confirmations (were "PLAY_MUSIC done." etc).
         if cmd == 'PLAY_MUSIC':
@@ -152,6 +158,8 @@ def _confirm(cmd, slot, requested=None):
                 return f'Volume set to {v} percent, the maximum.'
         if cmd == 'BRIGHTNESS':
             p = _pct(slot)
+            if p == 0:                       # the device turns the lamp off at 0
+                return 'Lights off.'
             return f'Brightness set to {p} percent.' if p is not None else 'Brightness updated.'
         if cmd == 'TEMPERATURE':
             d = _num(slot)
@@ -165,7 +173,11 @@ def _confirm(cmd, slot, requested=None):
             v = max(0, min(100, v)) if v is not None else None
             return f'Volume set to {v} percent.' if v is not None else 'Volume updated.'
         if cmd == 'COLOR':
-            c = (slot or '').strip()
+            # Say the user's words ("sky blue"), not the applied CSS value
+            # ("skyblue" / "#89cff0"); the server only accepts known colours.
+            c = (requested or slot or '').strip()
+            if c.startswith('#'):
+                return 'Light color changed.'
             return f'Light color set to {c}.' if c else 'Light color updated.'
         if cmd == 'TIMER':
             c = (slot or '').strip()
