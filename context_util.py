@@ -79,3 +79,76 @@ def shorten_old(msgs, keep_full=KEEP_FULL, note_prefix=""):
                         fn["arguments"] = "{}"
                     n += 1
     return n
+
+
+# ---------------------------------------------------------------------------
+# Stray </think> (2026-11-18). With reasoning off, Qwen3.8 sometimes writes
+# its answer, then "</think>", then the same answer again; the voice spoke it
+# twice and the chat showed the tag. Rule (same for voice and chat): text
+# before the first </think> is kept if it has words; everything after it is
+# dropped. If nothing came before the tag, the tag is removed and the text
+# after it is kept. <think> opening tags are removed. Works on a stream:
+# a tag split across chunks ("</th" + "ink>") is held back until complete.
+# ---------------------------------------------------------------------------
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
+
+
+def _words(s):
+    import re
+    return len(re.findall(r"[^\W\d_]{2,}", s or ""))
+
+
+def _partial_tag_suffix(s):
+    """Length of a trailing piece of s that could be the start of a tag."""
+    for k in range(min(len(s), len(THINK_CLOSE) - 1), 0, -1):
+        tail = s[-k:]
+        if THINK_CLOSE.startswith(tail) or THINK_OPEN.startswith(tail):
+            return k
+    return 0
+
+
+class ThinkFilter:
+    """Feed reply text chunk by chunk; returns the text to show/speak."""
+
+    def __init__(self):
+        self.said = ""
+        self.pending = ""
+        self.off = False          # True once text after </think> is being dropped
+        self.dropped = False      # True if a tag was seen at all
+
+    def feed(self, chunk):
+        if self.off:
+            if chunk:
+                self.dropped = True
+            return ""
+        s = self.pending + (chunk or "")
+        self.pending = ""
+        out = ""
+        while s and not self.off:
+            if THINK_OPEN in s:
+                s = s.replace(THINK_OPEN, "")
+                self.dropped = True
+            i = s.find(THINK_CLOSE)
+            if i < 0:
+                k = _partial_tag_suffix(s)
+                if k:
+                    self.pending, s = s[-k:], s[:-k]
+                out += s
+                self.said += s
+                break
+            self.dropped = True
+            head, s = s[:i], s[i + len(THINK_CLOSE):]
+            out += head
+            self.said += head
+            if _words(self.said) >= 2:
+                self.off = True
+        return out
+
+
+def clean_reply(text):
+    """Whole-text version of ThinkFilter (the chat bubble and history)."""
+    f = ThinkFilter()
+    out = f.feed(text)
+    if not f.off and f.pending and not (THINK_CLOSE.startswith(f.pending) or THINK_OPEN.startswith(f.pending)):
+        out += f.pending
+    return out

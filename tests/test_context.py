@@ -147,15 +147,71 @@ def agent_case():
          "function": {"name": "remember", "arguments": "{}"}}]},
         {"role": "tool", "tool_call_id": "1", "content": "Saved"}]))
     check("agent: not forced again after the call", g2 is None, str(g2))
+    import asyncio
+    asyncio.new_event_loop().run_until_complete(stream_case(agent))
+    asyncio.new_event_loop().run_until_complete(reset_case(agent))
     names = {s.name for s in agent._function_schemas()}
     check("agent: memory tools registered", mem.NAMES <= names, str(mem.NAMES - names))
     mem.dispatch("forget", fact="all")
 
 
+def think_case():
+    cases = [("You like OPM music.\n</think>\n\nYou like OPM music.", "You like OPM music."),
+             ("</think>\n\nHello there friend", "Hello there friend"),
+             ("<think></think>Hi you all", "Hi you all"),
+             ("a < b is true", "a < b is true")]
+    bad = [(t, cu.clean_reply(t).strip()) for t, w in cases if cu.clean_reply(t).strip() != w]
+    check("think: whole replies cleaned", not bad, str(bad))
+    f = cu.ThinkFilter()
+    out = "".join(f.feed(x) for x in ["You like ", "OPM.</th", "ink>\n\nYou like", " OPM."])
+    check("think: tag split across chunks", out == "You like OPM." and f.off, repr(out))
+
+
+async def stream_case(agent):
+    """Real openai chunk objects through the voice stream tap."""
+    try:
+        from openai.types.chat import ChatCompletionChunk
+    except Exception as e:
+        print(f"SKIP think: voice stream (no openai types: {e!r})")
+        return
+    parts = ["You like ", "OPM music.", "\n</think>", "\n\nYou like OPM music."]
+
+    async def gen():
+        for i, p in enumerate(parts):
+            yield ChatCompletionChunk.model_validate({
+                "id": "x", "object": "chat.completion.chunk", "created": 0, "model": "m",
+                "choices": [{"index": 0, "delta": {"content": p}, "finish_reason": None}]})
+    got = []
+    async for ch in agent._tap_reasoning_stream(gen()):
+        got.append(ch.choices[0].delta.content or "")
+    check("think: voice stream speaks the answer once", "".join(got).strip() == "You like OPM music.", repr(got))
+
+
+async def reset_case(agent):
+    """Restart button: a new reset.json empties the voice agent's history."""
+    import asyncio
+    agent.RESET_JSON_PATH = os.path.join(TMP, "reset.json")
+    with open(agent.RESET_JSON_PATH, "w") as f:
+        json.dump({"t": 1.0}, f)            # an old reset: must not clear
+    ctx = types.SimpleNamespace(messages=[{"role": "user", "content": "hi"},
+                                          {"role": "assistant", "content": "hello"}])
+    agent._CONTEXT_REF["ctx"] = ctx
+    task = asyncio.ensure_future(agent._reset_watcher(poll_s=0.05))
+    await asyncio.sleep(0.2)
+    kept = len(ctx.messages)
+    with open(agent.RESET_JSON_PATH, "w") as f:
+        json.dump({"t": 2.0}, f)
+    await asyncio.sleep(0.2)
+    task.cancel()
+    check("reset: old reset ignored, new one clears the voice history",
+          kept == 2 and ctx.messages == [], f"{kept} {ctx.messages}")
+
+
 def dashboard_case():
     src = open(os.path.join(os.path.dirname(HERE), "bootsui", "boots_ui.py"), encoding="utf-8").read()
     check("dashboard: memory tools routed and loaded",
-          '("remember", "forget", "list_memories")' in src and "_mem.prompt_block()" in src
+          '("remember", "forget", "list_memories")' in src and src.count('_strip_think(') >= 4 and "_mem.prompt_block()" in src
+          and 'elif self.path == "/reset":' in src and 'STATE["chat_history"].clear()' in src
           and '[-16:]' in src and 'str(res)[:1500]' in src)
 
 
@@ -163,6 +219,7 @@ if __name__ == "__main__":
     memory_case()
     window_case()
     shorten_case()
+    think_case()
     dashboard_case()
     agent_case()
     ok = all(RESULTS)

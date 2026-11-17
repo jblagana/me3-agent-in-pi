@@ -838,8 +838,19 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
 - **Typed chat:** it now sees 8 turns (was 5) and keeps 1,500 characters of each past tool result (was 200).
 - **Tests:** `tests/test_context.py` passes on the Pi, along with the other 6 test files.
 - **Live check through typed chat (about 6 Groq calls in all, including a first attempt before the guard):** Boots saved "likes OPM music, especially Ben&Ben". After a dashboard restart, "What kind of music do I like?" was answered from the note. The test note was deleted afterwards.
-- **Seen again:** the stray `</think>` (see 8.1) duplicated one reply. It's not fixed yet.
+- **Stray `</think>` fixed** (see 8.1): Qwen sometimes wrote the answer, `</think>`, then the answer again. `context_util.ThinkFilter` keeps the text before the tag and drops the repeat, in the voice stream (`_tap_reasoning_stream`, so it's spoken once) and in typed chat (`_strip_think`). Tested offline with real OpenAI stream chunks on the Pi; it can't be triggered on demand, so there's no live check. Backup: `~/me3_backup_20261118_think`.
 - **Backup:** `~/me3_backup_20261118_context`.
+
+### 8.7 Restart button, 2026-11-18
+
+- **What it does:** a circular-arrow button next to the theme toggle clears the conversation, after a confirm prompt.
+- **Server:** `POST /reset` empties the typed and voice thread and the live bubbles, then writes `bootsui/reset.json`. It also changes the boot id, so every open dashboard tab reloads.
+- **Voice agent:** `_reset_watcher` in `agent.py` sees the new `reset.json` and empties its LLM history.
+- **Kept:** devices, reminders, saved notes (`~/.boots_memory.json`) and the file library.
+- **Checked:**
+  - In the browser: 2 bubbles became 0, the page reloaded, and Activity shows "conversation cleared (restart button)". The layout is fine at desktop and phone width.
+  - The voice side is checked only by the offline test (`tests/test_context.py`), because the agent builds its context once the EMEET is connected.
+- **Backup:** `~/me3_backup_20261118_reset`.
 
 ## 9. Phase 6: tests and hygiene
 

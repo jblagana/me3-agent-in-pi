@@ -139,6 +139,44 @@ def _apply_llm_swap(llm, sig):
     logger.info(f"[me3] voice LLM swapped: {old[1]} {old[0]} -> {sig[0]} {sig[2]} (thinking {th})")
 
 
+# Restart button (2026-11-18): the dashboard writes bootsui/reset.json; this
+# watcher then empties the voice agent's LLM history, so Boots forgets the
+# old conversation too (saved notes and the file library stay).
+RESET_JSON_PATH = os.path.join(os.path.dirname(LLM_JSON_PATH), "reset.json")
+_CONTEXT_REF = {"ctx": None}
+
+
+def _reset_seen_time():
+    import json
+    try:
+        with open(RESET_JSON_PATH, encoding="utf-8") as f:
+            return float(json.load(f).get("t") or 0)
+    except Exception:
+        return 0.0
+
+
+async def _reset_watcher(poll_s=1.0):
+    import asyncio
+    last = _reset_seen_time()          # a reset from before this boot doesn't count
+    while True:
+        await asyncio.sleep(poll_s)
+        t = _reset_seen_time()
+        if t <= last:
+            continue
+        last = t
+        ctx = _CONTEXT_REF["ctx"]
+        try:
+            n = len(ctx.messages) if ctx is not None else 0
+            if ctx is not None:
+                ctx.messages[:] = [m for m in ctx.messages
+                                   if isinstance(m, dict) and m.get("role") == "system"]
+            for k in ("reply", "thinking", "heard", "tool_args"):
+                _RECENT_TEXT.pop(k, None)
+            logger.info(f"[me3] conversation cleared from the dashboard ({n} messages dropped)")
+        except Exception as e:
+            logger.warning(f"[me3] conversation reset failed: {e!r}")
+
+
 async def _llm_swap_poller(llm, gate_state):
     import asyncio as _aio
     while True:
@@ -2198,12 +2236,24 @@ async def _tap_reasoning_stream(stream):
     be consumed exactly once (pipecat's _closing() handles aclose)."""
     buf = []
     last_push = 0.0
+    # Stray </think> (2026-11-18): Qwen3.8 with reasoning off sometimes
+    # writes the answer, "</think>", then the answer again -- spoken twice.
+    # The filter drops the tag and everything after it (context_util).
+    think = cu.ThinkFilter()
     try:
         async for chunk in stream:
             try:
                 choices = getattr(chunk, "choices", None) or []
                 if choices:
                     delta = getattr(choices[0], "delta", None)
+                    c = getattr(delta, "content", None) if delta is not None else None
+                    if c:
+                        c2 = think.feed(c)
+                        if c2 != c:
+                            try:
+                                delta.content = c2
+                            except Exception as e:
+                                logger.debug(f"[me3] think filter couldn't edit the chunk: {e!r}")
                     if delta is not None:
                         # Groq puts reasoning on delta.reasoning (verified
                         # live 2026-11-06); keep the openai convention too.
@@ -2223,6 +2273,8 @@ async def _tap_reasoning_stream(stream):
                 logger.debug(f"[me3] reasoning-tap chunk error: {e!r}")
             yield chunk
     finally:
+        if think.dropped:
+            logger.info(f"[me3] stray think tag removed; kept {think.said.strip()[:80]!r}")
         # Round end: FLUSH the full reasoning (2026-11-07). The 0.35 s push
         # throttle sent only the FIRST chunk of a short burst (gpt-oss often
         # reasons in < 0.35 s) and the round-end clear came before any
@@ -2654,6 +2706,8 @@ async def build_bot(transport=None):
 
     await _MCP.start()
     context = LLMContext(tools=_function_schemas())
+    _CONTEXT_REF["ctx"] = context
+    _aio_mod.create_task(_reset_watcher())
     # Turn end (2026-11-07): Pipecat 1.12's default runs the Smart Turn model
     # on the Pi CPU after every utterance -- measured ~0.55 s of dead air per
     # turn once ASR got fast. ME3_SMART_TURN=0 (default) ends the turn on the

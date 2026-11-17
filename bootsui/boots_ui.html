@@ -317,6 +317,8 @@ a{color:var(--accent-text)}
     <button class="btn" id="btn-hood" aria-haspopup="dialog" aria-controls="drawer">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
       <span>Under the hood</span></button>
+    <button class="btn icon" id="btn-reset" aria-label="Restart: clear the conversation and reload" title="Restart: clear the conversation">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 2.6-6.4"/><path d="M3 4v4.5h4.5"/></svg></button>
     <button class="btn icon" id="btn-theme" aria-label="Switch theme">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><path d="M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z"/></svg></button>
   </div>
@@ -495,6 +497,12 @@ const ICON_LINK='<svg width="18" height="18" viewBox="0 0 24 24" fill="none" str
 
 /* ---------------- theme, tabs, drawer, clock ---------------- */
 (function(){const t=store('boots-theme');if(t)document.documentElement.setAttribute('data-theme',t);})();
+$('btn-reset').onclick=async()=>{
+  if(!confirm('Clear the conversation and reload?\nDevices, reminders, saved notes and your files are kept.'))return;
+  const b=$('btn-reset');b.disabled=true;
+  try{await fetch('/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}
+  location.reload();
+};
 $('btn-theme').onclick=()=>{const h=document.documentElement;const n=h.getAttribute('data-theme')==='light'?'dark':'light';h.setAttribute('data-theme',n);store('boots-theme',n);};
 function showTab(which){
   const home=which==='home';

@@ -1648,6 +1648,33 @@ def _append_turn(heard: str, response: str, tools=None) -> None:
     except Exception:
         pass
 
+# Restart button (2026-11-18): POST /reset clears the conversation (typed and
+# voice thread, live bubbles), writes reset.json so the voice agent drops its
+# own LLM history, and changes the boot id so every open page reloads. Devices,
+# reminders, saved notes and the file library are kept.
+RESET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reset.json")
+
+
+def _reset_conversation() -> None:
+    global _BOOT_ID
+    with STATE["lock"]:
+        STATE["chat_history"].clear()
+        STATE["history"].clear()
+        m3 = STATE["me3"]
+        for k in ("heard", "thinking", "response", "tool", "tool_args", "tool_result", "cot"):
+            m3[k] = ""
+        m3["latency"] = None
+        _BOOT_ID = "%d-%d" % (os.getpid(), int(time.time() * 1000))
+    try:
+        tmp = RESET_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"t": time.time()}, f)
+        os.replace(tmp, RESET_PATH)
+    except Exception:
+        pass
+    _cmdlog("conversation cleared (restart button)", "ok")
+
+
 def _cmdlog(text: str, cls: str = "ok") -> None:
     """Append one command-log entry (newest last; the UI renders
     newest-first and rebuilds from this on refresh). Cap 50."""
@@ -2055,7 +2082,7 @@ def _chat_run(msg: str, emit=None):
                 # Qwen3.8 opens its content with "\n\n" (thinking-model
                 # habit) — strip for the bubble + history so the reply
                 # doesn't render with a leading blank line.
-                _clean = _content.lstrip("\n")
+                _clean = _strip_think(_content).lstrip("\n")
                 # Stream the in-flight reply too: during the 'thinking'
                 # phase the UI renders m3.response as the typing bubble,
                 # so pushing it here (same throttle) makes the bubble
@@ -2095,7 +2122,7 @@ def _chat_run(msg: str, emit=None):
                      "try again and I'll keep it shorter.")
             break
         if not tcs:
-            reply = (ch.get("content") or "").strip()
+            reply = _strip_think(ch.get("content") or "").strip()
             # Drop Qwen's leading "\n\n" habit from the stored/spoken reply.
             reply = reply.lstrip("\n").strip()
             if (_wants_site and not _nudged
@@ -2115,7 +2142,7 @@ def _chat_run(msg: str, emit=None):
                 continue
             break
         messages.append({
-            "role": "assistant", "content": ch.get("content") or "",
+            "role": "assistant", "content": _strip_think(ch.get("content") or ""),
             "tool_calls": tcs})
         for tc in tcs:
             name = tc["function"]["name"]
@@ -2216,6 +2243,18 @@ def _chat_run(msg: str, emit=None):
            "tool": sum(c.get("ms", 0) for c in calls) or None,
            "total": None}  # filled by the /chat handler (includes queue)
     return reply, calls, lat
+
+def _strip_think(text):
+    """Stray </think> (2026-11-18): keep the text before the tag, drop the
+    repeat after it (context_util.clean_reply, same rule as the voice)."""
+    if "<" not in (text or ""):
+        return text
+    try:
+        import context_util as _cu
+        return _cu.clean_reply(text)
+    except Exception:
+        return (text or "").replace("</think>", " ").replace("<think>", "")
+
 
 def _ui_dispatch(name, args):
     try:
@@ -2726,6 +2765,9 @@ class Handler(BaseHTTPRequestHandler):
                             else:
                                 m["paused"] = False
                                 _DUCK["awake"] = False
+            self._send(200, b"ok", "text/plain")
+        elif self.path == "/reset":
+            _reset_conversation()
             self._send(200, b"ok", "text/plain")
         elif self.path == "/reminders":
             # Toggle a reminder's done state by index (UI checkbox).
