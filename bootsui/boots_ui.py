@@ -1717,6 +1717,11 @@ def _chat_load_impl():
         import shell_tools as _sh
     except ImportError:
         pass
+    _lib = None
+    try:
+        import library_tools as _lib      # files-only mode (2026-11-18)
+    except ImportError:
+        pass
 
     def _norm_props(p):
         out = {}
@@ -1730,7 +1735,7 @@ def _chat_load_impl():
         return out
 
     tools = []
-    for mod in (_ui, _sp, _web, _ft, _sh):
+    for mod in (_ui, _sp, _web, _ft, _sh, _lib):
         if mod is None:
             continue
         for (n, d, p) in mod.TOOL_SPECS:
@@ -1894,6 +1899,15 @@ def _chat_run(msg: str, emit=None):
         _sys = _CHAT_PROMPT_MOD.system_prompt()
     else:
         _sys = _CHAT_PROMPT or "You are Boots, a warm voice assistant."
+    # Files-only mode (2026-11-18): the passages matching this message ride
+    # in the system message for this turn only (same as agent.py).
+    try:
+        import library_tools as _lib
+        _prev = next((m.get("content") or "" for m in reversed(prior)
+                      if m.get("role") == "user"), "")
+        _sys += _lib.grounding_note(msg, also=_prev)
+    except Exception:
+        pass
     messages = [{"role": "system", "content": _sys}]
     messages.extend(prior)
     messages.append({"role": "user", "content": msg})
@@ -2108,6 +2122,11 @@ def _chat_run(msg: str, emit=None):
                 res = _ft_dispatch(name, args)
             elif name in ("run_command", "run_python"):
                 res = _sh_dispatch(name, args)
+            elif name in _LIB_NAMES:
+                res = _lib_dispatch(name, args)
+            elif name in ("web_search", "fetch_url") and _lib_web_blocked():
+                res = ("Not run: files-only mode is on, so web search is off. Tell the user "
+                       "their files don't cover this and ask if they want you to check the web.")
             else:
                 res = _web_dispatch(name, args)
             err = isinstance(res, str) and bool(res) and res[:7].lower() in ("errored", "error: ", "error —")
@@ -2194,6 +2213,26 @@ def _ft_dispatch(name, args):
         return _m.dispatch(name, **args)
     except Exception as e:
         return f"tool {name} errored: {e!r}"
+
+_LIB_NAMES = {"add_files", "find_and_download", "list_library", "list_collection",
+              "use_collection", "stop_using_files", "ask_files", "remove_files"}
+
+
+def _lib_dispatch(name, args):
+    try:
+        import library_tools as _m
+        return _m.dispatch(name, **args)
+    except Exception as e:
+        return f"tool {name} errored: {e!r}"
+
+
+def _lib_web_blocked():
+    try:
+        import library_tools as _m
+        return _m.web_blocked()
+    except Exception:
+        return False
+
 
 def _sh_dispatch(name, args):
     try:

@@ -289,6 +289,7 @@ import web_tools as web
 import spotify_tools as sp
 import files_tools as ft
 import shell_tools as sh
+import library_tools as lib
 from piper_tts import PiperLocalTTSService
 from asr import WhisperCPPSTTService
 from remote_voice import (Qwen2AudioSTTService, Qwen3TTSService,
@@ -684,6 +685,14 @@ _TOOL_PHRASE = {
     "write_website": "Building a website",
     "build_app": "Building an app",
     "run_python": "Running Python",
+    "add_files": "Reading your files",
+    "find_and_download": "Finding and downloading files",
+    "list_library": "Checking your library",
+    "list_collection": "Listing the files",
+    "use_collection": "Switching to your files",
+    "stop_using_files": "Leaving files-only mode",
+    "ask_files": "Searching your files",
+    "remove_files": "Removing files",
     "publish_website": "Publishing to GitHub",
 }
 
@@ -1534,6 +1543,10 @@ async def _web_handler(params):
         tool = None
     if not tool:
         result = "I couldn't run that web action."
+    elif tool in ("web_search", "fetch_url") and lib.web_blocked():
+        # Files-only mode (2026-11-18): the web stays off until the user agrees.
+        result = ("Not run: files-only mode is on, so web search is off. Tell the user their "
+                  "files don't cover this and ask if they want you to check the web.")
     else:
         result = await _MCP.call(tool, args)
         if result is None:
@@ -1561,7 +1574,7 @@ async def _web_handler(params):
 # One job per tool at a time. ME3_BG_TOOLS="" turns it off.
 # ---------------------------------------------------------------------------
 _BG_TOOLS = {t.strip() for t in os.environ.get(
-    "ME3_BG_TOOLS", "write_website,build_app,publish_website").split(",") if t.strip()}
+    "ME3_BG_TOOLS", "write_website,build_app,publish_website,find_and_download").split(",") if t.strip()}
 BG_TIMEOUT_S = float(os.environ.get("ME3_BG_TIMEOUT_S", "300"))
 _BG_JOBS = {}                    # tool name -> start time (monotonic)
 _BG_STATUS = {}                  # tool name -> current stage, from web_tools._stage
@@ -1576,7 +1589,8 @@ BG_UPDATE_GAP_S = float(os.environ.get("ME3_BG_UPDATE_GAP_S", "20"))
 BG_NUDGE_S = float(os.environ.get("ME3_BG_NUDGE_S", "90"))
 _SPEAK_GATE = {"user": False, "bot": False}
 _BG_LAST_UPDATE = {"t": 0.0}
-_BG_WHAT = {"write_website": "the website", "build_app": "the app", "publish_website": "your page"}
+_BG_WHAT = {"write_website": "the website", "build_app": "the app", "publish_website": "your page",
+            "find_and_download": "the downloads"}
 
 
 def _bg_running_text():
@@ -1654,7 +1668,8 @@ async def _web_bg_body(params):
         try:
             result = await _MCP.call(tool, args, timeout=max(30.0, BG_TIMEOUT_S - 10))
             if result is None:
-                result = await asyncio.to_thread(web.dispatch, tool, **args)
+                mod = lib if tool in lib.NAMES else web
+                result = await asyncio.to_thread(mod.dispatch, tool, **args)
                 _MCP.calls_fallback += 1
         except Exception as e:
             result = f"{tool} failed: {e!r}"
@@ -1719,6 +1734,53 @@ async def _files_handler(params):
     except Exception:
         pass
     return result
+
+
+async def _library_handler(params):
+    """Route a library tool call to library_tools.dispatch() (2026-11-18).
+    Same MCP-first, direct-fallback and result_callback contract as the others."""
+    import asyncio as _aio, functools as _ft
+    args = dict(params.arguments or {})
+    result = await _MCP.call(params.function_name, args, timeout=120)
+    if result is None:
+        result = await _aio.to_thread(_ft.partial(lib.dispatch, params.function_name), **args)
+        _MCP.calls_fallback += 1
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
+
+
+def _last_user_texts(context):
+    """(latest user words, the user message before it) -- plain text only,
+    background job notes skipped."""
+    found = []
+    for m in reversed(getattr(context, "messages", []) or []):
+        if (isinstance(m, dict) and m.get("role") == "user"
+                and isinstance(m.get("content"), str) and not _is_bg_note(m)):
+            found.append(m["content"])
+            if len(found) == 2:
+                break
+    return (found + ["", ""])[0], (found + ["", ""])[1]
+
+
+def _library_ground(context, llm):
+    """Files-only mode (2026-11-18): add the passages that match the user's
+    latest words to the system instruction for THIS call. Nothing enters the
+    history, so passages never pile up across turns. No-op when the mode is off."""
+    try:
+        if not lib.active_collection():
+            return
+        q, prev = _last_user_texts(context)
+        note = lib.grounding_note(q, also=prev)
+        if note:
+            llm._settings.system_instruction = (llm._settings.system_instruction or "") + note
+            logger.info(f"[me3] files-only: {note.count(chr(10) + '[')} passage(s) from "
+                        f"'{lib.active_collection()}' for {q[:60]!r}")
+    except Exception as e:
+        logger.debug(f"[me3] library grounding skipped: {e!r}")
 
 
 async def _shell_handler(params):
@@ -1789,6 +1851,12 @@ def _function_schemas():
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(ft, n, p), handler=_files_handler))
     for (n, d, p) in sh.TOOL_SPECS:
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(sh, n, p), handler=_shell_handler))
+    for (n, d, p) in lib.TOOL_SPECS:
+        h = _web_bg_handler if n in _BG_TOOLS else _library_handler
+        if n in _BG_TOOLS:
+            d = (d + " Runs in the background: in the same reply as this call, tell the user"
+                     " in a few natural words that you're on it; the result comes later.")
+        out.append(FunctionSchema(n, d, _normalize_props(p), _required(lib, n, p), handler=h))
     return out
 
 
@@ -1949,7 +2017,7 @@ def _stamp_system_and_strip(context, llm) -> None:
         bg_notes = _bg_results_to_notes(context)
         running = _bg_running_text()
         if running or bg_notes:
-            line += ("\n\nBACKGROUND JOBS: website, app and publish jobs run in the background"
+            line += ("\n\nBACKGROUND JOBS: website, app, publish and download jobs run in the background"
                      " while the conversation goes on."
                      + (f" Running now: {running}. If the user asks something else, answer it"
                         " normally and briefly; if they ask about the job, say it is still"
@@ -2145,6 +2213,7 @@ class GroqResilientLLM(OpenAILLMService):
         _stamp_system_and_strip(context, self)
         _restore_interrupted_reply(context)     # barge-in memory fix (2026-11-07)
         _merge_user_fragments(context)          # "Take down" + "by" -> one (2026-11-17)
+        _library_ground(context, self)          # files-only mode passages (2026-11-18)
         # (2026-11-07) reasoning_effort is no longer forced to 'medium' on
         # every request: _llm_extra() sets the provider-correct value at boot
         # and on every hot-swap (gpt-oss rejects 'none'; vLLM rejects

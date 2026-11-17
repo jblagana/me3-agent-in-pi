@@ -813,6 +813,22 @@ All deployed to the Pi and checked on the live page; previous file in
 
 ---
 
+### 8.5 Answering only from your files, 2026-11-18 (`library_tools.py`)
+
+Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
+
+- **Library:** `~/boots-library/` holds `index.sqlite` (SQLite full-text search), `state.json` (which collection is in use) and one folder of downloaded copies per collection. Your own files are indexed where they are, not copied.
+- **Tools:** `add_files`, `find_and_download` (a background job, like website builds), `list_library`, `list_collection`, `use_collection`, `stop_using_files`, `ask_files`, `remove_files`. The voice agent, the typed chat and `mcp_server.py` all have them.
+- **Files-only mode:** adding files turns it on. Every LLM call then gets the best-matching passages (at most about 5,200 characters) in its system instruction for that call only, plus strict rules: answer only from the passages, name the file and page, and say the files don't cover anything else. `web_search` and `fetch_url` are refused until you agree to use the web (`use_collection` with `allow_web`). Device commands keep working.
+- **Reads** PDF (`pdftotext`, now installed on the Pi; `pypdf` as fallback), Word `.docx`, text, Markdown, HTML and CSV. Scanned PDFs are reported as unreadable, not OCR'd.
+- **Limits:** 25 MB per file, 200 files per folder, 5 downloads per request. Downloads come only from public sites, and paths stay inside the home folder.
+- **Groq call kept:** a turn that matches no passage still goes to Groq, because only the model can tell a command ("lights on") from a question.
+- **Tests:** `tests/test_library.py` has 34 checks and passes on the Pi, along with the 5 older test files.
+- **Live check through typed chat, 4 Groq calls:** Boots added a folder, answered from the file with its name, and refused an off-topic question ("your files don't cover that... want me to look it up on the web?").
+- **Downloads:** `find_and_download` with the services' Tavily key fetched 3 relevant papers in 23 s. Without the key, the Wikipedia fallback is weak even with the new keyword filter. It picked "Quezon, Isabela" for "solar dryer for mangoes".
+- **Not done yet:** a voice test (needs the EMEET), the Library card on the dashboard, and search by meaning (plan steps 4–5).
+- **Backup:** `~/me3_backup_20261118_library`.
+
 ## 9. Phase 6: tests and hygiene
 
 1. Unit tests, no audio needed:
