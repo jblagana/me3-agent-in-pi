@@ -11,20 +11,20 @@
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
 <style>
 :root{
-  --bg:#131211;--bg2:#171615;--card:#1C1A18;--card2:#24211E;--line:#2E2A26;--line2:#3A3530;
-  --text:#F3EEE8;--text2:#C9C0B5;--dim:#A89F94;--faint:#8A8178;
+  --bg:#111412;--bg2:#151917;--card:#1A1E1B;--card2:#212622;--line:#2A302C;--line2:#353D37;
+  --text:#EDF3EF;--text2:#BFC9C2;--dim:#9AA69E;--faint:#7F8B83;
   --accent:#5CCB8A;--accent-ink:#0B2416;--accent-soft:rgba(92,203,138,.12);--accent-line:rgba(92,203,138,.45);--accent-text:#A6E5BF;
   --user:#22303F;--user-text:#E6EEFA;--blue:#8DB8FF;--warn:#F0A85C;--warn-soft:rgba(240,168,92,.10);--warn-line:rgba(240,168,92,.45);--warn-text:#F6C38E;
-  --danger:#D9534F;--code:#0F0E0D;
+  --danger:#D9534F;--code:#0D100E;
   --head:'Space Grotesk',system-ui,sans-serif;--body:Inter,'Segoe UI',system-ui,sans-serif;--mono:'JetBrains Mono','Cascadia Code',Consolas,monospace;
   color-scheme:dark;
 }
 :root[data-theme="light"]{
-  --bg:#F7F5F1;--bg2:#EFECE6;--card:#FFFFFF;--card2:#F1EEE8;--line:#E2DDD5;--line2:#D3CCC1;
-  --text:#1B1916;--text2:#3D3833;--dim:#635B53;--faint:#71695F;
+  --bg:#F4F7F5;--bg2:#EBF0EC;--card:#FFFFFF;--card2:#EEF2EF;--line:#DCE3DE;--line2:#CBD4CE;
+  --text:#161B18;--text2:#333D37;--dim:#56615A;--faint:#65716A;
   --accent:#1F8F55;--accent-ink:#FFFFFF;--accent-soft:rgba(31,143,85,.10);--accent-line:rgba(31,143,85,.45);--accent-text:#17733F;
   --user:#DCE8F7;--user-text:#142235;--blue:#2F6FD0;--warn:#B8661A;--warn-soft:rgba(184,102,26,.10);--warn-line:rgba(184,102,26,.45);--warn-text:#8F4D10;
-  --code:#F1EEE8;color-scheme:light;
+  --code:#EEF2EF;color-scheme:light;
 }
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%}
@@ -49,6 +49,7 @@ a{color:var(--accent-text)}
 .status{display:inline-flex;align-items:center;gap:8px;font:500 12px var(--mono);color:var(--text2);min-width:0}
 .status .d{width:8px;height:8px;border-radius:50%;background:var(--accent);flex:none}
 .status.warn .d{background:var(--warn)}.status.warn{color:var(--warn-text)}
+.status.green{color:var(--accent-text)}
 .status.off .d{background:var(--faint)}
 .top .right{margin-left:auto;display:flex;align-items:center;gap:8px}
 .clock{font:600 18px var(--head);margin-right:6px}
@@ -79,7 +80,23 @@ a{color:var(--accent-text)}
 .orb[data-s="talk"] .r2{animation:pulse 1.2s ease-in-out infinite}
 .orb[data-s="idle"] .core{box-shadow:none;opacity:.85}.orb[data-s="idle"] .r1,.orb[data-s="idle"] .r2{opacity:.18}
 .orb[data-s="idle"] .core{animation:breathe 4s ease-in-out infinite}
-.orb[data-s="nomic"] .core{background:var(--line2);box-shadow:none}.orb[data-s="nomic"] .core i{background:var(--dim)}.orb[data-s="nomic"] .r{border-color:var(--line2);background:none}
+/* Listening (2026-11-18, mockups/listening_icon_mockup.html option D): mic glyph, no glow, no static
+   rings; rings spawned by JS spread out, more often and brighter as the mic level rises. */
+.orb .mic{display:none;width:44px;height:44px;color:var(--accent-ink)}
+.orb[data-s="listen"] .core{box-shadow:none}
+.orb[data-s="listen"] .core i{display:none}
+.orb[data-s="listen"] .mic{display:block}
+.orb[data-s="listen"] .r{opacity:0;animation:none}
+/* No mic: same disc, crossed-out mic in the theme green */
+.orb .micoff{display:none;width:44px;height:44px;color:var(--accent)}
+.orb[data-s="nomic"] .core i{display:none}
+.orb[data-s="nomic"] .micoff{display:block}
+.orb[data-s="nomic"] .core{border:1.5px solid var(--accent-line)}
+.orb .rip{position:absolute;left:50%;top:50%;width:100px;height:100px;margin:-50px 0 0 -50px;border-radius:50%;border:2px solid var(--accent);opacity:0;pointer-events:none;animation:rip 2.4s ease-out forwards}
+@keyframes rip{0%{transform:scale(1);opacity:var(--rip-o,.55)}100%{transform:scale(2.25);opacity:0}}
+@keyframes rip-sm{0%{transform:scale(1);opacity:var(--rip-o,.55)}100%{transform:scale(1.9);opacity:0}}
+.orb[data-s="nomic"] .core{background:color-mix(in srgb,var(--accent) 14%,var(--card));box-shadow:none}.orb[data-s="nomic"] .core i{background:var(--dim)}.orb[data-s="nomic"] .r{border-color:var(--accent-line);background:none}
+.orb[data-s="nomic"] .r1{opacity:.18}.orb[data-s="nomic"] .r2{opacity:.3}.orb[data-s="nomic"] .r3{opacity:.45}
 @keyframes rot{to{transform:rotate(360deg)}}
 @keyframes pulse{0%,100%{transform:scale(1);opacity:.35}50%{transform:scale(1.04);opacity:.6}}
 @keyframes dots{0%,100%{transform:translateY(0)}50%{transform:translateY(-6px)}}
@@ -200,20 +217,22 @@ a{color:var(--accent-text)}
 .banner.idle{background:var(--card);border-color:var(--line)}
 .banner .raw{font:12px var(--mono);color:var(--accent-text);border-left:1px solid var(--accent-line);padding-left:12px;white-space:nowrap}
 .banner small{color:var(--dim)}
-.devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:16px;align-items:start}
+.devgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(270px,1fr));gap:16px;align-items:stretch}
 .dev{background:var(--card);border:1px solid var(--line);border-radius:22px;padding:20px;display:flex;flex-direction:column;gap:14px;position:relative;transition:border-color .3s,box-shadow .3s}
 .dev.just{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
 .dev .just-tag{position:absolute;top:16px;right:16px;font:600 11px var(--mono);color:var(--accent-ink);background:var(--accent);border-radius:999px;padding:3px 9px;display:none}
 .dev.just .just-tag{display:inline-block}
-.dev .dh{display:flex;justify-content:space-between;align-items:baseline;gap:10px;padding-right:76px}
+.dev .dh{display:flex;justify-content:space-between;align-items:baseline;gap:10px;min-height:24px}
+.dev.just .dh .st{visibility:hidden}   /* the "just changed" tag sits where the status is */
 .dev h2{font-size:17px;font-weight:600}
 .dev .st{font-size:13px;color:var(--dim)}
-.dev.lights{grid-row:span 2}
-.bulbwrap{display:flex;align-items:center;justify-content:center;min-height:190px;position:relative}
+.dev.lights{grid-row:auto}
+.dev.reminders{grid-row:span 2}.dev.reminders .list{max-height:300px;overflow-y:auto}
+.bulbwrap{display:flex;align-items:center;justify-content:center;min-height:160px;position:relative}
 .bulbwrap .g1,.bulbwrap .g2{position:absolute;border-radius:50%;background:var(--lampc,#FFD696);transition:opacity .4s,background .4s}
-.bulbwrap .g1{width:210px;height:210px;opacity:calc(var(--lv,0) * .10)}
-.bulbwrap .g2{width:140px;height:140px;opacity:calc(var(--lv,0) * .16)}
-.bulbwrap svg{position:relative;width:92px;height:92px;transition:color .4s}
+.bulbwrap .g1{width:160px;height:160px;opacity:calc(var(--lv,0) * .10)}
+.bulbwrap .g2{width:108px;height:108px;opacity:calc(var(--lv,0) * .16)}
+.bulbwrap svg{position:relative;width:76px;height:76px;transition:color .4s}
 .bulbwrap svg .fill{fill:var(--lampc,#FFD696);opacity:calc(.12 + var(--lv,0) * .4)}
 .dev.lights.off .bulbwrap svg{color:var(--faint)!important}.dev.lights.off .bulbwrap svg .fill{fill:var(--line2);opacity:.4}
 .big{font:600 34px/1 var(--head)}
@@ -276,9 +295,10 @@ a{color:var(--accent-text)}
   .stagecol,.homecol{padding:20px 16px;overflow:visible}
   .stage{min-height:300px}
   .orb{width:180px;height:180px}.orb .r2{inset:22px}.orb .r3{inset:44px}.orb .core{width:80px;height:80px}
+  .orb .rip{width:80px;height:80px;margin:-40px 0 0 -40px;animation-name:rip-sm}.orb .mic,.orb .micoff{width:36px;height:36px}
   .cap-text{font-size:26px}
   .top{padding:10px 16px}.clock,.status .txt{display:none}
-  .dev.lights{grid-row:auto}
+  .dev.lights{grid-row:auto}.dev.reminders{grid-row:auto}
 }
 @media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
 </style>
@@ -308,7 +328,7 @@ a{color:var(--accent-text)}
     <section class="stage" aria-label="Voice status" aria-live="polite">
       <div class="orb" id="orb" data-s="idle" aria-hidden="true">
         <span class="r r1"></span><span class="r r2"></span><span class="r r3"></span><span class="spin"></span>
-        <span class="core"><i></i><i></i><i></i><i></i><i></i></span>
+        <span class="core"><i></i><i></i><i></i><i></i><i></i><svg class="mic" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg><svg class="micoff" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 9.3V6a3 3 0 0 0-5.7-1.3M9 9v2a3 3 0 0 0 4.9 2.3M19 11a7 7 0 0 1-1.1 3.8M5 11a7 7 0 0 0 11.2 5.6M12 18v3M3 3l18 18"/></svg></span>
       </div>
       <div style="display:flex;flex-direction:column;gap:10px;align-items:center">
         <span class="cap-state" id="cap-state">Connecting</span>
@@ -351,7 +371,6 @@ a{color:var(--accent-text)}
         <div class="row"><div class="grow"><div class="big" id="lights-lv">–</div><div class="note" id="lights-col"></div></div>
           <label class="swl"><span class="sr">Lights on</span><input type="checkbox" role="switch" class="sw" id="lights-sw"></label></div>
         <label class="range">Brightness<input type="range" min="1" max="100" id="lights-range"></label>
-        <p class="note">Colour: say any colour, like “teal”, “warm white” or “sky blue”. The bulb shows it.</p>
       </article>
 
       <article class="dev ac" id="d-ac" aria-labelledby="h-ac">
@@ -705,11 +724,30 @@ async function poll(){
 function setStatus(kind,text){const el=$('status');el.className='status '+kind;$('status-txt').textContent=text;}
 
 /* ---------------- stage ---------------- */
+/* Listening rings: one faint ring every 2 s when quiet, up to 4 a second (brighter) at full voice.
+   Reads the --lvl that renderStage sets from me3.mic_level. Off for reduced motion. */
+(function ringLoop(){
+  const orb=$('orb'),calm=window.matchMedia&&matchMedia('(prefers-reduced-motion: reduce)');
+  let since=99;
+  setInterval(()=>{
+    if(orb.dataset.s!=='listen'||(calm&&calm.matches)||document.hidden){since=99;return;}
+    const v=Math.min(1,parseFloat(orb.style.getPropertyValue('--lvl'))||0);
+    since+=0.05;
+    if(since<2.0-1.75*v)return;
+    since=0;
+    const r=document.createElement('span');r.className='rip';
+    r.style.setProperty('--rip-o',(0.3+0.4*v).toFixed(2));
+    r.style.borderColor=`color-mix(in srgb, var(--accent) ${Math.round(45+55*v)}%, transparent)`;
+    r.addEventListener('animationend',()=>r.remove());
+    setTimeout(()=>r.remove(),3000);   // safety if the animation never ends
+    orb.insertBefore(r,orb.querySelector('.core'));
+  },50);
+})();
 function renderStage(s){
   const m3=s.me3||{},ph=chatBusy&&!['tool','speaking'].includes(m3.phase)?'thinking':(m3.phase||'idle');
   const P=PH[ph]||PH.idle;
   const orb=$('orb');orb.dataset.s=P.s;orb.style.setProperty('--lvl',String(Math.min(1,(m3.mic_level||0)*2.2)));
-  const st=$('cap-state');st.textContent=P.lab;st.classList.toggle('warn',ph==='nomic');
+  const st=$('cap-state');st.textContent=P.lab;st.classList.remove('warn');   // no-mic uses the theme green too (2026-11-18)
   const cap=$('cap-text');let txt='',quiet=false;
   if(ph==='speaking'&&m3.response)txt=m3.response;
   else if((ph==='listening'||ph==='thinking'||ph==='tool')&&m3.heard&&Date.now()-turnStartedAt<60000)txt=m3.heard,quiet=ph!=='listening';
@@ -728,7 +766,7 @@ function renderStage(s){
   renderTask();
   // header status
   const age=m3.last_hb&&s.now?s.now-m3.last_hb:null;
-  if(m3.phase==='nomic')setStatus('warn','No microphone · typing works');
+  if(m3.phase==='nomic')setStatus('green','No microphone · typing works');
   else if(age!=null&&age>15)setStatus('warn','Voice agent offline · typing works');
   else if(s.llm&&s.llm.provider==='off')setStatus('ok','Voice ready');
   else setStatus('ok','All systems fine');
@@ -879,7 +917,7 @@ function renderHood(s){
   const V=m3.voice||{};
   const cards=[
     {k:'Voice agent',b:on?'Online':'Offline',sp:age!=null?'last seen '+ago(age):'not seen yet',w:!on},
-    {k:'Microphone',b:m3.phase==='nomic'?'Not plugged in':'EMEET connected',sp:m3.phase==='nomic'?'typing still works':meter,w:m3.phase==='nomic',raw:true},
+    {k:'Microphone',b:m3.phase==='nomic'?'Not plugged in':'EMEET connected',sp:m3.phase==='nomic'?'typing still works':meter,w:false,raw:true},
     {k:'Voice model',b:V.model&&V.model!=='llm'?String(V.model).split('/').pop():'Not reported yet',sp:V.provider&&V.provider!=='llm'?V.provider:'the voice agent sends it when it starts'},
     {k:'Chat model',b:L.model?String(L.model).split('/').pop():'–',sp:(L.provider||'')+(L.thinking==='on'?' · thinking on':'')},
     {k:'Barge-in',b:V.gate===false?'On':'Off',sp:V.gate===false?'speakerphone echo cancel':'mic muted while speaking'},

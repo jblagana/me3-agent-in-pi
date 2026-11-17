@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Listening Icon Options</title>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+/* Same tokens as bootsui/boots_ui.html */
+:root{
+  --bg:#131211;--card:#1C1A18;--card2:#24211E;--line:#2E2A26;--line2:#3A3530;
+  --text:#F3EEE8;--text2:#C9C0B5;--dim:#A89F94;--faint:#8A8178;
+  --accent:#5CCB8A;--accent-ink:#0B2416;--accent-soft:rgba(92,203,138,.12);--accent-line:rgba(92,203,138,.45);--accent-text:#A6E5BF;
+  --head:'Space Grotesk',system-ui,sans-serif;--body:Inter,'Segoe UI',system-ui,sans-serif;--mono:'JetBrains Mono',Consolas,monospace;
+  color-scheme:dark;
+}
+:root[data-theme="light"]{
+  --bg:#F7F5F1;--card:#FFFFFF;--card2:#F1EEE8;--line:#E2DDD5;--line2:#D3CCC1;
+  --text:#1B1916;--text2:#3D3833;--dim:#635B53;--faint:#71695F;
+  --accent:#1F8F55;--accent-ink:#FFFFFF;--accent-soft:rgba(31,143,85,.10);--accent-line:rgba(31,143,85,.45);--accent-text:#17733F;
+  color-scheme:light;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font:15px/1.5 var(--body);padding:28px 16px 48px}
+h1{font:700 24px var(--head);letter-spacing:-.3px}
+.sub{color:var(--dim);margin-top:4px;max-width:720px}
+.bar{display:flex;flex-wrap:wrap;gap:12px 20px;align-items:center;margin:20px 0 26px}
+.bar label{display:flex;gap:10px;align-items:center;font:500 13px var(--mono);color:var(--text2)}
+.bar button{min-height:40px;padding:0 14px;border-radius:10px;border:1px solid var(--line);background:var(--card);color:var(--text);font:500 13px var(--body);cursor:pointer}
+.bar button[aria-pressed="true"]{border-color:var(--accent-line);background:var(--accent-soft);color:var(--accent-text)}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:22px 18px 20px;display:flex;flex-direction:column;align-items:center;gap:18px;text-align:center}
+.card h2{font:600 16px var(--head)}
+.card p{font-size:13px;color:var(--dim);max-width:280px}
+.tag{font:600 11px var(--mono);letter-spacing:2px;text-transform:uppercase;color:var(--accent)}
+.tag.cur{color:var(--faint)}
+.stage{width:240px;height:240px;position:relative;display:flex;align-items:center;justify-content:center;--lvl:0}
+
+/* ---- A: current (copied from boots_ui.html) ---- */
+.a .r{position:absolute;border-radius:50%;border:1px solid var(--accent-line)}
+.a .r1{inset:0;opacity:.35;animation:pulse 2.4s ease-in-out infinite}.a .r2{inset:28px;opacity:.6}.a .r3{inset:56px;background:var(--accent-soft);opacity:.9}
+.a .core{position:relative;width:100px;height:100px;border-radius:50%;background:var(--accent);box-shadow:0 0 56px var(--accent-line);display:flex;align-items:center;justify-content:center;gap:5px}
+.a .core i{width:6px;border-radius:3px;background:var(--accent-ink);height:calc(10px + var(--lvl) * 34px);transition:height .12s}
+.a .core i:nth-child(2),.a .core i:nth-child(4){height:calc(14px + var(--lvl) * 26px)}
+@keyframes pulse{0%,100%{transform:scale(1);opacity:.35}50%{transform:scale(1.04);opacity:.6}}
+
+/* ---- B: mic + radial level ticks ---- */
+.b .ticks{position:absolute;inset:0}
+.b .ticks i{position:absolute;left:50%;top:50%;width:4px;height:12px;margin:-2px 0 0 -2px;border-radius:2px;background:var(--accent);transform-origin:2px 2px;opacity:.35;transition:height .09s,opacity .09s}
+.b .core{position:relative;width:104px;height:104px;border-radius:50%;background:var(--accent);box-shadow:0 0 calc(20px + var(--lvl)*50px) var(--accent-line);display:flex;align-items:center;justify-content:center;transition:box-shadow .12s}
+.b .core svg{width:44px;height:44px;color:var(--accent-ink)}
+
+/* ---- C: breathing blob ---- */
+.c .blob{position:absolute;width:150px;height:150px;background:radial-gradient(circle at 35% 30%,var(--accent-text),var(--accent) 60%);opacity:.9;
+  transform:scale(calc(.78 + var(--lvl)*.32));transition:transform .12s;animation:morph 6s ease-in-out infinite;filter:blur(.3px)}
+.c .blob.b2{width:190px;height:190px;background:var(--accent-soft);border:1px solid var(--accent-line);opacity:1;animation-duration:9s;animation-direction:reverse;transform:scale(calc(.85 + var(--lvl)*.22))}
+.c .eye{position:relative;display:flex;gap:18px}
+.c .eye i{width:10px;height:22px;border-radius:6px;background:var(--accent-ink);animation:blink 5s infinite}
+@keyframes morph{0%,100%{border-radius:58% 42% 50% 50%/48% 55% 45% 52%}33%{border-radius:45% 55% 40% 60%/58% 42% 58% 42%}66%{border-radius:52% 48% 60% 40%/42% 58% 46% 54%}}
+@keyframes blink{0%,46%,50%,100%{transform:scaleY(1)}48%{transform:scaleY(.1)}}
+
+/* ---- D: mic + emitted ripples ---- */
+.d .rip{position:absolute;width:104px;height:104px;border-radius:50%;border:2px solid var(--accent);opacity:0;animation:rip 2.4s ease-out forwards;pointer-events:none}
+.d .core{position:relative;width:104px;height:104px;border-radius:50%;background:var(--accent);display:flex;align-items:center;justify-content:center}
+.d .core svg{width:44px;height:44px;color:var(--accent-ink)}
+.d{--ripmax:2.25}
+@keyframes rip{0%{transform:scale(1);opacity:var(--rip-o,.55)}100%{transform:scale(var(--ripmax));opacity:0}}
+/* Phone width: the live orb shrinks to 180px (core 80px), so rings spread less */
+@media (max-width:640px){.d{--ripmax:1.9}}
+
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+</head>
+<body>
+<h1>Listening icon: options</h1>
+<p class="sub">The centre orb on the Assistant tab while Boots is listening. Every option reacts to the live mic level (simulated here). Thinking, speaking and no-mic states keep their current look unless you want those changed too.</p>
+
+<div class="bar">
+  <button id="auto" aria-pressed="true">Simulated speech</button>
+  <label>Mic level <input type="range" id="lvl" min="0" max="100" value="0"></label>
+  <button id="theme">Light theme</button>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <span class="tag cur">Current</span>
+    <div class="stage a"><span class="r r1"></span><span class="r r2"></span><span class="r r3"></span>
+      <span class="core"><i></i><i></i><i></i><i></i><i></i></span></div>
+    <h2>Bars in a disc</h2>
+    <p>Five bars that grow with your voice. Reads the same as the speaking state, so listening and talking look alike.</p>
+  </div>
+
+  <div class="card">
+    <span class="tag">Option B</span>
+    <div class="stage b"><span class="ticks" id="ticks"></span>
+      <span class="core"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span></div>
+    <h2>Mic with a level ring</h2>
+    <p>A mic glyph says "listening" at a glance; 48 ticks round the edge rise with your voice, like a radial meter.</p>
+  </div>
+
+  <div class="card">
+    <span class="tag">Option C</span>
+    <div class="stage c"><span class="blob b2"></span><span class="blob"></span>
+      <span class="eye"><i></i><i></i></span></div>
+    <h2>Living blob with eyes</h2>
+    <p>A soft shape that slowly morphs and swells as you speak, with two eyes that blink. Gives Boots a face.</p>
+  </div>
+
+  <div class="card">
+    <span class="tag">Option D</span>
+    <div class="stage d" id="stage-d">
+      <span class="core"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3" fill="currentColor"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg></span></div>
+    <h2>Mic with ripples</h2>
+    <p>Rings spread out from the mic: one faint ring every 2 s when it's quiet, up to 4 a second, brighter, when you speak. No glow; rings spread less on phone-width screens.</p>
+  </div>
+</div>
+
+<script>
+const ticks=document.getElementById('ticks');
+for(let i=0;i<48;i++){const t=document.createElement('i');t.style.transform=`rotate(${i*7.5}deg) translateY(-104px)`;ticks.appendChild(t);}
+const tk=[...ticks.children], stages=[...document.querySelectorAll('.stage')];
+const slider=document.getElementById('lvl'), auto=document.getElementById('auto');
+let on=true, t=0, env=0;
+auto.onclick=()=>{on=!on;auto.setAttribute('aria-pressed',on);};
+slider.oninput=()=>{on=false;auto.setAttribute('aria-pressed','false');};
+document.getElementById('theme').onclick=e=>{const r=document.documentElement,l=r.dataset.theme==='light';r.dataset.theme=l?'':'light';e.target.textContent=l?'Light theme':'Dark theme';};
+function frame(){
+  t+=1/30;
+  let lvl;
+  if(on){ // speech-like: bursts of syllables, then pauses
+    const phrase=(Math.sin(t*0.9)+Math.sin(t*0.37))>0.2;
+    const target=phrase?0.35+0.6*Math.abs(Math.sin(t*7.3)*Math.sin(t*3.1)):0.02;
+    env+=(target-env)*0.35; lvl=env; slider.value=Math.round(lvl*100);
+  } else lvl=slider.value/100;
+  stages.forEach(s=>s.style.setProperty('--lvl',lvl.toFixed(3)));
+  tk.forEach((x,i)=>{const w=lvl*(0.55+0.45*Math.sin(i*1.7+t*9)*Math.sin(i*0.6-t*4));const h=6+Math.max(0,w)*30;
+    x.style.height=h+'px';x.style.opacity=(0.3+Math.max(0,w)*0.7).toFixed(2);
+    x.style.transform=`rotate(${i*7.5}deg) translateY(-${100+h}px)`;});
+  curLvl=lvl;
+  setTimeout(frame,33);
+}
+// Option D: ring spawn rate follows the voice level.
+// Quiet: one faint ring every 2 s. Full voice: capped at 4 a second, and brighter.
+const stageD=document.getElementById('stage-d'), coreD=stageD.querySelector('.core');
+let curLvl=0, sinceRing=99;
+function ringTick(){
+  sinceRing+=0.05;
+  const v=Math.min(1,curLvl*1.4);
+  const gap=2.0-1.75*v;               // 2 s quiet -> 0.25 s (4/s) loud
+  if(sinceRing>=gap){
+    sinceRing=0;
+    const r=document.createElement('span');r.className='rip';
+    r.style.setProperty('--rip-o',(0.3+0.4*v).toFixed(2));   // faint when quiet
+    r.style.borderColor=`color-mix(in srgb, var(--accent) ${Math.round(45+55*v)}%, transparent)`;
+    r.addEventListener('animationend',()=>r.remove());
+    stageD.insertBefore(r,coreD);
+  }
+  setTimeout(ringTick,50);
+}
+frame();ringTick();
+</script>
+</body>
+</html>
