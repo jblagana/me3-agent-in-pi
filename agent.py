@@ -290,6 +290,8 @@ import spotify_tools as sp
 import files_tools as ft
 import shell_tools as sh
 import library_tools as lib
+import memory_tools as mem
+import context_util as cu
 from piper_tts import PiperLocalTTSService
 from asr import WhisperCPPSTTService
 from remote_voice import (Qwen2AudioSTTService, Qwen3TTSService,
@@ -693,6 +695,9 @@ _TOOL_PHRASE = {
     "stop_using_files": "Leaving files-only mode",
     "ask_files": "Searching your files",
     "remove_files": "Removing files",
+    "remember": "Saving a note",
+    "forget": "Forgetting a note",
+    "list_memories": "Checking my notes",
     "publish_website": "Publishing to GitHub",
 }
 
@@ -1736,21 +1741,27 @@ async def _files_handler(params):
     return result
 
 
-async def _library_handler(params):
-    """Route a library tool call to library_tools.dispatch() (2026-11-18).
-    Same MCP-first, direct-fallback and result_callback contract as the others."""
-    import asyncio as _aio, functools as _ft
-    args = dict(params.arguments or {})
-    result = await _MCP.call(params.function_name, args, timeout=120)
-    if result is None:
-        result = await _aio.to_thread(_ft.partial(lib.dispatch, params.function_name), **args)
-        _MCP.calls_fallback += 1
-    try:
-        if getattr(params, "result_callback", None) is not None:
-            await params.result_callback(result)
-    except Exception:
-        pass
-    return result
+def _module_handler(mod, timeout=120):
+    """Handler for a tool module (2026-11-18: library, memory). Same
+    MCP-first, direct-fallback and result_callback contract as the others."""
+    async def handler(params):
+        import asyncio as _aio, functools as _ft
+        args = dict(params.arguments or {})
+        result = await _MCP.call(params.function_name, args, timeout=timeout)
+        if result is None:
+            result = await _aio.to_thread(_ft.partial(mod.dispatch, params.function_name), **args)
+            _MCP.calls_fallback += 1
+        try:
+            if getattr(params, "result_callback", None) is not None:
+                await params.result_callback(result)
+        except Exception:
+            pass
+        return result
+    return handler
+
+
+_library_handler = _module_handler(lib)
+_memory_handler = _module_handler(mem, timeout=20)
 
 
 def _last_user_texts(context):
@@ -1857,6 +1868,8 @@ def _function_schemas():
             d = (d + " Runs in the background: in the same reply as this call, tell the user"
                      " in a few natural words that you're on it; the result comes later.")
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(lib, n, p), handler=h))
+    for (n, d, p) in mem.TOOL_SPECS:
+        out.append(FunctionSchema(n, d, _normalize_props(p), _required(mem, n, p), handler=_memory_handler))
     return out
 
 
@@ -2010,6 +2023,11 @@ def _stamp_system_and_strip(context, llm) -> None:
                 "search for them with the user's own words and year, never change the year.")
         if _BASE_SYSTEM_TEXT is None:
             _BASE_SYSTEM_TEXT = SYSTEM_PROMPT
+        # Saved notes about the user (2026-11-18): survive trimming and restarts.
+        try:
+            line += mem.prompt_block()
+        except Exception:
+            pass
         # Background job results (2026-11-18) arrive as developer messages,
         # which this strip would delete. They become labelled user messages
         # (kept, so the model still knows the URL later), and the job rules
@@ -2052,12 +2070,14 @@ def _stamp_system_and_strip(context, llm) -> None:
         logger.debug(f"[me3] system stamp/strip skipped: {e!r}")
 
 
-def _trim_llm_context(context, max_messages: int) -> None:
+def _trim_llm_context(context, max_messages: int, max_turns: int = 0) -> None:
     """Drop the oldest conversation messages, keeping the system prompt + the
     most recent turns. Mutates `context.messages` in place. The system message
     (role='system'/'developer') is always kept; everything else is capped to
-    the last `max_messages`. Keeps user/assistant pairing intact where
-    possible by trimming to an even boundary."""
+    the last `max_turns` user turns (2026-11-18; was a flat message count, so
+    one website build pushed the whole earlier chat out) and, as a hard cap,
+    `max_messages`. Tool results and big tool-call arguments in turns older
+    than the last two are shortened (context_util.shorten_old)."""
     try:
         msgs = context.messages
         if not msgs:
@@ -2073,6 +2093,8 @@ def _trim_llm_context(context, max_messages: int) -> None:
             else:
                 break
         tail = msgs[i:]
+        if max_turns > 0:
+            tail = tail[cu.window_start(tail, max_turns, _BG_NOTE):]
         if len(tail) > max_messages:
             # Drop from the oldest non-system message, keeping the newest.
             drop = len(tail) - max_messages
@@ -2090,6 +2112,7 @@ def _trim_llm_context(context, max_messages: int) -> None:
             if last_user is not None and drop > last_user:
                 drop = last_user
             tail = tail[drop:]
+        cu.shorten_old(tail, note_prefix=_BG_NOTE)
         # LLMContext.messages is a read-only property -- mutate the list IN PLACE
         # (clear + extend) rather than reassigning, which raises AttributeError.
         new_msgs = head + tail
@@ -2138,6 +2161,26 @@ def _site_guard_choice(context):
             return {"type": "function", "function": {"name": "write_website"}}
     except Exception as e:
         logger.debug(f"[me3] website guard skipped: {e!r}")
+    return None
+
+
+def _memory_guard_choice(context):
+    """tool_choice forcing remember, or None: the latest user turn asks to
+    remember something (memory_tools.wants_remember) and no tool has run
+    since it, so this is the turn's first round."""
+    try:
+        msgs = list(context.messages)
+        role = lambda m: (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) or ""
+        last_user = max((i for i, m in enumerate(msgs)
+                         if role(m) == "user" and not _is_bg_note(m)), default=None)
+        if last_user is None or any(role(m) in ("tool", "assistant") for m in msgs[last_user + 1:]):
+            return None
+        um = msgs[last_user]
+        utext = um.get("content") if isinstance(um, dict) else getattr(um, "content", "")
+        if isinstance(utext, str) and mem.wants_remember(utext):
+            return {"type": "function", "function": {"name": "remember"}}
+    except Exception as e:
+        logger.debug(f"[me3] memory guard skipped: {e!r}")
     return None
 
 
@@ -2202,7 +2245,10 @@ class GroqResilientLLM(OpenAILLMService):
     other behaviour (streaming, tool calls, adapters) is inherited."""
 
     # Tunables (env-overridable).
-    MAX_CONTEXT_MESSAGES = int(os.environ.get("ME3_LLM_MAX_MSGS", "24"))
+    # (2026-11-18) the window is now TURNS; the message count is only a
+    # hard cap for very tool-heavy stretches (old tool results are shortened).
+    MAX_CONTEXT_TURNS = int(os.environ.get("ME3_LLM_MAX_TURNS", "8"))
+    MAX_CONTEXT_MESSAGES = int(os.environ.get("ME3_LLM_MAX_MSGS", "60"))
     MAX_RETRIES = int(os.environ.get("ME3_LLM_MAX_RETRIES", "3"))
     RETRY_BASE_DELAY = float(os.environ.get("ME3_LLM_RETRY_DELAY", "1.0"))
 
@@ -2220,7 +2266,7 @@ class GroqResilientLLM(OpenAILLMService):
         # reasoning_effort-style keys it doesn't know).
         # 1) Keep the request light: trim to the most recent N messages.
         if self.MAX_CONTEXT_MESSAGES > 0:
-            _trim_llm_context(context, self.MAX_CONTEXT_MESSAGES)
+            _trim_llm_context(context, self.MAX_CONTEXT_MESSAGES, self.MAX_CONTEXT_TURNS)
         # 1b) Website guard (2026-11-07): force write_website once research is
         #     done, so the model can't SPEAK a fake "it's built" + made-up URL
         #     (gpt-oss did exactly that on the typed path). Restored right
@@ -2228,7 +2274,16 @@ class GroqResilientLLM(OpenAILLMService):
         _forced = _site_guard_choice(context)
         _old_tc = None
         _nudge = None
-        if _forced:
+        _mem_forced = None if _forced else _memory_guard_choice(context)
+        if _mem_forced:
+            # "Remember that..." must actually save (2026-11-18): first round
+            # of the turn only, no extra LLM call (the save is the call it
+            # should have made anyway). Restored in the finally below.
+            _forced = _mem_forced
+            _old_tc = context.tool_choice
+            context.set_tool_choice(_forced)
+            logger.info("[me3] memory guard: remember request, forcing the remember call")
+        elif _forced:
             _old_tc = context.tool_choice
             context.set_tool_choice(_forced)
             # tool_choice alone isn't enough: Groq enforces it server-side and
@@ -2543,7 +2598,7 @@ async def build_bot(transport=None):
         settings=OpenAILLMService.Settings(**llm_settings),
     )
     logger.info(f"LLM: {type(llm).__name__} model={LLM_MODEL} "
-                f"(ctx cap {llm.MAX_CONTEXT_MESSAGES} msgs, "
+                f"(ctx {llm.MAX_CONTEXT_TURNS} turns / cap {llm.MAX_CONTEXT_MESSAGES} msgs, "
                 f"429-retry x{llm.MAX_RETRIES}; HPC fallback "
                 f"{'ON -> ' + HPC_LLM_MODEL if (HPC_LLM_BASE and HPC_LLM_KEY) else 'OFF (ME3_HPC_* unset)'})")
     # Attach the non-invasive reply-token observer on the LLM (event handler,

@@ -1717,9 +1717,13 @@ def _chat_load_impl():
         import shell_tools as _sh
     except ImportError:
         pass
-    _lib = None
+    _lib = _mem = None
     try:
         import library_tools as _lib      # files-only mode (2026-11-18)
+    except ImportError:
+        pass
+    try:
+        import memory_tools as _mem       # saved notes about the user (2026-11-18)
     except ImportError:
         pass
 
@@ -1735,7 +1739,7 @@ def _chat_load_impl():
         return out
 
     tools = []
-    for mod in (_ui, _sp, _web, _ft, _sh, _lib):
+    for mod in (_ui, _sp, _web, _ft, _sh, _lib, _mem):
         if mod is None:
             continue
         for (n, d, p) in mod.TOOL_SPECS:
@@ -1879,7 +1883,9 @@ def _chat_run(msg: str, emit=None):
         # appear as assistant.tool_calls + tool messages, it reliably
         # emits the tool call. UI-only fields ("tools" chip payload) are
         # dropped — Groq 400s on unknown message fields.
-        tail = list(STATE["chat_history"])[-10:]  # 5 user+assistant turns
+        # (2026-11-18) 8 turns, was 5; turns older than the last two get
+        # their tool results shortened below (context_util.shorten_old).
+        tail = list(STATE["chat_history"])[-16:]  # 8 user+assistant turns
         prior = []
         for m in tail:
             if m["role"] == "assistant" and m.get("tool_calls"):
@@ -1901,6 +1907,18 @@ def _chat_run(msg: str, emit=None):
         _sys = _CHAT_PROMPT or "You are Boots, a warm voice assistant."
     # Files-only mode (2026-11-18): the passages matching this message ride
     # in the system message for this turn only (same as agent.py).
+    try:
+        import context_util as _cu
+        while prior and prior[0].get("role") != "user":   # start on a user turn
+            prior.pop(0)
+        _cu.shorten_old(prior + [{"role": "user", "content": msg}])
+    except Exception:
+        pass
+    try:
+        import memory_tools as _mem
+        _sys += _mem.prompt_block()
+    except Exception:
+        pass
     try:
         import library_tools as _lib
         _prev = next((m.get("content") or "" for m in reversed(prior)
@@ -1927,6 +1945,15 @@ def _chat_run(msg: str, emit=None):
     _wants_site = bool(_SITE_INTENT.search(msg))
     _nudged = False
     _force_tool = None
+    # "Remember that..." must actually save (2026-11-18, seen live: Qwen said
+    # "Got it, I'll remember" with no remember call). Forces the call on the
+    # first round only; see memory_tools.wants_remember.
+    try:
+        import memory_tools as _mt
+        if _mt.wants_remember(msg):
+            _force_tool = "remember"
+    except Exception:
+        pass
     for _ in range(10):  # research (2-3 search + 2 fetch) + write needs >5 (2026-11-07)
         body = {"model": _CHAT_LLM.model, "messages": messages,
                 "tools": _CHAT_TOOLS, "temperature": 0.3,
@@ -2124,6 +2151,8 @@ def _chat_run(msg: str, emit=None):
                 res = _sh_dispatch(name, args)
             elif name in _LIB_NAMES:
                 res = _lib_dispatch(name, args)
+            elif name in ("remember", "forget", "list_memories"):
+                res = _mem_dispatch(name, args)
             elif name in ("web_search", "fetch_url") and _lib_web_blocked():
                 res = ("Not run: files-only mode is on, so web search is off. Tell the user "
                        "their files don't cover this and ask if they want you to check the web.")
@@ -2145,8 +2174,10 @@ def _chat_run(msg: str, emit=None):
             # "ok · undefined ms" and the chip looked stuck loading).
             # ok: explicit success flag so the UI stops guessing from the
             # result string (errors auto-open the detail block in amber).
+            # (2026-11-18) 1500, was 200: later turns are built from this
+            # record, and 200 characters lost what a page or file said.
             calls.append({"id": tc["id"], "name": name, "args": args,
-                          "seq": seq, "result": str(res)[:200],
+                          "seq": seq, "result": str(res)[:1500],
                           "ms": int((time.time() - t_tool) * 1000),
                           "ok": not err})
             messages.append({"role": "tool", "tool_call_id": tc["id"],
@@ -2176,7 +2207,7 @@ def _chat_run(msg: str, emit=None):
                 "id": c["id"], "type": "function",
                 "function": {"name": c["name"],
                              "arguments": json.dumps(c.get("args") or {})},
-                "result": c["result"][:200]} for c in calls]
+                "result": c["result"][:1500]} for c in calls]
         STATE["chat_history"].append(entry)
     # Latency breakdown for the UI readout: llm = all LLM round-trips,
     # tool = all tool execs, total = whole turn. asr/tts are voice-only
@@ -2221,6 +2252,14 @@ _LIB_NAMES = {"add_files", "find_and_download", "list_library", "list_collection
 def _lib_dispatch(name, args):
     try:
         import library_tools as _m
+        return _m.dispatch(name, **args)
+    except Exception as e:
+        return f"tool {name} errored: {e!r}"
+
+
+def _mem_dispatch(name, args):
+    try:
+        import memory_tools as _m
         return _m.dispatch(name, **args)
     except Exception as e:
         return f"tool {name} errored: {e!r}"

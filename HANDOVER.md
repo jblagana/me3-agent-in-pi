@@ -829,6 +829,18 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
 - **Not done yet:** a voice test (needs the EMEET), the Library card on the dashboard, and search by meaning (plan steps 4–5).
 - **Backup:** `~/me3_backup_20261118_library`.
 
+### 8.6 Context window and saved notes, 2026-11-18
+
+- **The window is now turns, not messages.** The voice agent keeps the last 8 user turns (`ME3_LLM_MAX_TURNS`), with 60 messages as a hard cap (`ME3_LLM_MAX_MSGS`, was 24). Before, one website build (about 12 messages) pushed the whole earlier conversation out.
+- **Older turns are shortened.** In turns older than the last two, tool results are cut to 400 characters, and big tool-call arguments (website HTML) are cut to short valid JSON. See `context_util.py`.
+- **Saved notes** (`memory_tools.py`, file `~/.boots_memory.json`): the tools are `remember`, `forget` and `list_memories`. The notes go into the system prompt on every call, voice and typed chat alike, and survive restarts. Limits: 40 notes and 1,200 characters in the prompt. Passwords, codes, keys and card or account numbers are refused.
+- **Remember guard:** live, Qwen said "Got it, I'll remember" without calling the tool. A "remember that…" request now forces the `remember` call on the turn's first round, with no extra LLM call. Questions ("do you remember…"), to-dos ("remember to…", which is a reminder) and "I can't remember…" are left alone.
+- **Typed chat:** it now sees 8 turns (was 5) and keeps 1,500 characters of each past tool result (was 200).
+- **Tests:** `tests/test_context.py` passes on the Pi, along with the other 6 test files.
+- **Live check through typed chat (about 6 Groq calls in all, including a first attempt before the guard):** Boots saved "likes OPM music, especially Ben&Ben". After a dashboard restart, "What kind of music do I like?" was answered from the note. The test note was deleted afterwards.
+- **Seen again:** the stray `</think>` (see 8.1) duplicated one reply. It's not fixed yet.
+- **Backup:** `~/me3_backup_20261118_context`.
+
 ## 9. Phase 6: tests and hygiene
 
 1. Unit tests, no audio needed:

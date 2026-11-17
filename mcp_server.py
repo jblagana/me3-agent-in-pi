@@ -35,10 +35,11 @@ import web_tools as web_mod
 import files_tools as files_mod
 import shell_tools as shell_mod
 import library_tools as lib_mod
+import memory_tools as mem_mod
 
 mcp = FastMCP("boots")
 
-_MODULES = [ui_mod, spotify_mod, web_mod, files_mod, shell_mod, lib_mod]
+_MODULES = [ui_mod, spotify_mod, web_mod, files_mod, shell_mod, lib_mod, mem_mod]
 
 def _make_tool(mod, name, desc, params):
     """Build a properly-typed function for FastMCP to introspect.
