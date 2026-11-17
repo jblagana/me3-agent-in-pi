@@ -370,6 +370,110 @@ def _restore_interrupted_reply(context):
         logger.debug(f"[me3] restore interrupted reply failed: {e!r}")
 
 
+def _is_bg_note(m):
+    return (isinstance(m, dict) and m.get("role") == "user"
+            and isinstance(m.get("content"), str) and m["content"].startswith(_BG_NOTE))
+
+
+def _bg_results_to_notes(context):
+    """Turn Pipecat's async-tool developer messages into labelled user
+    messages Qwen accepts (2026-11-18). Returns how many were converted.
+
+    Pipecat writes a background job's result as a developer message when the
+    conversation moved on while it ran (and for updates/cancellations). Qwen
+    allows a single system message, first, so _stamp_system_and_strip used to
+    delete every developer message, and the result was lost. Mutates
+    context.messages in place."""
+    try:
+        from pipecat.processors.aggregators import async_tool_messages as atm
+    except Exception:
+        return 0
+    n = 0
+    try:
+        msgs = context.messages
+        names = {}
+        for m in msgs:
+            for tc in ((m.get("tool_calls") if isinstance(m, dict) else None) or []):
+                if isinstance(tc, dict):
+                    names[tc.get("id")] = (tc.get("function") or {}).get("name")
+        for i, m in enumerate(msgs):
+            if not (isinstance(m, dict) and m.get("role") == "developer"):
+                continue
+            p = atm.parse_message(m)
+            if p is None:
+                continue
+            tool = names.get(p.tool_call_id) or "a background job"
+            res = p.result if p.result is not None else ""
+            try:
+                import json as _json
+                dec = _json.loads(res)
+                res = dec if isinstance(dec, str) else res
+            except Exception:
+                pass
+            if p.kind == "intermediate":
+                body = f"{tool} progress: {res}"
+            elif str(res).startswith("CANCELLED"):
+                body = f"{tool} did not finish (it was stopped or timed out). Tell the user."
+            else:
+                body = f"{tool} finished. Result: {res}"
+            msgs[i] = {"role": "user", "content": f"{_BG_NOTE} {body}"}
+            n += 1
+        if n:
+            logger.info(f"[me3] background job result(s) handed to the model: {n}")
+    except Exception as e:
+        logger.debug(f"[me3] background result conversion skipped: {e!r}")
+    return n
+
+
+def _merge_user_fragments(context):
+    """Join back-to-back user messages into one (2026-11-17).
+
+    Speech arrives in pieces: "Take down" / "by" / "demon hunters." each
+    became its own turn, each cut off the reply to the one before, and the
+    model got three short user messages. With no reply between them they are
+    one request, so they are joined with spaces: "Take down by demon
+    hunters." A spoken (cut-off) reply that _restore_interrupted_reply put
+    back sits between them, so pieces said across a reply stay separate.
+    Only plain-text messages are joined. Mutates context.messages in place."""
+    try:
+        msgs = context.messages
+        out, merged = [], 0
+        for m in msgs:
+            prev = out[-1] if out else None
+            if (isinstance(m, dict) and isinstance(prev, dict)
+                    and m.get("role") == "user" and prev.get("role") == "user"
+                    and isinstance(m.get("content"), str) and isinstance(prev.get("content"), str)
+                    and set(m) <= {"role", "content"} and set(prev) <= {"role", "content"}
+                    and not _is_bg_note(m) and not _is_bg_note(prev)):
+                a, b = prev["content"].strip(), m["content"].strip()
+                prev["content"] = f"{a} {b}".strip()
+                merged += 1
+                continue
+            out.append(m)
+        if merged:
+            msgs.clear()
+            msgs.extend(out)
+            logger.info(f"[me3] joined {merged} user fragment(s): {out[-1].get('content')!r}"
+                        if isinstance(out[-1], dict) and out[-1].get("role") == "user"
+                        else f"[me3] joined {merged} user fragment(s)")
+    except Exception as e:
+        logger.debug(f"[me3] merge user fragments skipped: {e!r}")
+
+
+# Reply cut off, then no words (2026-11-17). Pipecat's empty-user-turn
+# recovery runs the LLM once when a user turn that interrupted Boots ends
+# with no transcript (seen live: a late repeat interim cancelled a song
+# request and nothing re-ran). Its default prompt asks the user to repeat;
+# Boots carries on instead. The note goes into the system instruction for
+# that one call (_stamp_system_and_strip). ME3_EMPTY_TURN_RERUN=0 turns it off.
+EMPTY_TURN_PROMPT = (
+    "The user's last turn had no new recognized words; it only cut off your "
+    "response. Carry on: if you have not answered the user's latest request "
+    "yet, answer it now, calling tools if needed. If your reply was cut off "
+    "midway, finish it briefly without repeating what you already said. Do "
+    "not ask the user to repeat.")
+
+
 def _voice_turn_start():
     """A new utterance was transcribed — reset the per-turn latency stamps."""
     _VOICE_T["heard"] = time.monotonic()
@@ -454,6 +558,40 @@ def _progress_text(name, args):
     if name == "run_command":
         return "Running that command."
     return None
+
+
+# Start lines for a background job (2026-11-18): fixed text, so no LLM call,
+# but rotated, and short once you've heard one recently. Used only when the
+# model didn't already say something itself in the reply that started it.
+_BG_START_FULL = [
+    "On it. I'll build {what} now; it takes a minute or two, so ask me anything meanwhile.",
+    "Sure, working on {what} now. You can keep talking to me while I do.",
+    "Got it, I'm putting {what} together. I'll tell you when it's ready.",
+]
+_BG_START_SHORT = ["On it.", "Sure, working on it.", "Got it, I'll let you know."]
+_BG_START_RECENT_S = float(os.environ.get("ME3_BG_START_RECENT_S", "600"))
+_BG_SPOKEN = {"last": 0.0, "n": 0}
+
+
+def _bg_start_text(name):
+    """Spoken when a background job starts (no LLM call)."""
+    what = {"write_website": "the website", "build_app": "the app",
+            "publish_website": "your page"}.get(name, "that")
+    now = time.monotonic()
+    recent = _BG_SPOKEN["last"] and now - _BG_SPOKEN["last"] < _BG_START_RECENT_S
+    pool = _BG_START_SHORT if recent else _BG_START_FULL
+    text = pool[_BG_SPOKEN["n"] % len(pool)].format(what=what)
+    _BG_SPOKEN["last"], _BG_SPOKEN["n"] = now, _BG_SPOKEN["n"] + 1
+    return text
+
+
+def _model_said_something():
+    """True when this LLM round already streamed words before its tool call
+    (the reply tap keeps them in _RECENT_TEXT['reply']; they go to the voice
+    on their own)."""
+    import re as _re
+    txt = (_RECENT_TEXT.get("reply") or "").replace("</think>", " ")
+    return len(_re.findall(r"[A-Za-z]{2,}", txt)) >= 2
 
 
 def _speak_progress(text, force=False):
@@ -738,8 +876,27 @@ class StatusIndicator(FrameProcessor):
         self._idle_timer = loop.call_later(delay, _go)
 
     async def process_frame(self, frame, direction):
+        # Phase 1 (2026-11-16): the base handler MUST run. It creates this
+        # processor's data-frame task on StartFrame; without it every
+        # non-system frame (transcripts, TTSSpeakFrame, ...) queued here and
+        # never ran -- the root cause of the transcript bypass and the
+        # "never put a processor between llm and tts" rule.
+        await super().process_frame(frame, direction)
         self._rearm()
-        if isinstance(frame, (UserStartedSpeakingFrame, VADUserStartedSpeakingFrame)):
+        # Who is talking right now, for unprompted job updates (2026-11-18).
+        if isinstance(frame, (VADUserStartedSpeakingFrame, UserStartedSpeakingFrame)):
+            _SPEAK_GATE["user"] = True
+        elif isinstance(frame, (UserStoppedSpeakingFrame, VADUserStoppedSpeakingFrame)):
+            _SPEAK_GATE["user"] = False
+        elif isinstance(frame, BotStartedSpeakingFrame):
+            _SPEAK_GATE["bot"] = True
+        elif isinstance(frame, BotStoppedSpeakingFrame):
+            _SPEAK_GATE["bot"] = False
+        if isinstance(frame, VADUserStartedSpeakingFrame):
+            # Raw voice activity: pre-warm only. With the min-words start
+            # strategy (2026-11-16) a VAD blip while Boots talks is NOT a turn
+            # start (room noise fired it every ~1.5 s), so the UI reset and the
+            # interrupted-reply capture moved to the real UserStartedSpeakingFrame.
             # Pre-warm the Groq ASR connection while the user is still talking
             # (an idle-closed TLS session cost ~0.7 s on the next transcript).
             try:
@@ -753,6 +910,9 @@ class StatusIndicator(FrameProcessor):
                     _rvw.prewarm_tts()
             except Exception:
                 pass
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            # The aggregator decided a user turn really started (broadcast
+            # both ways, so it reaches this upstream processor).
             if self._bot_talking and (_RECENT_TEXT.get("reply") or "").strip():
                 _INTERRUPTED_REPLY["text"] = _RECENT_TEXT["reply"].strip()
                 _INTERRUPTED_REPLY["ts"] = time.monotonic()
@@ -833,7 +993,22 @@ class StatusIndicator(FrameProcessor):
                 logger.info(f"[me3] calling tool(s): {names} args={_RECENT_TEXT.get('tool_args')!r}")
             # Progress update for a slow tool (spoken + intermediate bubble),
             # and arm the "still working" check for this turn (once).
-            if PROGRESS_ENABLED and fcs:
+            bg = [n for n in names if n in _BG_TOOLS]
+            if bg:
+                # Background job (2026-11-18): one fixed line, no LLM call, and
+                # the turn is over -- the user may talk while it runs. The
+                # still-working check is not armed (the job reports itself).
+                _VOICE_T["final_seen"] = True
+                if _model_said_something():
+                    # the model's own "Sure, I'll build that" is already
+                    # being spoken: no canned line on top of it
+                    logger.info("[me3] background job: model acknowledged it itself")
+                    _BG_SPOKEN["last"] = time.monotonic()
+                else:
+                    _speak_progress(_bg_start_text(bg[0]), force=True)
+                if not PROGRESS_ENABLED or _PROGRESS["tts"] is None:
+                    _TURN_INFLIGHT["until"] = 0.0
+            elif PROGRESS_ENABLED and fcs:
                 try:
                     if names[0] in _SLOW_TOOLS:
                         _speak_progress(_progress_text(names[0], fcs[0].arguments or {}))
@@ -887,6 +1062,8 @@ class StatusIndicator(FrameProcessor):
                     pass
         elif isinstance(frame, BotStoppedSpeakingFrame):
             self._bot_talking = False
+            if _WELCOME["text"]:
+                _finish_welcome()   # the pipeline greeting just finished
             # Reply audio done -> idle timer may rest. NOT after a progress
             # update mid-turn (the final reply hasn't come yet), or the UI
             # would flip to 'listening' between updates.
@@ -912,6 +1089,8 @@ class StatusIndicator(FrameProcessor):
             was_speaking = self._bot_talking
             _TURN_INFLIGHT["until"] = 0.0
             self._state["bot_speaking"] = False
+            if was_speaking and _WELCOME["text"]:
+                _finish_welcome()   # talked over the greeting
             if was_speaking:
                 logger.info("[me3] BARGE-IN: user interrupted Boots mid-reply")
                 self._set("listening", "Barge-in: you interrupted me")
@@ -1174,6 +1353,7 @@ class InputGate(FrameProcessor):
         self._last_mic_push = 0.0
 
     async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)   # see StatusIndicator
         from pipecat.frames.frames import InputAudioRawFrame
         if isinstance(frame, InputAudioRawFrame):
             # FIX: compute a live mic level (RMS) on the RAW audio *before* the
@@ -1277,14 +1457,14 @@ class _MCPBridge:
             logger.error("[mcp] bridge failed to start: %r "
                          "(handlers fall back to direct dispatch)" % (e,))
 
-    async def call(self, tool, args):
+    async def call(self, tool, args, timeout=60):
         """Return the tool result string via MCP, or None to signal fallback."""
         if not self.available or self._session is None:
             return None
         import asyncio as _aio
         try:
             res = await _aio.wait_for(
-                self._session.call_tool(tool, dict(args or {})), timeout=60)
+                self._session.call_tool(tool, dict(args or {})), timeout=timeout)
             text = "".join(getattr(c, "text", "") or "" for c in res.content)
             self.calls_via_mcp += 1
             logger.info("[mcp] ran %s via bridge (%d total)" % (tool, self.calls_via_mcp))
@@ -1293,7 +1473,7 @@ class _MCPBridge:
             # NOT a fallback trigger (2026-11-07): the tool may still be
             # running in the MCP server, and re-running it directly would
             # double its side effects (two websites, two reminders...).
-            logger.warning("[mcp] call %s timed out after 60s (no re-run)" % tool)
+            logger.warning("[mcp] call %s timed out after %ss (no re-run)" % (tool, timeout))
             return ("That's taking longer than expected, so I stopped waiting. "
                     "It may still finish in the background.")
         except Exception as e:
@@ -1367,6 +1547,138 @@ async def _web_handler(params):
     except Exception:
         pass
     return result
+
+
+# ---------------------------------------------------------------------------
+# BACKGROUND JOBS (2026-11-18). Website/app builds used to hold the turn:
+# talking during one cancelled it on Boots' side (the MCP server finished the
+# work, but the result was thrown away), and anything past 60 s was dropped.
+# These tools now run as Pipecat async calls (cancel_on_interruption=False):
+# Boots says one fixed line (no LLM call), you can keep talking, and when the
+# job ends its result comes back into the conversation. Groq cost: no LLM
+# call at start; one at the end to announce the result -- the same call a
+# build makes today. Questions asked meanwhile cost what they always do.
+# One job per tool at a time. ME3_BG_TOOLS="" turns it off.
+# ---------------------------------------------------------------------------
+_BG_TOOLS = {t.strip() for t in os.environ.get(
+    "ME3_BG_TOOLS", "write_website,build_app,publish_website").split(",") if t.strip()}
+BG_TIMEOUT_S = float(os.environ.get("ME3_BG_TIMEOUT_S", "300"))
+_BG_JOBS = {}                    # tool name -> start time (monotonic)
+_BG_STATUS = {}                  # tool name -> current stage, from web_tools._stage
+_BG_NOTE = "[Background job update, not said by the user]"
+# Unprompted updates (2026-11-18): while a job runs, Boots speaks the stages
+# web_tools marks as worth saying ("the website's built, publishing it now"),
+# plus one "still working" if it runs long. Fixed lines (no LLM call), only
+# when nobody is talking and no reply is in flight, >= BG_UPDATE_GAP_S apart;
+# an update that can't be said within 60 s is dropped (the result covers it).
+BG_UPDATES = os.environ.get("ME3_BG_UPDATES", "1") != "0"
+BG_UPDATE_GAP_S = float(os.environ.get("ME3_BG_UPDATE_GAP_S", "20"))
+BG_NUDGE_S = float(os.environ.get("ME3_BG_NUDGE_S", "90"))
+_SPEAK_GATE = {"user": False, "bot": False}
+_BG_LAST_UPDATE = {"t": 0.0}
+_BG_WHAT = {"write_website": "the website", "build_app": "the app", "publish_website": "your page"}
+
+
+def _bg_running_text():
+    """'write_website (started 40 s ago; now: ...)' for the running jobs, or ''."""
+    now = time.monotonic()
+    return ", ".join(
+        f"{n} (started {int(now - t0)} s ago"
+        + (f"; now: {_BG_STATUS[n]}" if _BG_STATUS.get(n) else "") + ")"
+        for n, t0 in _BG_JOBS.items())
+
+
+def _bg_can_speak():
+    return (not _SPEAK_GATE["user"] and not _SPEAK_GATE["bot"]
+            and time.monotonic() >= _TURN_INFLIGHT["until"])
+
+
+def _bg_stage_path(tool):
+    return os.path.join(getattr(web, "JOB_DIR", "/tmp/me3-jobs"), tool + ".json")
+
+
+async def _bg_watch(tool, poll_s=1.0):
+    """Follow one job's stage file and speak its updates (see above)."""
+    import asyncio
+    import json as _json
+    t0 = _BG_JOBS.get(tool, time.monotonic())
+    seen, pending, nudged = None, None, False
+    while True:
+        await asyncio.sleep(poll_s)
+        try:
+            with open(_bg_stage_path(tool), encoding="utf-8") as f:
+                st = _json.load(f)
+        except Exception:
+            st = None
+        now = time.monotonic()
+        if st and st.get("key") != seen:
+            seen = st.get("key")
+            _BG_STATUS[tool] = st.get("status") or ""
+            logger.info(f"[me3] background job {tool}: {_BG_STATUS[tool]}")
+            if st.get("say"):
+                pending = (st["say"], now)
+        if (not pending and not nudged and now - t0 >= BG_NUDGE_S
+                and now - _BG_LAST_UPDATE["t"] >= BG_NUDGE_S / 2):
+            nudged = True
+            pending = (f"Still working on {_BG_WHAT.get(tool, 'that')}; it's taking a bit "
+                       "longer. I'll tell you when it's done.", now)
+        if pending and now - pending[1] > 60:
+            logger.info(f"[me3] background update dropped (no quiet moment): {pending[0]!r}")
+            pending = None
+        if (pending and BG_UPDATES and _bg_can_speak()
+                and now - _BG_LAST_UPDATE["t"] >= BG_UPDATE_GAP_S):
+            _BG_LAST_UPDATE["t"] = now
+            logger.info(f"[me3] background update spoken: {pending[0]!r}")
+            _speak_progress(pending[0], force=True)
+            pending = None
+
+
+async def _web_bg_body(params):
+    """A web tool run as a background job (see BACKGROUND JOBS)."""
+    import asyncio
+    tool = getattr(params, "function_name", None)
+    args = dict(getattr(params, "arguments", None) or {})
+    if tool in _BG_JOBS:
+        result = (f"{tool} is already running in the background (started "
+                  f"{int(time.monotonic() - _BG_JOBS[tool])} s ago). Its result will come "
+                  "when it finishes; do not start it again.")
+    else:
+        _BG_JOBS[tool] = time.monotonic()
+        _BG_LAST_UPDATE["t"] = time.monotonic()      # the start line was just said
+        try:
+            os.remove(_bg_stage_path(tool))         # no stale stage from a past job
+        except OSError:
+            pass
+        watcher = asyncio.ensure_future(_bg_watch(tool))
+        logger.info(f"[me3] background job started: {tool}")
+        try:
+            result = await _MCP.call(tool, args, timeout=max(30.0, BG_TIMEOUT_S - 10))
+            if result is None:
+                result = await asyncio.to_thread(web.dispatch, tool, **args)
+                _MCP.calls_fallback += 1
+        except Exception as e:
+            result = f"{tool} failed: {e!r}"
+        finally:
+            watcher.cancel()
+            _BG_STATUS.pop(tool, None)
+            dt = time.monotonic() - _BG_JOBS.pop(tool, time.monotonic())
+            logger.info(f"[me3] background job finished: {tool} after {dt:.0f}s")
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
+
+
+try:
+    from pipecat.adapters.schemas.direct_function import tool_options as _tool_options
+    _web_bg_handler = _tool_options(cancel_on_interruption=False,
+                                    timeout_secs=BG_TIMEOUT_S)(_web_bg_body)
+except Exception as _e:                      # older Pipecat: keep them synchronous
+    logger.warning(f"[me3] background jobs unavailable ({_e!r}); builds hold the turn")
+    _BG_TOOLS = set()
+    _web_bg_handler = None
 
 
 async def _ui_handler(params):
@@ -1468,7 +1780,11 @@ def _function_schemas():
     for (n, d, p) in sp.TOOL_SPECS:
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(sp, n, p), handler=_spotify_handler))
     for (n, d, p) in web.TOOL_SPECS:
-        out.append(FunctionSchema(n, d, _normalize_props(p), _required(web, n, p), handler=_web_handler))
+        h = _web_bg_handler if n in _BG_TOOLS else _web_handler
+        if n in _BG_TOOLS:
+            d = (d + " Runs in the background: in the same reply as this call, tell the user"
+                     " in a few natural words that you're on it; the result comes later.")
+        out.append(FunctionSchema(n, d, _normalize_props(p), _required(web, n, p), handler=h))
     for (n, d, p) in ft.TOOL_SPECS:
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(ft, n, p), handler=_files_handler))
     for (n, d, p) in sh.TOOL_SPECS:
@@ -1540,6 +1856,54 @@ async def _speak_welcome(tts: "PiperLocalTTSService", spk_dev: int, state: dict)
 
 
 # --------------------------------------------------------------------------- #
+# Welcome THROUGH THE PIPELINE (2026-11-16). Phase 1 made processors pass data
+# frames, so the greeting is now a TTSSpeakFrame handed straight to the
+# pipeline TTS (same as progress updates and the error apology): same
+# streaming voice as replies, no second PyAudio stream, no 0.45 s lead-in,
+# and Boots is listening while it greets (you can talk over it).
+# ME3_WELCOME_PIPELINE=0 restores the old direct playback (_speak_welcome).
+# --------------------------------------------------------------------------- #
+WELCOME_TEXT = "Hi there. I am Boots."
+WELCOME_PIPELINE = os.environ.get("ME3_WELCOME_PIPELINE", "1").strip() != "0"
+# The output stream opens at pipeline start, and the EMEET drops the head of a
+# freshly opened stream. The keep-alive mixer feeds it silence from the start,
+# so waiting this long means the greeting plays on an already-running stream.
+WELCOME_DELAY_S = float(os.environ.get("ME3_WELCOME_DELAY_S", "0.8"))
+_WELCOME = {"text": None}
+
+
+def _finish_welcome():
+    """Close the greeting's UI turn (called when Boots stops speaking it,
+    is interrupted, or after a safety timeout). Idempotent."""
+    text = _WELCOME["text"]
+    if not text:
+        return
+    _WELCOME["text"] = None
+    # Same closing push as the old path: the dashboard stores the greeting
+    # from a 'greeting' push whose phase is no longer 'speaking'.
+    _me3_push("idle", extra={"greeting": True, "response": text})
+    logger.info("[me3] welcome finished (pipeline)")
+
+
+async def _welcome_via_pipeline(tts):
+    await asyncio.sleep(WELCOME_DELAY_S)
+    text = WELCOME_TEXT
+    _WELCOME["text"] = text
+    _RECENT_TEXT["reply"] = text
+    _me3_push("speaking", extra={"greeting": True, "response": text})
+    logger.info(f"[me3] speaking welcome through the pipeline: {text!r}")
+    try:
+        await tts.queue_frame(TTSSpeakFrame(text, append_to_context=False))
+    except Exception as e:
+        logger.error(f"[me3] welcome queue failed: {e!r}")
+        _finish_welcome()
+        return
+    # Safety net: if no BotStoppedSpeaking arrives (TTS down), still close
+    # the UI turn so the next real reply isn't stored as the greeting.
+    asyncio.get_running_loop().call_later(15.0, _finish_welcome)
+
+
+# --------------------------------------------------------------------------- #
 # Groq-resilient LLM (D23): 429 retry + context trimming.
 #
 # Groq's free tier rate-limits (429 Too Many Requests) under barge-in-heavy
@@ -1578,8 +1942,37 @@ def _stamp_system_and_strip(context, llm) -> None:
                 "search for them with the user's own words and year, never change the year.")
         if _BASE_SYSTEM_TEXT is None:
             _BASE_SYSTEM_TEXT = SYSTEM_PROMPT
+        # Background job results (2026-11-18) arrive as developer messages,
+        # which this strip would delete. They become labelled user messages
+        # (kept, so the model still knows the URL later), and the job rules
+        # are added only while a job runs or a result is in the context.
+        bg_notes = _bg_results_to_notes(context)
+        running = _bg_running_text()
+        if running or bg_notes:
+            line += ("\n\nBACKGROUND JOBS: website, app and publish jobs run in the background"
+                     " while the conversation goes on."
+                     + (f" Running now: {running}. If the user asks something else, answer it"
+                        " normally and briefly; if they ask about the job, say it is still"
+                        " working. Never start a running job again and never invent its result."
+                        if running else "")
+                     + f" A message starting with {_BG_NOTE} is a job result, not the user"
+                     " speaking: first answer what the user last said, if anything, then tell"
+                     " them the result in one short sentence. Do not read a URL aloud; say it"
+                     " is on the dashboard. Tell each result once.")
+        # A developer note at the END of the context is meant for THIS call
+        # (2026-11-17: Pipecat's empty-user-turn recovery adds one). It can't
+        # stay where it is (Qwen wants a single system message first), so its
+        # text rides in the system instruction for this one request.
+        note = ""
+        msgs = context.messages
+        k = len(msgs)
+        while k > 0 and isinstance(msgs[k - 1], dict) and msgs[k - 1].get("role") == "developer":
+            k -= 1
+        tail_notes = [m.get("content") for m in msgs[k:] if isinstance(m.get("content"), str)]
+        if tail_notes:
+            note = "\n\n" + "\n".join(tail_notes)
         try:
-            llm._settings.system_instruction = _BASE_SYSTEM_TEXT + line
+            llm._settings.system_instruction = _BASE_SYSTEM_TEXT + line + note
         except Exception:
             pass
         for _m in list(context.messages):
@@ -1657,7 +2050,8 @@ def _site_guard_choice(context):
     try:
         msgs = list(context.messages)
         role = lambda m: (m.get("role") if isinstance(m, dict) else getattr(m, "role", "")) or ""
-        last_user = max((i for i, m in enumerate(msgs) if role(m) == "user"), default=None)
+        last_user = max((i for i, m in enumerate(msgs)
+                         if role(m) == "user" and not _is_bg_note(m)), default=None)
         if last_user is None:
             return None
         um = msgs[last_user]
@@ -1750,6 +2144,7 @@ class GroqResilientLLM(OpenAILLMService):
         #    can't answer "what time is it?" or reason about relative times).
         _stamp_system_and_strip(context, self)
         _restore_interrupted_reply(context)     # barge-in memory fix (2026-11-07)
+        _merge_user_fragments(context)          # "Take down" + "by" -> one (2026-11-17)
         # (2026-11-07) reasoning_effort is no longer forced to 'medium' on
         # every request: _llm_extra() sets the provider-correct value at boot
         # and on every hot-swap (gpt-oss rejects 'none'; vLLM rejects
@@ -1907,6 +2302,7 @@ class ErrorApologyTTS(FrameProcessor):
         self._text = text
 
     async def process_frame(self, frame, direction):
+        await super().process_frame(frame, direction)   # see StatusIndicator
         await self.push_frame(frame, direction)
         if isinstance(frame, ErrorFrame):
             global _last_error_apology
@@ -2139,19 +2535,54 @@ async def build_bot(transport=None):
     # turn once ASR got fast. ME3_SMART_TURN=0 (default) ends the turn on the
     # VAD's own 0.6 s silence + a transcript; =1 restores Smart Turn (better
     # at not cutting in on long mid-thought pauses, slower).
+    from pipecat.turns.user_turn_strategies import UserTurnStrategies
     _turn_kw = {}
+    _stop = None                      # None = Pipecat default (Smart Turn v3)
     if os.environ.get("ME3_SMART_TURN", "0") != "1":
-        from pipecat.turns.user_turn_strategies import UserTurnStrategies
         from pipecat.turns.user_stop.speech_timeout_user_turn_stop_strategy import (
             SpeechTimeoutUserTurnStopStrategy)
-        _turn_kw["user_turn_strategies"] = UserTurnStrategies(
-            stop=[SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.0)])
+        _stop = [SpeechTimeoutUserTurnStopStrategy(user_speech_timeout=0.0)]
         logger.info("[me3] turn end: VAD silence + transcript (Smart Turn off)")
     else:
         logger.info("[me3] turn end: Smart Turn v3 model")
+    # Barge-in on WORDS, not on sound (2026-11-16). The default start strategy
+    # is the VAD, so any noise interrupted Boots (85 barge-ins in 264 turns on
+    # 2026-11-07; on 2026-11-16 room noise fired it every ~1.5 s with nothing
+    # transcribed). MinWords: while Boots speaks, your turn (and so the
+    # interruption) starts only once N words are transcribed (Deepgram interim
+    # results make this quick); while Boots is silent, 1 word is enough.
+    # ME3_BARGEIN_MIN_WORDS=0 restores the VAD default.
+    _start = None                     # None = Pipecat default (VAD + transcript)
+    _mw = int(os.environ.get("ME3_BARGEIN_MIN_WORDS", "2") or 0)
+    if _mw > 0:
+        from pipecat.turns.user_start.min_words_user_turn_start_strategy import (
+            MinWordsUserTurnStartStrategy)
+        _start = [MinWordsUserTurnStartStrategy(min_words=_mw)]
+        logger.info(f"[me3] barge-in: needs {_mw} transcribed words while Boots speaks")
+    else:
+        logger.info("[me3] barge-in: on voice activity (VAD)")
+    if _start or _stop:
+        _turn_kw["user_turn_strategies"] = UserTurnStrategies(start=_start, stop=_stop)
+    # Greeting can't be barged in (2026-11-16): the pipeline welcome is
+    # interruptible like any reply, and room noise tripped the VAD 0.3 s in,
+    # cancelling it before any audio. This built-in strategy ignores the user
+    # until Boots' FIRST speech finishes (it also unmutes if that speech fails
+    # before any audio). Only applies when the welcome is spoken through the
+    # pipeline; ME3_GREETING_MUTE=0 turns it off.
+    if WELCOME_PIPELINE and not bench and os.environ.get("ME3_GREETING_MUTE", "1") != "0":
+        from pipecat.turns.user_mute.mute_until_first_bot_complete_user_mute_strategy import (
+            MuteUntilFirstBotCompleteUserMuteStrategy)
+        _turn_kw["user_mute_strategies"] = [MuteUntilFirstBotCompleteUserMuteStrategy()]
+        logger.info("[me3] greeting: user muted until the welcome finishes")
+    _empty = None
+    if os.environ.get("ME3_EMPTY_TURN_RERUN", "1") != "0":
+        from pipecat.turns.empty_user_turn import EmptyUserTurnConfig
+        _empty = EmptyUserTurnConfig(interrupted_prompt=EMPTY_TURN_PROMPT, idle_prompt=None,
+                                     max_consecutive_recoveries=1)
+        logger.info("[me3] empty turn that cut Boots off: re-run the reply once")
     user_aggregator, assistant_aggregator = LLMContextAggregatorPair(
         context, user_params=LLMUserAggregatorParams(vad_analyzer=vad,
-                                                     empty_user_turn=None, **_turn_kw))
+                                                     empty_user_turn=_empty, **_turn_kw))
 
     if bench:
         in_transport, out_transport = transport.input(), transport.output()
@@ -2223,11 +2654,19 @@ async def run_bot():
         sys.stdout.write("\n")
         sys.stdout.flush()
     runner = PipelineRunner(handle_sigint=True)
-    # Speak the welcome BEFORE the pipeline starts so it can open the
-    # EMEET output device cleanly. Once runner.run() begins, the output
-    # transport holds SPK_DEV and a second PyAudio stream on it fails
-    # with "Device unavailable".
-    await _speak_welcome(tts, SPK_DEV, gate_state)
+    if WELCOME_PIPELINE:
+        # Greet once the pipeline is running (its output transport owns the
+        # EMEET, so the greeting goes through the pipeline TTS).
+        _bg = []
+
+        @task.event_handler("on_pipeline_started")
+        async def _greet(_worker, _frame):
+            _bg.append(asyncio.get_running_loop().create_task(_welcome_via_pipeline(tts)))
+    else:
+        # Old path: play the welcome BEFORE the pipeline starts, on its own
+        # PyAudio stream (once runner.run() begins, the output transport
+        # holds SPK_DEV and a second stream fails with "Device unavailable").
+        await _speak_welcome(tts, SPK_DEV, gate_state)
     await runner.run(task)
     if _USE_ANSI:
         sys.stdout.write("\r\x1b[2K")

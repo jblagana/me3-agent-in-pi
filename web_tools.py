@@ -1096,6 +1096,27 @@ def _gh_publish(slug: str, html: str) -> str:
     except Exception as e:
         return f"Publishing to GitHub failed ({e!r}). It's still live on the LAN."
 
+# Job stages (2026-11-18). Builds run as background jobs in the agent; this
+# tool usually runs in the MCP subprocess, so it reports its current stage
+# through a small file per tool that the agent polls. `say` is a fixed line
+# Boots may speak unprompted (no LLM call); `status` is what the model is
+# told if you ask how it's going. Never raises.
+JOB_DIR = os.environ.get("ME3_JOB_DIR") or os.path.join(
+    __import__("tempfile").gettempdir(), "me3-jobs")
+
+
+def _stage(tool: str, key: str, status: str, say: str = "") -> None:
+    try:
+        os.makedirs(JOB_DIR, exist_ok=True)
+        path = os.path.join(JOB_DIR, tool + ".json")
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"key": key, "status": status, "say": say, "t": _time.time()}, f)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def _build_app(name: str, html: str, publish: bool = True) -> str:
     """Save an LLM-written single-file app, verify it renders without JS
     errors (headless Chromium), and publish it like a website (2026-11-07)."""
@@ -1119,12 +1140,15 @@ def _build_app(name: str, html: str, publish: bool = True) -> str:
     except Exception as e:
         return f"I couldn't save the app ({e!r})."
     url = f"http://{_site_host()}:{_SITE_PORT}/site/{slug}.html"
+    _stage("build_app", "testing", "the app is written; testing that it runs")
     verify = _verify_site(f"http://127.0.0.1:{_SITE_PORT}/site/{slug}.html", html)
     if "JS errors" in verify:
         return (f"The app has JavaScript errors, so I didn't publish it: {verify}. "
                 f"Fix the code and call build_app again. (Local copy: {url})")
     msg = f"Built the app '{name}'. "
     if publish:
+        _stage("build_app", "publishing", "the app works; publishing it to GitHub Pages",
+               say="Quick update: the app works, and I'm publishing it now.")
         pub = _gh_publish(slug, html)
         if pub.startswith("Published"):
             return msg + pub + f" (Also on the local network at {url}; {verify}.)"
@@ -1235,6 +1259,7 @@ def _write_website(topic: str, title: str, description: str,
     os.makedirs(SITES_DIR, exist_ok=True)
     path = os.path.join(SITES_DIR, slug + ".html")
 
+    _stage("write_website", "images", "finding pictures and laying out the page")
     html = _render_site(title, topic, description, h,
                         sections=sections, sources=sources, stats=stats,
                         hero_image=hero_image)
@@ -1248,6 +1273,7 @@ def _write_website(topic: str, title: str, description: str,
     url = f"http://{_site_host()}:{_SITE_PORT}/site/{slug}.html"
     # Verify through loopback: the server is on this machine, and the LAN
     # address can be unreachable from itself (or wrong, like the old default).
+    _stage("write_website", "checking", "the page is built; checking that it renders")
     verify = _verify_site(f"http://127.0.0.1:{_SITE_PORT}/site/{slug}.html", html)
     n_sec = len([s for s in (sections or [])
                  if isinstance(s, dict) and ((s.get("heading") or "").strip()
@@ -1257,6 +1283,8 @@ def _write_website(topic: str, title: str, description: str,
            + (f" and {n_img} photo{'s' if n_img != 1 else ''}" if n_img else "")
            + ". ")
     if publish:
+        _stage("write_website", "publishing", "the page is built and checked; publishing it to GitHub Pages",
+               say="Quick update: the website's built, and I'm publishing it now.")
         pub = _gh_publish(slug, html)
         if pub.startswith("Published"):
             # public link first; the LAN copy is the fallback

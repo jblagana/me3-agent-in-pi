@@ -120,6 +120,15 @@ def make_stt():
         async def push_frame(self, frame, direction=FrameDirection.DOWNSTREAM):
             if direction == FrameDirection.DOWNSTREAM and isinstance(
                     frame, (TranscriptionFrame, InterimTranscriptionFrame)):
+                # Stale interim (2026-11-17): seen live, an interim of words
+                # already finalised arrived 0.2 s AFTER the turn ended. The
+                # min-words start strategy took it as a new turn, interrupted
+                # the LLM, and the reply (a song request) was lost. After VAD
+                # stop, and before the next VAD start, interims are dropped;
+                # real new speech always brings a VAD start first.
+                if self._stopped and isinstance(frame, InterimTranscriptionFrame):
+                    logger.debug(f"[asr-deepgram] dropped stale interim after VAD stop: {frame.text!r}")
+                    return
                 if isinstance(frame, TranscriptionFrame):
                     t = rv._clean_transcript(frame.text or "")
                     if not re.search(r"[A-Za-z0-9]", t):
@@ -134,6 +143,10 @@ def make_stt():
                         self._fire()
                 # Same delivery as the Groq path: straight to the user aggregator
                 # (a push from a background task isn't reliably processed in 1.12).
+                # ME3_STT_BYPASS=0 uses the normal push instead (phase 1).
+                if not rv.STT_BYPASS:
+                    await super().push_frame(frame, direction)
+                    return
                 try:
                     nxt = getattr(self, "_next", None)
                     for _ in range(3):

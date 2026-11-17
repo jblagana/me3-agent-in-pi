@@ -61,19 +61,25 @@ LEAD_SILENCE_S = float(os.environ.get("ME3_LEAD_SILENCE_S", "0.45"))
 
 # --- edge-tts (primary voice) ----------------------------------------------
 # The chosen Boots voice: Microsoft "Roger" (en-US-RogerNeural) via the free
-# edge-tts endpoint, +30 Hz pitch, +8% rate. No API key / no hard limit (it is
+# edge-tts endpoint, +20 Hz pitch, +8% rate. No API key / no hard limit (it is
 # the public MS speech endpoint), but it NEEDS INTERNET and can be region
 # -blocked or rate-limited, so it is used as the PRIMARY with a fail-soft
 # fallback to the local-over-VPN Qwen3-TTS (vivian). Env-tunable:
 #   ME3_TTS_BACKEND = edge | qwen3 | auto (default auto = edge, fall back to qwen3)
 EDGE_VOICE = os.environ.get("ME3_EDGE_VOICE", "en-US-RogerNeural")
-EDGE_PITCH = os.environ.get("ME3_EDGE_PITCH", "+30Hz")
+EDGE_PITCH = os.environ.get("ME3_EDGE_PITCH", "+20Hz")   # was +30Hz until 2026-11-18
 EDGE_RATE = os.environ.get("ME3_EDGE_RATE", "+8%")
 EDGE_TIMEOUT_S = float(os.environ.get("ME3_EDGE_TIMEOUT_S", "8.0"))
 TTS_BACKEND = os.environ.get("ME3_TTS_BACKEND", "auto").lower()
 
 # Turn-start hook: agent.py points this at StatusIndicator.on_transcript.
 ON_TRANSCRIPT = None
+
+# Transcript bypass (phase 1, 2026-11-16). 1 = deliver transcripts straight to
+# the user aggregator (the old workaround for processors that never ran data
+# frames). 0 = normal Pipecat push through StatusIndicator. The processor fix
+# makes 0 correct; keep 1 as the default until a live voice test confirms it.
+STT_BYPASS = os.environ.get("ME3_STT_BYPASS", "1").strip() != "0"
 
 # fd-benchmark stage mark (2026-11-07). Our transcript is re-delivered
 # straight to the aggregator (push_frame below), so the benchmark's Pipecat
@@ -289,6 +295,9 @@ class Qwen2AudioSTTService(SegmentedSTTService):
                 # turn-stop strategy waited out its 1.0 s STT safety timer
                 # (~0.3 s of dead air once early transcription made ASR fast).
                 frame.finalized = True
+            if not STT_BYPASS:
+                await super().push_frame(frame, direction)
+                return
             try:
                 # Walk the processor chain: self -> status -> user_aggregator.
                 nxt = getattr(self, "_next", None)
@@ -626,7 +635,7 @@ class Qwen3TTSService(TTSService):
 
 
 # =========================================================================== #
-# edge-tts (primary voice: en-US-RogerNeural, +30Hz, +8%) with Qwen3 fallback
+# edge-tts (primary voice: en-US-RogerNeural, +20Hz, +8%) with Qwen3 fallback
 # =========================================================================== #
 class _EdgeSynth:
     """text -> `out_sr` int16 mono PCM via edge-tts + miniaudio.
