@@ -100,6 +100,7 @@ try:
     _CHAT_PROMPT = None
     _CHAT_PROMPT_MOD = None   # prompt module (system_prompt() = base + clock)
     _CHAT_LLM = None
+    _CHAT_GROUPS = None       # tool_router groups (2026-11-18)
 except ImportError:
     _requests = None
 
@@ -1781,6 +1782,20 @@ def _chat_load_impl():
                 },
             })
 
+    # Tool routing (2026-11-18, tool_router.py): each round sends the core
+    # tools plus the groups the user's words point to (see _chat_run).
+    global _CHAT_GROUPS
+    try:
+        import tool_router as _tr
+        if _tr.ENABLED:
+            n, d, p = _tr.TOOL_SPEC
+            tools.append({"type": "function", "function": {
+                "name": n, "description": d,
+                "parameters": {"type": "object", "properties": _norm_props(p),
+                               "required": list(p)}}})
+            _CHAT_GROUPS = _tr.build_groups([m for m in (_ui, _sp, _web, _ft, _sh, _lib, _mem) if m])
+    except Exception:
+        _CHAT_GROUPS = None
     _CHAT_TOOLS = tools
     _CHAT_PROMPT = _prompt.SYSTEM_PROMPT
     _CHAT_PROMPT_MOD = _prompt   # for system_prompt() (base + fresh clock)
@@ -1971,7 +1986,19 @@ def _chat_run(msg: str, emit=None):
     # is told nothing was built, and the next round FORCES write_website.
     _wants_site = bool(_SITE_INTENT.search(msg))
     _nudged = False
+    _empty_retried = False   # empty-reply retry, once per turn (2026-11-18)
     _force_tool = None
+    # Tool routing (2026-11-18): groups used in the last two turns stay loaded.
+    _route_extra = set()
+    _route_used = set()
+    try:
+        import context_util as _cu2
+        _st = _cu2.user_turn_starts(prior)
+        for _m in prior[(_st[-2] if len(_st) >= 2 else 0):]:
+            for _c in _m.get("tool_calls") or []:
+                _route_used.add(((_c.get("function") or {}).get("name")) or "")
+    except Exception:
+        pass
     # "Remember that..." must actually save (2026-11-18, seen live: Qwen said
     # "Got it, I'll remember" with no remember call). Forces the call on the
     # first round only; see memory_tools.wants_remember.
@@ -2014,10 +2041,40 @@ def _chat_run(msg: str, emit=None):
         # delta["reasoning"] (Groq-style APIs: delta["reasoning_content"]);
         # tool_calls arrive as per-chunk fragments (index + name on the
         # first, arguments in pieces) and are reassembled below.
+        try:
+            import tool_router as _tr
+            if _tr.ENABLED and _CHAT_GROUPS:
+                _prev_u = next((m.get("content") or "" for m in reversed(prior)
+                                if m.get("role") == "user"), "")
+                _lib_on = False
+                try:
+                    import library_tools as _lb
+                    _lib_on = bool(_lb.active_collection())
+                except Exception:
+                    pass
+                _ch = _tr.pick_groups([msg, _prev_u], _route_used | {c["name"] for c in calls},
+                                      _CHAT_GROUPS, files_mode=_lib_on, extra=_route_extra)
+                _names = _tr.tool_names(_ch, _CHAT_GROUPS)
+                if _force_tool:
+                    _names.add(_force_tool)
+                body["tools"] = [t for t in _CHAT_TOOLS if t["function"]["name"] in _names]
+        except Exception:
+            body["tools"] = _CHAT_TOOLS
         if _force_tool:
             body["tool_choice"] = {"type": "function",
                                    "function": {"name": _force_tool}}
             _force_tool = None
+        else:
+            # Loop guard (2026-11-18): an action tool that already ran 3
+            # times this turn -> tools off for this round (answer in words).
+            try:
+                import context_util as _cu3
+                _looping = _cu3.looping_tool(messages)
+                if _looping:
+                    body["tool_choice"] = "none"
+                    _cmdlog(f"guard: {_looping} ran {_cu3.LOOP_LIMIT}x this turn -> tools off", "err")
+            except Exception:
+                pass
         t_llm = time.time()
         body["stream"] = True
         # HPC FALLBACK (2026-11-07): Groq is primary; any failure to OPEN the
@@ -2140,6 +2197,16 @@ def _chat_run(msg: str, emit=None):
                 with STATE["lock"]:
                     STATE["me3"]["response"] = ""
                 continue
+            if not reply and not calls and not _empty_retried:
+                # Empty reply, no tool run (2026-11-18, seen live on a
+                # repeated "It is too dark in here."): one retry with a
+                # nudge instead of "didn't catch that". Costs a call only
+                # when the first one came back empty.
+                _empty_retried = True
+                _cmdlog("guard: empty reply -> one retry", "err")
+                import context_util as _cu4
+                messages.append({"role": "user", "content": _cu4.EMPTY_NUDGE})
+                continue
             break
         messages.append({
             "role": "assistant", "content": _strip_think(ch.get("content") or ""),
@@ -2180,6 +2247,13 @@ def _chat_run(msg: str, emit=None):
                 res = _lib_dispatch(name, args)
             elif name in ("remember", "forget", "list_memories"):
                 res = _mem_dispatch(name, args)
+            elif name == "load_tools":
+                try:
+                    import tool_router as _tr
+                    _route_extra |= _tr.parse_groups(args.get("groups", ""))
+                    res = _tr.load_tools_result(args.get("groups", ""))
+                except Exception as e:
+                    res = f"tool {name} errored: {e!r}"
             elif name in ("web_search", "fetch_url") and _lib_web_blocked():
                 res = ("Not run: files-only mode is on, so web search is off. Tell the user "
                        "their files don't cover this and ask if they want you to check the web.")

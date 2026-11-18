@@ -330,6 +330,7 @@ import shell_tools as sh
 import library_tools as lib
 import memory_tools as mem
 import context_util as cu
+import tool_router as tr
 from piper_tts import PiperLocalTTSService
 from asr import WhisperCPPSTTService
 from remote_voice import (Qwen2AudioSTTService, Qwen3TTSService,
@@ -736,6 +737,7 @@ _TOOL_PHRASE = {
     "remember": "Saving a note",
     "forget": "Forgetting a note",
     "list_memories": "Checking my notes",
+    "load_tools": "Loading more tools",
     "publish_website": "Publishing to GitHub",
 }
 
@@ -1798,6 +1800,73 @@ def _module_handler(mod, timeout=120):
     return handler
 
 
+# Tool routing (2026-11-18, tool_router.py): each call sends the core tools
+# plus the groups the user's words point to. Pipecat registers handlers from
+# context.tools when the context frame arrives, so the FULL list stays in the
+# context; only the request itself is built with the subset (swapped in
+# get_chat_completions and restored right after the request opens).
+_ROUTE = {"user": None, "extra": set(), "groups": None, "all": [], "logged": None}
+
+
+def _route_groups_map():
+    if _ROUTE["groups"] is None:
+        _ROUTE["groups"] = tr.build_groups([ui, sp, web, ft, sh, lib, mem])
+    return _ROUTE["groups"]
+
+
+async def _load_tools_handler(params):
+    args = dict(params.arguments or {})
+    _ROUTE["extra"] |= tr.parse_groups(args.get("groups", ""))
+    result = tr.load_tools_result(args.get("groups", ""))
+    logger.info(f"[me3] load_tools {args.get('groups', '')!r} -> {sorted(_ROUTE['extra'])}")
+    try:
+        if getattr(params, "result_callback", None) is not None:
+            await params.result_callback(result)
+    except Exception:
+        pass
+    return result
+
+
+def _route_tools(context, forced=None):
+    """Swap in the routed tool subset for this request. Returns the full
+    ToolsSchema to restore, or None when nothing was swapped."""
+    try:
+        if not tr.ENABLED or not _ROUTE["all"]:
+            return None
+        latest, prev = _last_user_texts(context)
+        if latest != _ROUTE["user"]:
+            _ROUTE["user"], _ROUTE["extra"] = latest, set()
+        msgs = list(context.messages)
+        starts = cu.user_turn_starts(msgs, _BG_NOTE)
+        used = set()
+        for m in msgs[(starts[-3] if len(starts) >= 3 else 0):]:
+            for tc in ((m.get("tool_calls") if isinstance(m, dict) else None) or []):
+                fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+                if fn.get("name"):
+                    used.add(fn["name"])
+        gmap = _route_groups_map()
+        chosen = tr.pick_groups([latest, prev], used, gmap,
+                                files_mode=bool(lib.active_collection()), extra=_ROUTE["extra"])
+        names = tr.tool_names(chosen, gmap)
+        fname = ((forced or {}).get("function") or {}).get("name") if isinstance(forced, dict) else None
+        if fname:
+            names.add(fname)
+        subset = [s for s in _ROUTE["all"] if s.name in names]
+        if len(subset) >= len(_ROUTE["all"]):
+            return None
+        old = context.tools
+        context.set_tools(subset)
+        key = (latest, tuple(sorted(chosen)))
+        if _ROUTE["logged"] != key:
+            _ROUTE["logged"] = key
+            logger.info(f"[me3] tools: core+{'+'.join(sorted(chosen)) or 'nothing'} "
+                        f"({len(subset)} of {len(_ROUTE['all'])})")
+        return old
+    except Exception as e:
+        logger.debug(f"[me3] tool routing skipped: {e!r}")
+        return None
+
+
 _library_handler = _module_handler(lib)
 _memory_handler = _module_handler(mem, timeout=20)
 
@@ -1908,6 +1977,10 @@ def _function_schemas():
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(lib, n, p), handler=h))
     for (n, d, p) in mem.TOOL_SPECS:
         out.append(FunctionSchema(n, d, _normalize_props(p), _required(mem, n, p), handler=_memory_handler))
+    if tr.ENABLED:
+        n, d, p = tr.TOOL_SPEC
+        out.append(FunctionSchema(n, d, _normalize_props(p), list(p), handler=_load_tools_handler))
+    _ROUTE["all"] = out
     return out
 
 
@@ -2349,6 +2422,18 @@ class GroqResilientLLM(OpenAILLMService):
                 "stats, and sources from what your research found.")}
             context.messages.append(_nudge)
             logger.info("[me3] website guard: research done, forcing write_website")
+        # Loop guard (2026-11-18, seen live: boots_set_bright x10 in one turn):
+        # an action tool that already ran 3 times this turn -> this request
+        # gets tool_choice "none", so the model must answer in words.
+        _loop_tc = None
+        if not _forced:
+            _looping = cu.looping_tool(list(context.messages), _BG_NOTE)
+            if _looping:
+                _loop_tc = (context.tool_choice,)
+                context.set_tool_choice("none")
+                logger.warning(f"[me3] loop guard: {_looping} ran {cu.LOOP_LIMIT}x this turn; "
+                               f"tools off for this round")
+        _all_tools = _route_tools(context, _forced)       # tool routing (2026-11-18)
         _llm_swap["inflight"] += 1
         try:
             if not self._has_fallback():
@@ -2366,6 +2451,10 @@ class GroqResilientLLM(OpenAILLMService):
                 return await self._complete_via_fallback(context)
         finally:
             _llm_swap["inflight"] -= 1
+            if _all_tools is not None:
+                context.set_tools(_all_tools)
+            if _loop_tc is not None:
+                context.set_tool_choice(_loop_tc[0])
             if _forced:
                 context.set_tool_choice(_old_tc)
                 try:

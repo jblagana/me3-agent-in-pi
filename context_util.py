@@ -152,3 +152,35 @@ def clean_reply(text):
     if not f.off and f.pending and not (THINK_CLOSE.startswith(f.pending) or THINK_OPEN.startswith(f.pending)):
         out += f.pending
     return out
+
+
+# ---- tool loop guard (2026-11-18) ------------------------------------------
+# Seen live: repeating "It is too dark in here." made Qwen call
+# boots_set_bright 10 times in one turn. Once a device/action tool has run
+# LOOP_LIMIT times since the user's last message, the next request is sent
+# with tool_choice "none" so the model has to answer in words. Research and
+# reading tools are exempt: several searches or fetches in a turn is normal.
+LOOP_LIMIT = 3
+LOOP_EXEMPT = {"web_search", "fetch_url", "read_file", "search_files", "list_dir",
+               "ask_files", "list_collection", "list_library", "load_tools"}
+
+
+def looping_tool(msgs, note_prefix="", limit=LOOP_LIMIT):
+    """Name of a non-exempt tool called `limit`+ times since the latest real
+    user message, else None."""
+    starts = user_turn_starts(msgs, note_prefix)
+    counts = {}
+    for m in msgs[(starts[-1] if starts else 0):]:
+        tcs = (m.get("tool_calls") if isinstance(m, dict) else getattr(m, "tool_calls", None)) or []
+        for tc in tcs:
+            fn = (tc.get("function") if isinstance(tc, dict) else getattr(tc, "function", None)) or {}
+            name = fn.get("name") if isinstance(fn, dict) else getattr(fn, "name", None)
+            if name and name not in LOOP_EXEMPT:
+                counts[name] = counts.get(name, 0) + 1
+                if counts[name] >= limit:
+                    return name
+    return None
+
+
+EMPTY_NUDGE = ("(Your last reply was empty. Answer the user's latest message: call the "
+               "tool it needs, or reply in one short sentence.)")
