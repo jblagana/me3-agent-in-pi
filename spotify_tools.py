@@ -40,7 +40,7 @@ def _load_token():
 
     except Exception as e:
 
-        logger.warning(f"could not load spotify token: {e!r}")
+        logger.warning(f"could not load spotify token: {type(e).__name__}")
 
         return {}
 
@@ -94,13 +94,19 @@ def _refresh_token(tok):
 
     })
 
+    # (2026-11-18) The body goes on stdin ("-d @-"), not the command line:
+
+    # on a timeout, TimeoutExpired's repr carried the whole command, so the
+
+    # refresh token landed in bootsui/ui.log; argv is also readable via ps.
+
     cmd = ["curl", "-s", "-X", "POST", "https://accounts.spotify.com/api/token",
 
-           "-H", "Content-Type: application/x-www-form-urlencoded", "-d", body]
+           "-H", "Content-Type: application/x-www-form-urlencoded", "-d", "@-"]
 
     try:
 
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, input=body, capture_output=True, text=True, timeout=15)
 
         if r.returncode != 0:
 
@@ -128,7 +134,9 @@ def _refresh_token(tok):
 
     except Exception as e:
 
-        logger.warning(f"spotify token refresh failed: {e!r}")
+        # Type only: exception text can echo the request (see above).
+
+        logger.warning(f"spotify token refresh failed: {type(e).__name__}")
 
     return tok
 
@@ -140,9 +148,15 @@ def _api(method, path, body=None):
 
     url = f"https://api.spotify.com/v1{path}"
 
-    auth_header = f"Authorization: Bearer {tok.get('access_token', '')}"
+    # (2026-11-18) The Authorization header goes in a curl config read from
 
-    cmd = ["curl", "-s", "-w", "\n__HTTP_STATUS__:%{http_code}", "-X", method, url, "-H", auth_header]
+    # stdin ("-K -"), not argv: a timeout's error text carried the command
+
+    # (token included) back to the LLM and the logs; argv is visible in ps.
+
+    auth_cfg = 'header = "Authorization: Bearer %s"\n' % tok.get("access_token", "")
+
+    cmd = ["curl", "-s", "-K", "-", "-w", "\n__HTTP_STATUS__:%{http_code}", "-X", method, url]
 
     if body:
 
@@ -160,7 +174,7 @@ def _api(method, path, body=None):
 
     try:
 
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        r = subprocess.run(cmd, input=auth_cfg, capture_output=True, text=True, timeout=15)
 
         if body:
 
@@ -202,9 +216,13 @@ def _api(method, path, body=None):
 
             return {"error": "non-JSON response (HTTP " + str(status) + "): " + out[:200]}
 
+    except subprocess.TimeoutExpired:
+
+        return {"error": "Spotify did not answer in 15 seconds"}
+
     except Exception as e:
 
-        return {"error": str(e)}
+        return {"error": type(e).__name__}
 
 AUTH_MSG = ("Spotify auth is expired or missing — re-run `spotify-mcp auth` and "
 

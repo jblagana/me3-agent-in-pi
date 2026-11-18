@@ -885,6 +885,13 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
 - **Backup:** `~/me3_backup_20261118_router`.
 - **Groq calls for this work:** about 15, plus 4 for the guards.
 
+### 8.10 Spotify token leak, fixed 2026-11-18
+
+- **Cause:** `spotify_tools._refresh_token` passed the refresh token to curl on the command line. When curl timed out, the logged `TimeoutExpired` repr included the whole command, so the token was written to `bootsui/ui.log` 3 times (Nov 12 and 17). `_api` had the same path for the access token, through `{"error": str(e)}`, which goes back to the LLM. Both tokens were also visible in `ps` while curl ran.
+- **Fix:** the refresh body goes on stdin (`-d @-`), and the Authorization header goes in a curl config read from stdin (`-K -`). Errors log only the exception type, and a timeout returns "Spotify did not answer in 15 seconds". Test: `tests/test_spotify_secrets.py`.
+- **Cleanup:** the 3 copies in `ui.log` were replaced with `<REDACTED>`. The journal never had them. No other file holds the token except `~/.cache/librespot/auth.json`, librespot's own store, now set to mode 600.
+- **Rotated (2026-11-18):** Jan revoked the app at spotify.com/account/apps, signed in again on the laptop and copied the new `tokens.json` to the Pi (mode 600). Checked on the Pi: the new token refreshes, API calls work, and it differs from the leaked one. `~/.cache/librespot/auth.json` still holds the old, revoked token, so librespot needs a fresh sign-in the next time it's used.
+
 ## 9. Phase 6: tests and hygiene
 
 1. Unit tests, no audio needed:
