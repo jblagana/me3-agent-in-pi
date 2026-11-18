@@ -14,3 +14,4 @@ bootsui/sites/*.html
 fd-benchmark/
 agent.log
 bootsui/ui.log
+/tts-samples/

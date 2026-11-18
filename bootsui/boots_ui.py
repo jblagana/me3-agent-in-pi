@@ -27,6 +27,8 @@ from collections import deque
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import subprocess
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import ui_auth as _auth   # login token for other devices (2026-11-18)
 
 LABELS = {
     # V3 phrasebook (20 classes, src/commands.py) — single source of truth
@@ -2406,7 +2408,53 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ---- login token (2026-11-18, ui_auth.py) --------------------------
+    def _authorized(self, method):
+        verdict = _auth.decide(method, self.path, self.client_address[0], self.headers)
+        if verdict == "ok":
+            return True
+        if verdict == "login":
+            self.send_response(303)
+            self.send_header("Location", "/login")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif verdict == "cross":
+            self._send(403, b"cross-site request refused", "text/plain")
+        else:
+            body = (b'{"error":"sign in at /login"}' if _auth.token()
+                    else b'{"error":"dashboard token not set (ME3_UI_TOKEN)"}')
+            self._send(401, body, "application/json")
+        return False
+
+    def _login(self):
+        from urllib.parse import parse_qs
+        n = int(self.headers.get("Content-Length", 0) or 0)
+        form = parse_qs(self.rfile.read(min(n, 4096)).decode("utf-8", "replace"))
+        given = (form.get("token") or [""])[0]
+        if _auth.check_token(given):
+            print(f"login ok from {self.client_address[0]}", flush=True)
+            self.send_response(303)
+            self.send_header("Set-Cookie", _auth.set_cookie_header())
+            self.send_header("Location", "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        else:
+            print(f"login FAILED from {self.client_address[0]}", flush=True)
+            self._send(401, _auth.login_page(error=True), "text/html; charset=utf-8")
+
     def do_GET(self):
+        if not self._authorized("GET"):
+            return
+        if self.path.split("?", 1)[0] == "/login":
+            self._send(200, _auth.login_page(), "text/html; charset=utf-8")
+            return
+        if self.path == "/logout":
+            self.send_response(303)
+            self.send_header("Set-Cookie", _auth.clear_cookie_header())
+            self.send_header("Location", "/login")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
         if self.path in ("/", "/index.html", "/muji"):
             # The ME3 observability dashboard (muji-styled chat + inspector) is
             # the UI. Served from boots_ui.html next to this file when present.
@@ -2447,6 +2495,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain")
 
     def do_POST(self):
+        if not self._authorized("POST"):
+            return
+        if self.path == "/login":
+            self._login()
+            return
         n = int(self.headers.get("Content-Length", 0))
         try:
             obj = json.loads(self.rfile.read(n) or b"{}")
@@ -3118,6 +3171,14 @@ def main():
     _chat_load()  # eager: /ui_state reports llm state from the first poll
     threading.Thread(target=_weather_loop, daemon=True).start()
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    # systemd watchdog (2026-11-18): ping only after the server answers its
+    # own /ui_state, so a hung server gets restarted. No-op outside systemd.
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+        import sd_watchdog as _sdw
+        _sdw.start(check=_sdw.http_check(f"http://127.0.0.1:{args.port}/ui_state"))
+    except Exception as e:
+        print(f"watchdog off: {e!r}", flush=True)
     print(f"ME2 UI: http://{args.host}:{args.port}  (package dir {args.dir})",
           flush=True)
     try:

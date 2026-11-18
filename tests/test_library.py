@@ -180,7 +180,7 @@ def mode_case():
 
 def guard_case():
     out = lib.dispatch("add_files", path="/etc/passwd")
-    check("guard: outside the home folder refused", "outside the allowed folder" in out, out)
+    check("guard: outside the boots-files folder refused", "only use files" in out, out)
     out2 = lib.dispatch("add_files", path="http://192.168.1.10/secret.pdf")
     check("guard: private URL refused", "public websites" in out2, out2)
 

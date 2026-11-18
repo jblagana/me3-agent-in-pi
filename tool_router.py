@@ -39,7 +39,7 @@ KEYWORDS = {
     "build": r"\b(website|websites|web ?site|web ?page|landing page|site|app|apps|build|make me|"
              r"create|calculator|quiz|game|publish|github|deploy|html)\b",
     "files": r"\b(file|files|folder|folders|directory|notes?|readme|txt|md|py|json|csv|edit|"
-             r"overwrite|save (it|this|that)|write (it|this|that|down)|search my|home folder)\b",
+             r"overwrite|save (it|this|that)|write (it|this|that|down)|search my|home folder|boots-files)\b",
     "shell": r"\b(command|terminal|disk|storage|space|git|process|processes|cpu|ram|uptime|ping|"
              r"python|script|calculate|compute|math|sum|average|convert|how many days|"
              r"\d+\s*[-+*/x^%]\s*\d+)\b",

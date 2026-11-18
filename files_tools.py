@@ -24,9 +24,12 @@
 import os
 import re
 
-# Where "my files" live. Overridable via env (the Pi agent sets it to the
-# user's home so relative paths land somewhere sane).
-BOOT_FILES_ROOT = os.environ.get("BOOT_FILES_ROOT", os.path.expanduser("~"))
+# Where "my files" live (2026-11-18): a dedicated folder, ~/boots-files, not
+# the whole home folder (which held ~/.ssh, the Spotify token and Boots's own
+# code). Overridable via BOOT_FILES_ROOT. Symlinks are resolved, so a link
+# inside the folder can't point outside it.
+import sandbox as _sb
+BOOT_FILES_ROOT = _sb.ensure_root()
 
 MAX_READ_CHARS = 1500      # read_file output cap (voice context budget)
 MAX_LIST_ITEMS = 25        # list_dir item cap
@@ -46,10 +49,11 @@ def _resolve(path: str) -> str:
         raise ValueError("no path given")
     if not os.path.isabs(p):
         p = os.path.join(BOOT_FILES_ROOT, p)
-    p = os.path.normpath(os.path.expanduser(p))
-    root = os.path.normpath(BOOT_FILES_ROOT)
+    p = os.path.realpath(os.path.expanduser(p))     # resolves symlinks too
+    root = os.path.realpath(BOOT_FILES_ROOT)
     if p != root and not p.startswith(root + os.sep):
-        raise ValueError(f"path '{path}' is outside the allowed folder ({os.path.basename(root)})")
+        raise ValueError(f"I can only use files in the {os.path.basename(root)} folder; "
+                         f"'{path}' is outside it.")
     return p
 
 
@@ -155,6 +159,7 @@ def _tool_search_files(pattern: str, path: str = "", glob: str = "") -> str:
                     continue
                 fp = os.path.join(dirpath, fn)
                 try:
+                    _resolve(fp)                    # a symlink pointing outside: skip
                     if os.path.getsize(fp) > 1_000_000:
                         continue
                     with open(fp, "r", encoding="utf-8", errors="ignore") as f:
@@ -181,7 +186,8 @@ def _tool_search_files(pattern: str, path: str = "", glob: str = "") -> str:
 
 
 TOOL_SPECS = [
-    ("list_dir",     "List the folders and files inside a folder.",
+    ("list_dir",     "List the folders and files inside a folder. All file tools work only "
+                     "inside the user's boots-files folder; paths are relative to it.",
                     {"path": "string"}),
     ("read_file",    "Read a text file and report its contents.",
                     {"path": "string"}),

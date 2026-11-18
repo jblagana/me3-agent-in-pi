@@ -27,7 +27,11 @@ import os
 import re
 import subprocess
 
-BOOT_SHELL_ROOT = os.environ.get("BOOT_SHELL_ROOT", os.path.expanduser("~"))
+# (2026-11-18) Commands run in the Boots files folder, inside a bubblewrap box
+# (sandbox.py) that shows only that folder under /home, hides /etc/me3 and
+# makes the system read-only. Without bwrap the blocklist below still applies.
+import sandbox as _sb
+BOOT_SHELL_ROOT = _sb.ensure_root()
 
 TIMEOUT_S = 20           # hard kill for hung commands (voice can't wait)
 MAX_OUT_CHARS = 1200     # output cap (voice context budget)
@@ -85,17 +89,21 @@ def _check(command: str):
         if base in BLOCKED_VERBS:
             return f"I can't run {base} — that's a destructive or system command, off limits for me."
     if SYSTEM_PATH.search(command):
-        return "That touches system folders — off limits. I only work in your home folder."
+        return "That touches system folders — off limits. I only work in your boots-files folder."
     return None
 
 
 def _run(command: str, cwd: str) -> str:
     """Run the (already validated) command; return a speakable result."""
-    work = os.path.expanduser(cwd) if cwd else BOOT_SHELL_ROOT
-    if not os.path.isdir(work):
+    work = os.path.realpath(os.path.join(BOOT_SHELL_ROOT, os.path.expanduser(cwd))) if cwd else BOOT_SHELL_ROOT
+    if not os.path.isdir(work) or not (work == BOOT_SHELL_ROOT or work.startswith(BOOT_SHELL_ROOT + os.sep)):
         work = BOOT_SHELL_ROOT
     kwargs = dict(shell=True, cwd=work, stdout=subprocess.PIPE,
                   stderr=subprocess.STDOUT, text=True, errors="replace")
+    if _sb.available():
+        command = _sb.wrap(["/bin/sh", "-c", command], cwd=work, net=True)
+        kwargs["shell"] = False
+        kwargs["cwd"] = BOOT_SHELL_ROOT
     if os.name == "posix":
         kwargs["start_new_session"] = True   # own process group -> clean kill
     else:
@@ -184,13 +192,28 @@ def _run_python(code: str) -> str:
         resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 2**20, 10 * 2**20))
         resource.setrlimit(resource.RLIMIT_NPROC, (64, 64))
 
-    with tempfile.TemporaryDirectory(prefix="boots_py_") as d:
+    def _limits_boxed():
+        # RLIMIT_NPROC counts every process of the user, and bwrap itself
+        # forks; the box's own pid namespace + the timeout cover runaways.
+        import resource
+        resource.setrlimit(resource.RLIMIT_CPU, (PY_TIMEOUT_S, PY_TIMEOUT_S))
+        resource.setrlimit(resource.RLIMIT_AS, (512 * 2**20, 512 * 2**20))
+        resource.setrlimit(resource.RLIMIT_FSIZE, (10 * 2**20, 10 * 2**20))
+
+    boxed = _sb.available()
+    # In the box the program sees /tmp as a private, empty tmpfs, so the
+    # script goes in the files folder; it is deleted after the run.
+    with tempfile.TemporaryDirectory(prefix=".boots_py_", dir=BOOT_SHELL_ROOT if boxed else None) as d:
         path = os.path.join(d, "program.py")
         with open(path, "w", encoding="utf-8") as f:
             f.write(code)
+        argv = [sys.executable, "-I", path]
+        if boxed:   # no network, only the files folder; the venv python is hidden
+            argv = _sb.wrap([_sb.SYSTEM_PYTHON, "-I", path], cwd=BOOT_SHELL_ROOT, net=False)
         try:
-            r = subprocess.run([sys.executable, "-I", path], cwd=d, capture_output=True,
-                               text=True, timeout=PY_TIMEOUT_S + 2, preexec_fn=_limits,
+            r = subprocess.run(argv, cwd=d, capture_output=True,
+                               text=True, timeout=PY_TIMEOUT_S + 2,
+                               preexec_fn=_limits_boxed if boxed else _limits,
                                env={"PATH": "/usr/bin:/bin", "HOME": d, "LANG": "C.UTF-8"},
                                stdin=subprocess.DEVNULL)
         except subprocess.TimeoutExpired:

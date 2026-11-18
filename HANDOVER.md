@@ -892,6 +892,77 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
 - **Cleanup:** the 3 copies in `ui.log` were replaced with `<REDACTED>`. The journal never had them. No other file holds the token except `~/.cache/librespot/auth.json`, librespot's own store, now set to mode 600.
 - **Rotated (2026-11-18):** Jan revoked the app at spotify.com/account/apps, signed in again on the laptop and copied the new `tokens.json` to the Pi (mode 600). Checked on the Pi: the new token refreshes, API calls work, and it differs from the leaked one. `~/.cache/librespot/auth.json` still holds the old, revoked token, so librespot needs a fresh sign-in the next time it's used.
 
+### 8.11 Network addresses, 2026-11-18
+
+- `hotspot_jan` (priority 5) is fixed at `192.168.137.216`. `jaranjjan` (priority 1, the fallback, an iPhone hotspot) is now pinned too, at `172.20.10.7/28`, gateway and DNS `172.20.10.1`. It was DHCP before. Its old profile is backed up as `~/me3_backup_20261118_loop/jaranjjan.nmconnection.bak`.
+- On either network the Pi can also be reached by name: `me2pi.local`, through avahi.
+- Not tested on `jaranjjan` yet. If the Pi doesn't answer there, another device may hold `.7`; undo with `sudo nmcli con modify jaranjjan ipv4.method auto ipv4.addresses "" ipv4.gateway "" ipv4.dns ""`.
+
+### 8.12 Housekeeping, 2026-11-18: local voice fallback, watchdog, log rotation
+
+**Local voice fallback** (`piper_voice.py`, wired in `remote_voice.EdgeTTSService._synthesize`):
+- The chain is now edge-tts Roger, then Piper `en_US-ryan-medium` on the Pi (no network), then Qwen3 on the HPC. Before, edge-tts fell straight to Qwen3, a female voice that also needs the VPN.
+- Ryan is tuned to Roger. Four male Piper voices were measured on the same sentences, and Ryan was the only one in Roger's pitch range. The other three were about an octave lower.
+
+  | | Roger (edge-tts) | Ryan (Piper, tuned) |
+  |---|---|---|
+  | speaking time | 11.94 s | 11.74 s |
+  | pitch | 167 Hz | 164 Hz |
+  | comma and sentence pauses | 0.58–0.74 s | 0.50–0.58 s |
+
+- How it's tuned:
+  - Pitch: the audio is played 8% faster and `length_scale` is stretched by the same factor, so pitch rises and pace stays the same.
+  - Pauses: text is split at clause and sentence ends and silence inserted. A short tag after a comma (", Jan.") stays attached, as Roger runs it on.
+- Synthesis takes about 0.3 s per second of speech, so a short sentence is ready in about 1 s.
+- The model is preloaded at startup, so the first fallback isn't slow.
+- Env settings: `ME3_PIPER_PITCH`, `ME3_PIPER_LS`, `ME3_PIPER_COMMA_S`, `ME3_PIPER_SENT_S`. `ME3_TTS_BACKEND=piper` forces the local voice.
+- Models are in `~/me3/models/`: ryan, plus joe, john and norman, which are unused and can be deleted. Samples are in `tts-samples/`, ignored by git.
+- Test: `tests/test_tts_fallback.py` makes edge-tts fail and checks that Piper speaks on both the reply and the welcome path, and that Qwen3 isn't called.
+- Not tested by ear on the EMEET yet.
+
+**Watchdog** (`sd_watchdog.py`; the drop-ins are in `deploy/systemd/`):
+- `Restart=always` only caught exits. Now systemd kills and restarts a service when its pings stop.
+- Agent, `WatchdogSec=120`: the asyncio loop beats every 5 s, and pings stop once beats are stale. Pings flow during the EMEET wait, which isn't a hang.
+- Dashboard, `WatchdogSec=60`: a ping follows only a successful answer from its own `/ui_state`.
+- `LimitCORE=0`, so a watchdog kill (SIGABRT) leaves no core dump.
+- Tested live: the dashboard was frozen with SIGSTOP, systemd logged a watchdog timeout 55 s later, and it was restarted and answering 3 s after that. `tests/test_watchdog.py` covers the rules.
+
+**Log rotation** (`/etc/logrotate.d/me3`, copy in `deploy/logrotate/me3`):
+- `agent.log` and `bootsui/ui.log` rotate daily, or sooner once over 20 MB. Seven are kept, compressed, using `copytruncate`, because systemd holds them open.
+- `agent.log` had reached 121 MB and was rotated by hand. It is `agent.log.1` until tomorrow's run compresses it.
+- `ME3_DEBUG_FRAMES=1` in `me3-agent.service.d/override.conf` is probably what makes the log so big.
+
+### 8.13 Dashboard login and the boots-files folder, 2026-11-18 (HANDOVER 5.1, 5.3, decisions 10.1 and 10.2)
+
+**Login token for other devices** (`bootsui/ui_auth.py`):
+- The Pi itself (127.0.0.1) passes as before: the voice agent's pushes, the tools' `/fire` calls, the watchdog check, and a browser on the Pi.
+- Any other device signs in once at `/login`. The server then sets an `HttpOnly; SameSite=Strict` cookie, valid for a year. The cookie holds an HMAC of the token, not the token. A new token signs every device out.
+- `/login#<token>` fills the form from the URL fragment, which never reaches the server or its logs.
+- POSTs with another site's `Origin` are refused (403), from the Pi too.
+- `/site/...` (generated websites) stays open.
+- With no token configured, other devices are refused (fail closed).
+- The token is in `/etc/me3/ui.env` as `ME3_UI_TOKEN` (root, mode 600), loaded by `me2-ui.service.d/auth.conf`; a copy of the drop-in is in `deploy/systemd/`.
+- To see it, run `ssh jan@me2pi.local "sudo cat /etc/me3/ui.env"`. To rotate it, write a new value and `sudo systemctl restart me2-ui`.
+- Tested live: with no cookie, `/` redirects to `/login` and the API returns 401. A wrong token returns 401. The right token sets the cookie, after which the dashboard and API return 200. A cross-site POST returns 403. Localhost is unchanged.
+
+**Dedicated folder `~/boots-files`** (`files_tools.py`, `shell_tools.py`, `sandbox.py`):
+- The file tools and `add_files` work only inside `~/boots-files`. Paths are resolved with `realpath`, so a symlink inside can't point out.
+- `run_command` and `run_python` run in a bubblewrap box (`apt: bubblewrap`, installed):
+  - `/home` shows only `boots-files` and is read-only apart from it;
+  - `/etc/me3`, `/root` and `/tmp` are empty;
+  - the rest of the system is read-only;
+  - `run_python` also has no network.
+- Before this, `cat ~/.ssh/...` passed the blocklist, and Python's `open()` could read any of the user's files.
+- `ME3_SANDBOX=0` turns the box off. Without bwrap, the old blocklist and word filter still apply.
+- The prompt now names the folder.
+- The home folder held no personal files to move, so `~/boots-files` starts empty.
+- Tests: `tests/test_security.py`, 27 checks covering auth, the folder lock and the sandbox.
+
+**Still open from section 5:**
+- 5.1 item 3: `/llm` still accepts a custom `base_url`, now behind the login.
+- 5.2: `run_command` keeps its blocklist; the box now limits the damage.
+- 5.4: API keys reach the MCP tool process.
+
 ## 9. Phase 6: tests and hygiene
 
 1. Unit tests, no audio needed:
@@ -922,8 +993,8 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
 
 | # | Decision | My suggestion |
 |---|---|---|
-| 1 | Does the dashboard need to be reachable from other devices? | Yes with token, or localhost plus Tailscale |
-| 2 | Should Boots reach the whole home folder or a dedicated folder? | Dedicated `~/boots-files` |
+| 1 | Does the dashboard need to be reachable from other devices? | **Decided 2026-11-18: yes, with a login token (8.13)** |
+| 2 | Should Boots reach the whole home folder or a dedicated folder? | **Decided 2026-11-18: dedicated `~/boots-files` (8.13)** |
 | 3 | Keep `run_command` at all? | Keep, as the allowlist in 5.2 |
 | 4 | Public publish by default for voice-built websites? | Default off |
 | 5 | Is Taglish a requirement? | It decides the STT language setting and whether an English-only turn model is usable |

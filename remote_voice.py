@@ -66,6 +66,9 @@ LEAD_SILENCE_S = float(os.environ.get("ME3_LEAD_SILENCE_S", "0.45"))
 # -blocked or rate-limited, so it is used as the PRIMARY with a fail-soft
 # fallback to the local-over-VPN Qwen3-TTS (vivian). Env-tunable:
 #   ME3_TTS_BACKEND = edge | qwen3 | auto (default auto = edge, fall back to qwen3)
+# (2026-11-18) auto now falls back to Piper Ryan ON THE PI first (piper_voice.py:
+# no network, tuned to Roger's pace, pitch and pauses), Qwen3 only if Piper
+# fails. ME3_TTS_BACKEND=piper forces the local voice (for testing).
 EDGE_VOICE = os.environ.get("ME3_EDGE_VOICE", "en-US-RogerNeural")
 EDGE_PITCH = os.environ.get("ME3_EDGE_PITCH", "+20Hz")   # was +30Hz until 2026-11-18
 EDGE_RATE = os.environ.get("ME3_EDGE_RATE", "+8%")
@@ -637,6 +640,9 @@ class Qwen3TTSService(TTSService):
 # =========================================================================== #
 # edge-tts (primary voice: en-US-RogerNeural, +20Hz, +8%) with Qwen3 fallback
 # =========================================================================== #
+import piper_voice as _pv
+
+
 class _EdgeSynth:
     """text -> `out_sr` int16 mono PCM via edge-tts + miniaudio.
     Raises on any failure so the caller can fall back to Qwen3-TTS."""
@@ -685,12 +691,14 @@ class EdgeTTSService(Qwen3TTSService):
         super().__init__(**kwargs)
         self._edge_ok = True
         self._edge_fail_ts = 0.0
+        if TTS_BACKEND != "qwen3":
+            _pv.preload()        # load Piper now so the first fallback isn't slow
         logger.info(
             f"[tts-edge] edge-tts primary ({EDGE_VOICE} {EDGE_PITCH} {EDGE_RATE}), "
             f"qwen3 fallback, backend={TTS_BACKEND}, lead={LEAD_SILENCE_S}s")
 
     def _edge_enabled(self) -> bool:
-        if TTS_BACKEND == "qwen3":
+        if TTS_BACKEND in ("qwen3", "piper"):
             return False
         if not self._edge_ok and (time.time() - self._edge_fail_ts) < 60.0:
             return False  # back off 60s after a failure
@@ -708,7 +716,16 @@ class EdgeTTSService(Qwen3TTSService):
             except Exception as e:
                 self._edge_ok = False
                 self._edge_fail_ts = time.time()
-                logger.warning(f"[tts-edge] edge-tts failed ({e!r}); qwen3 fallback")
+                logger.warning(f"[tts-edge] edge-tts failed ({e!r}); local fallback")
+        if TTS_BACKEND != "qwen3" and _pv.available():
+            try:
+                t0 = time.time()
+                raw = _pv.synthesize(text, sample_rate)
+                if raw:
+                    logger.info(f"[tts-piper] local voice ({time.time()-t0:.2f}s, {len(raw)} B)")
+                    return raw
+            except Exception as e:
+                logger.warning(f"[tts-piper] local voice failed ({e!r}); qwen3 fallback")
         return super()._synthesize(text, sample_rate)
 
 
@@ -941,7 +958,7 @@ class StreamingEdgeTTSService(EdgeTTSService):
             self._edge_ok = False
             self._edge_fail_ts = time.time()
             logger.warning(f"[tts-edge] streaming failed ({e!r})"
-                           + ("; qwen3 fallback" if not sent else "; reply cut short"))
+                           + ("; local fallback" if not sent else "; reply cut short"))
             if not sent:
                 async for f in Qwen3TTSService.run_tts(self, text, context_id):
                     yield f

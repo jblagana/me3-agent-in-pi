@@ -488,6 +488,9 @@ a{color:var(--accent-text)}
 
 <script>
 'use strict';
+// Signed out (2026-11-18, ui_auth.py): any 401 from the server -> sign-in page.
+(()=>{const f=window.fetch.bind(window);window.fetch=async(...a)=>{const r=await f(...a);
+  if(r.status===401&&location.hostname!=='127.0.0.1'&&location.hostname!=='localhost')location.href='/login';return r;};})();
 const $=id=>document.getElementById(id);
 const esc=s=>String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function store(k,v){try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v)}catch(e){return null}}

@@ -267,6 +267,12 @@ def _wait_for_emeet():
     time.sleep(2)              # let ALSA/PortAudio finish enumerating the card
 
 
+# systemd watchdog (2026-11-18, sd_watchdog.py): pings start now, so the
+# EMEET wait below counts as alive; once main() runs, only a beating event
+# loop keeps them going. A no-op unless the unit sets WatchdogSec=.
+import sd_watchdog as _sdw
+_sdw.start()
+
 if not BENCH_MODE:
     _wait_for_emeet()
 MIC_DEV = None if BENCH_MODE else _find_mic_index()
@@ -2961,6 +2967,8 @@ def _emeet_watchdog():
 async def main():
     if not BENCH_MODE:
         _emeet_watchdog()
+    _sdw.beat()
+    _sdw._state["task"] = asyncio.get_running_loop().create_task(_sdw.loop_beat())   # systemd watchdog
     logger.info("starting local audio (mic #%s -> speaker #%s)", MIC_DEV, SPK_DEV)
     await run_bot()
 

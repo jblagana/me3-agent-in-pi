@@ -264,7 +264,7 @@ def index_file(path, collection, source="", display_name=""):
 
 def _home_path(path):
     import files_tools
-    return files_tools._resolve(path)        # locked inside the home folder
+    return files_tools._resolve(path)        # locked inside ~/boots-files (2026-11-18)
 
 
 def _summarise(results, collection):

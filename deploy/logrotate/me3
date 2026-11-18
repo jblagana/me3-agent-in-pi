@@ -1,0 +1,14 @@
+# Boots logs (2026-11-18). systemd appends to these as root (StandardOutput=
+# append:), so copytruncate: the file is copied, then truncated in place, and
+# the service keeps writing to the same open file.
+/home/jan/me3/agent.log /home/jan/me3/bootsui/ui.log {
+    daily
+    maxsize 20M
+    rotate 7
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
