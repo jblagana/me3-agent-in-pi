@@ -29,6 +29,11 @@ COOKIE = "boots_auth"
 MAX_AGE = 365 * 24 * 3600
 LOCAL = {"127.0.0.1", "::1", "::ffff:127.0.0.1"}
 PUBLIC_PREFIXES = ("/site/",)
+# Icons are public too (exact names only): the login page shows them, and
+# browsers fetch the manifest and favicon without cookies. Nothing private.
+PUBLIC_PATHS = ("/login", "/logout", "/favicon.ico", "/apple-touch-icon.png",
+                "/manifest.webmanifest", "/icons/icon.svg", "/icons/icon-192.png",
+                "/icons/icon-512.png", "/icons/icon-maskable-512.png")
 FAIL_DELAY_S = 1.0
 
 
@@ -90,7 +95,7 @@ def decide(method, path, client_ip, headers):
     if method == "POST" and not origin_ok(headers.get("Origin"), headers.get("Host")):
         return "cross"
     p = (path or "").split("?", 1)[0]
-    if p.startswith(PUBLIC_PREFIXES) or p in ("/login", "/logout"):
+    if p.startswith(PUBLIC_PREFIXES) or p in PUBLIC_PATHS:
         return "ok"
     if is_local(client_ip) or has_cookie(headers.get("Cookie")):
         return "ok"
@@ -102,6 +107,9 @@ def decide(method, path, client_ip, headers):
 LOGIN_PAGE = b"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Boots sign in</title>
+<link rel="icon" href="/favicon.ico" sizes="48x48"><link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png"><link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#111412">
 <style>
 :root{--bg:#f6f5f1;--fg:#1f2a22;--muted:#66705f;--line:#d9dccf;--acc:#3f6b4a;--err:#a3402e}
 @media (prefers-color-scheme:dark){:root{--bg:#141815;--fg:#e6eae2;--muted:#9aa594;--line:#2c332c;--acc:#7fb08a;--err:#e08a76}}

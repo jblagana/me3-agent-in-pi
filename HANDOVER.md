@@ -987,6 +987,19 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
   - stutter when Wi-Fi is busy, since the Pi 4 shares one radio chip.
 - **librespot:** still installed, with its service disabled. `~/.cache/librespot` holds an old sign-in and can be deleted.
 
+### 8.16 Dashboard icon, 2026-11-19
+- **Design:** "boot buddy", an original green cartoon boot with eyes on the dark tile. The source is `bootsui/icons/icon.svg`; `icon-full.svg` is the full-bleed version for home screens.
+- **Files:** `tools/make_icons.py` (Pillow only) draws the same shapes into `bootsui/icons/`:
+  - `favicon.ico` (16/32/48);
+  - `icon-192.png` and `icon-512.png`;
+  - `icon-maskable-512.png` (Android);
+  - `apple-touch-icon.png` (180).
+  
+  Run it again after changing the design.
+- **Serving:** `_ICON_ROUTES` in boots_ui.py maps a fixed list of URLs to those files, cached for a day. `ui_auth.PUBLIC_PATHS` lists the same exact paths, so the login page and the manifest load before signing in. The dashboard and its API still need the token.
+- **Pages:** the dashboard and the login page link the favicon, touch icon and `manifest.webmanifest` ("Add to Home screen" opens Boots full screen). The header's green dot is now the icon.
+- **Tests:** `tests/test_icons.py` (files and sizes, auth, page links).
+
 ## 9. Phase 6: tests and hygiene
 
 1. Unit tests, no audio needed:

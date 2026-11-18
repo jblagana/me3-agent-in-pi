@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+<!-- Boots dashboard icon, "boot buddy" (2026-11-19). -->
+<rect width="64" height="64" rx="14" fill="#111412"/>
+<g id="boot">
+<path d="M19 9 H38 V32 Q38 36 42 36 H45 Q55 36 55 46 V50 H14 V44 Q19 40 19 34 Z" fill="#5CCB8A" stroke="#0B2416" stroke-width="2.5" stroke-linejoin="round"/>
+<rect x="12" y="49" width="45" height="6" rx="3" fill="#A6E5BF" stroke="#0B2416" stroke-width="2.5"/>
+<circle cx="25" cy="22" r="5" fill="#fff" stroke="#0B2416" stroke-width="2"/>
+<circle cx="34" cy="22" r="5" fill="#fff" stroke="#0B2416" stroke-width="2"/>
+<circle cx="26" cy="23" r="2.2" fill="#0B2416"/>
+<circle cx="35" cy="23" r="2.2" fill="#0B2416"/>
+<path d="M24 31 Q29.5 36 35 31" fill="none" stroke="#0B2416" stroke-width="2.2" stroke-linecap="round"/>
+<path d="M40 40 l4 -3 M45 41 l4 -3" stroke="#0B2416" stroke-width="2" stroke-linecap="round"/>
+</g>
+</svg>

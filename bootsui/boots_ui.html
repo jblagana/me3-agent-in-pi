@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Boots</title>
+<link rel="icon" href="/favicon.ico" sizes="48x48">
+<link rel="icon" href="/icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/manifest.webmanifest">
+<meta name="theme-color" content="#111412">
+<meta name="apple-mobile-web-app-title" content="Boots">
 <!-- Boots UI v3 (2026-11-16). The previous dashboard lives in archive/boots_ui_v2.html
      and is served at /classic. Same server contract: GET /ui_state (poll), POST
      /chat_stream (typed chat, SSE), /llm, /fire (device taps, src:"tap"), /reminders. -->
@@ -42,7 +48,7 @@ a{color:var(--accent-text)}
 .app{display:flex;flex-direction:column;height:100vh}
 .top{display:flex;flex-wrap:wrap;align-items:center;gap:12px 16px;padding:12px 24px;border-bottom:1px solid var(--line);background:var(--bg)}
 .brand{display:flex;align-items:center;gap:10px;font:700 20px var(--head);letter-spacing:-.3px}
-.brand i{width:26px;height:26px;border-radius:50%;background:var(--accent);display:inline-block}
+.brand img{width:30px;height:30px;display:block;border-radius:7px}
 .tabs{display:flex;gap:4px;background:var(--card);border:1px solid var(--line);border-radius:14px;padding:4px}
 .tabs button{min-height:40px;padding:0 16px;border-radius:10px;border:0;background:transparent;color:var(--text2);font-weight:500}
 .tabs button[aria-selected="true"]{background:var(--text);color:var(--bg);font-weight:600}
@@ -307,7 +313,7 @@ a{color:var(--accent-text)}
 <body>
 <div class="app">
 <header class="top">
-  <div class="brand"><i aria-hidden="true"></i>Boots</div>
+  <div class="brand"><img src="/icons/icon.svg" alt="" width="30" height="30">Boots</div>
   <nav class="tabs" role="tablist" aria-label="Views">
     <button role="tab" id="tab-assist" aria-selected="true" aria-controls="v-assist">Assistant</button>
     <button role="tab" id="tab-home" aria-selected="false" aria-controls="v-home">Smart home</button>

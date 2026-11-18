@@ -454,6 +454,17 @@ MUSIC_DIR = None  # Path, set in main() from --dir
 import os as _os
 SITES_DIR = _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "sites")
 _os.makedirs(SITES_DIR, exist_ok=True)
+# Dashboard icons (2026-11-19), files in bootsui/icons/ (tools/make_icons.py).
+# A fixed list: only these names are served, no path from the URL is used.
+_ICON_ROUTES = {
+    "/favicon.ico": ("favicon.ico", "image/x-icon"),
+    "/apple-touch-icon.png": ("apple-touch-icon.png", "image/png"),
+    "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+    "/icons/icon.svg": ("icon.svg", "image/svg+xml"),
+    "/icons/icon-192.png": ("icon-192.png", "image/png"),
+    "/icons/icon-512.png": ("icon-512.png", "image/png"),
+    "/icons/icon-maskable-512.png": ("icon-maskable-512.png", "image/png"),
+}
 _M = {"lock": threading.Lock(), "proc": None, "track": None, "sr": 48000,
       "pos": 0, "t0": 0.0, "dur": 0}
 _DUCK = {"awake": False, "defer": False}
@@ -2427,10 +2438,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # quiet
         pass
 
-    def _send(self, code: int, body: bytes, ctype: str):
+    def _send(self, code: int, body: bytes, ctype: str, cache: str = "no-store"):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
@@ -2520,6 +2531,14 @@ class Handler(BaseHTTPRequestHandler):
                     except Exception:
                         pass
             self._send(404, b"site not found", "text/plain")
+        elif self.path.split("?", 1)[0] in _ICON_ROUTES:
+            # Dashboard icons (2026-11-19): favicon, home-screen icons, manifest.
+            name, ctype = _ICON_ROUTES[self.path.split("?", 1)[0]]
+            p = Path(__file__).with_name("icons") / name
+            if p.is_file():
+                self._send(200, p.read_bytes(), ctype, cache="public, max-age=86400")
+            else:
+                self._send(404, b"icon not found", "text/plain")
         else:
             self._send(404, b"not found", "text/plain")
 
