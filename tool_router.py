@@ -35,7 +35,7 @@ KEYWORDS = {
     "home": r"\b(light|lights|lamp|bulb|bright|brightness|dim|dimmer|colou?r|aircon|air ?con|ac|"
             r"aircondition\w*|temperature|degrees|thermostat|cool(er)?|warm(er)?|fan|timer|timers|"
             r"alarm|alarms|wake me|remind|reminder|reminders|call|phone|dial|volume|louder|quieter|"
-            r"mute|minutes?|seconds?|o'?clock)\b|\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b",
+            r"mute|minutes?|seconds?|o'?clock|bluetooth|pair|pairing)\b|\b\d{1,2}(:\d{2})?\s*(am|pm)\b|\b\d{1,2}:\d{2}\b",
     "build": r"\b(website|websites|web ?site|web ?page|landing page|site|app|apps|build|make me|"
              r"create|calculator|quiz|game|publish|github|deploy|html)\b",
     "files": r"\b(file|files|folder|folders|directory|notes?|readme|txt|md|py|json|csv|edit|"
@@ -49,7 +49,7 @@ KEYWORDS = {
 }
 _KW = {g: re.compile(p, re.I) for g, p in KEYWORDS.items()}
 
-GROUP_HELP = ("home (lights, AC, timers, alarms, reminders, calls), music (Spotify, playback, "
+GROUP_HELP = ("home (lights, AC, timers, alarms, reminders, calls, Bluetooth pairing), music (Spotify, playback, "
               "volume), build (websites, apps, publishing), files (read/write/edit/search "
               "files), shell (system checks, run Python), library (the user's document library)")
 

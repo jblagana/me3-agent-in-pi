@@ -1,0 +1,17 @@
+[Unit]
+# Boots Bluetooth speaker audio (2026-11-18, tools/bt_audio_bridge.py): a
+# connected phone's A2DP stream (BlueALSA) -> music receiver :8795 -> the
+# agent's music mixer (EMEET, ducked while Boots talks).
+Description=Boots Bluetooth audio bridge (phone -> music receiver)
+After=bluealsa.service me3-music-rx.service
+Wants=bluealsa.service me3-music-rx.service
+
+[Service]
+Type=simple
+User=jan
+ExecStart=/home/jan/me3/.venv/bin/python /home/jan/me3/tools/bt_audio_bridge.py
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

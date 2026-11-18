@@ -54,6 +54,7 @@ a{color:var(--accent-text)}
 .top .right{margin-left:auto;display:flex;align-items:center;gap:8px}
 .clock{font:600 18px var(--head);margin-right:6px}
 .btn{display:inline-flex;align-items:center;justify-content:center;gap:8px;min-height:44px;padding:0 16px;border-radius:12px;border:1px solid var(--line);background:var(--card);color:var(--text);font-weight:500;font-size:14px}
+.btn.on{border-color:var(--accent-line);background:var(--accent-soft);color:var(--accent-text)}  /* Bluetooth pairing mode */
 .btn:hover{border-color:var(--line2)}
 .btn.icon{width:44px;padding:0}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:var(--accent-ink);font-weight:600}
@@ -317,6 +318,8 @@ a{color:var(--accent-text)}
     <button class="btn" id="btn-hood" aria-haspopup="dialog" aria-controls="drawer">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M4 6h10M18 6h2M4 12h4M12 12h8M4 18h12"/><circle cx="16" cy="6" r="2"/><circle cx="10" cy="12" r="2"/><circle cx="18" cy="18" r="2"/></svg>
       <span>Under the hood</span></button>
+    <button class="btn icon" id="btn-bt" aria-label="Bluetooth: let a phone pair with Boots" title="Bluetooth speaker">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m7 7 10 10-5 5V2l5 5L7 17"/></svg></button>
     <button class="btn icon" id="btn-reset" aria-label="Restart: clear the conversation and reload" title="Restart: clear the conversation">
       <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 12a9 9 0 1 0 2.6-6.4"/><path d="M3 4v4.5h4.5"/></svg></button>
     <button class="btn icon" id="btn-theme" aria-label="Switch theme">
@@ -506,6 +509,22 @@ $('btn-reset').onclick=async()=>{
   try{await fetch('/reset',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});}catch(e){}
   location.reload();
 };
+/* Bluetooth speaker (2026-11-18): the button opens a 3-minute pairing window. */
+async function btRefresh(){
+  try{const s=await (await fetch('/bt_status')).json();const b=$('btn-bt');
+    b.classList.toggle('on',!!s.pairing);
+    b.title=s.pairing?`Pairing mode: ${s.seconds_left}s left. Pick "${s.name||'Boots'}" in your phone's Bluetooth settings.`
+      :(s.connected&&s.connected.length?`Bluetooth: ${s.connected.join(', ')} connected`:'Bluetooth speaker: click to pair a phone');
+    return s;}catch(e){return null}
+}
+$('btn-bt').onclick=async()=>{
+  try{const r=await (await fetch('/bt_pair',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'})).json();
+    await btRefresh();
+    alert(r.ok?'Pairing mode is on for 3 minutes.\nOn your phone, open Bluetooth settings and pick "'+(r.name||'Boots')+'".'
+              :'Bluetooth is not available: '+(r.error||'the pairing agent is not running'));
+  }catch(e){alert('Bluetooth request failed.')}
+};
+btRefresh();setInterval(btRefresh,5000);
 $('btn-theme').onclick=()=>{const h=document.documentElement;const n=h.getAttribute('data-theme')==='light'?'dark':'light';h.setAttribute('data-theme',n);store('boots-theme',n);};
 function showTab(which){
   const home=which==='home';

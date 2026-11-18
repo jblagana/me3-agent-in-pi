@@ -58,6 +58,8 @@ TOOL_SPECS = [
     ("boots_volume_down",   "Turn the volume down.", {}),
     ("boots_set_volume",    "Set the volume to a level (0-100).",
                             {"level": {"type": "integer", "minimum": 0, "maximum": 100}}),
+    ("boots_bluetooth_pair", "Let a phone or laptop pair with Boots as a Bluetooth speaker "
+                             "(pairing mode for 3 minutes).", {}),
     ("boots_lights",        "Turn the lights on or off.",
                             {"action": {"type": "string", "enum": ["on", "off"]}}),
     ("boots_set_bright",    "Set the light brightness to any level from 0 to 100 percent (0 turns the lights off).",
@@ -86,6 +88,7 @@ TOOL_TO_FIRE = {
     "boots_volume_up":       ("VOLUME_UP",       None),
     "boots_volume_down":     ("VOLUME_DOWN",     None),
     "boots_set_volume":      ("SET_VOLUME",      "level"),
+    "boots_bluetooth_pair":  ("_BT_PAIR",        None),
     "boots_lights":          ("_LIGHTS",         "action"),   # on/off -> LIGHT_ON/LIGHT_OFF
     "boots_set_bright":      ("BRIGHTNESS",      "level"),
     "boots_set_color":       ("COLOR",           "color"),
@@ -274,6 +277,23 @@ def _human_secs(n):
     return " ".join(parts) or "0 seconds"
 
 
+def _bt_pair() -> str:
+    """Open the Bluetooth pairing window via the dashboard (2026-11-18)."""
+    import json as _json
+    import urllib.request
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{BOOTS_UI_PORT}/bt_pair", data=b"{}",
+                                     headers={"Content-Type": "application/json"}, method="POST")
+        with urllib.request.urlopen(req, timeout=5) as r:
+            st = _json.loads(r.read() or b"{}")
+    except Exception:
+        return "I couldn't turn on Bluetooth pairing; the Boots UI backend isn't answering."
+    if not st.get("ok"):
+        return "Bluetooth pairing isn't available right now."
+    return (f"Pairing mode is on for three minutes. On your phone, open Bluetooth settings "
+            f"and pick {st.get('name') or 'Boots'}.")
+
+
 def dispatch(tool: str, **kw) -> str:
     """Execute a Boots UI command by firing it at :8330. Returns a string the
     LLM can speak back to the user.
@@ -288,6 +308,8 @@ def dispatch(tool: str, **kw) -> str:
     cmd, slot_key = mapping
     slot = kw.get(slot_key) if slot_key else None
 
+    if cmd == "_BT_PAIR":
+        return _bt_pair()
     if cmd == "_LIGHTS":
         a = (slot or "").strip().lower()
         return _fire("LIGHT_ON" if a == "on" else "LIGHT_OFF")

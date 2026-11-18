@@ -1658,6 +1658,33 @@ def _append_turn(heard: str, response: str, tools=None) -> None:
 RESET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "reset.json")
 
 
+# Bluetooth speaker (2026-11-18, tools/bt_agent.py): the agent runs as root
+# and watches BT_TRIGGER; touching it opens a 3-minute pairing window.
+BT_RUN = os.environ.get("BOOTS_BT_RUN", "/run/boots-bt")
+
+
+def bt_status():
+    try:
+        with open(os.path.join(BT_RUN, "status.json")) as f:
+            return json.load(f)
+    except Exception:
+        return {"pairing": False, "seconds_left": 0, "connected": [], "paired": [],
+                "error": "bluetooth agent not running"}
+
+
+def bt_pair():
+    try:
+        p = os.path.join(BT_RUN, "pair")
+        with open(p, "a"):
+            pass
+        os.utime(p, None)
+        _cmdlog("bluetooth: pairing mode requested", "ok")
+        return True
+    except Exception as e:
+        _cmdlog(f"bluetooth: pairing mode failed ({e!r})", "err")
+        return False
+
+
 def _reset_conversation() -> None:
     global _BOOT_ID
     with STATE["lock"]:
@@ -2468,6 +2495,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/ui_state":
             self._send(200, json.dumps(ui_state_json()).encode(),
                        "application/json")
+        elif self.path == "/bt_status":
+            self._send(200, json.dumps(bt_status()).encode(), "application/json")
         elif self.path == "/classic":
             # The previous dashboard (archived 2026-11-16), kept as a fallback.
             p = Path(__file__).with_name("archive") / "boots_ui_v2.html"
@@ -2896,6 +2925,10 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/reset":
             _reset_conversation()
             self._send(200, b"ok", "text/plain")
+        elif self.path == "/bt_pair":
+            ok = bt_pair()
+            self._send(200 if ok else 503, json.dumps({"ok": ok, **bt_status()}).encode(),
+                       "application/json")
         elif self.path == "/reminders":
             # Toggle a reminder's done state by index (UI checkbox).
             # Body: {"index": <int>, "done": <bool>}

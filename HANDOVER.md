@@ -92,7 +92,7 @@ phase 4 before phase 0, or you will not know what helped.
 
   The old processors also ignored cancel, so a stuck pipeline could not be
   shut down. That may be why stopping the service was slow.
-- Deployed to the Pi; the previous files are in `~/me3_backup_20261116_phase1`.
+- Deployed to the Pi; the previous files are in `~/me3_backup_20261116_phase1`, now inside `~/me3_old_backups_to_20261117.tar.gz` (8.14).
   The agent restarted cleanly: MCP bridge up, welcome spoken, no errors.
 - Not yet done: a live voice turn with `ME3_STT_BYPASS=0`, and removing the
   workarounds (step 4.3, items 3 and 4). To try it:
@@ -962,6 +962,30 @@ Built steps 1–3 of `PLAN-file-grounding.md` and deployed them to the Pi.
 - 5.1 item 3: `/llm` still accepts a custom `base_url`, now behind the login.
 - 5.2: `run_command` keeps its blocklist; the box now limits the damage.
 - 5.4: API keys reach the MCP tool process.
+
+### 8.14 Cleanup, 2026-11-18
+
+- Removed `me3-agent.service.d/override.conf`, which only set `ME3_DEBUG_FRAMES=1`. No current code reads that setting. The 121 MB `agent.log` came from frame debugging on Nov 3 and 6, in code that's gone; since Nov 7 the log has been small. The file is backed up as `~/me3_backup_20261118_auth/me3-agent-override.conf.bak`.
+- Deleted the unused Piper voices joe, john and norman (182 MB). Only `en_US-ryan-medium` is left in `~/me3/models/`.
+- Packed the 30 backups older than today into `~/me3_old_backups_to_20261117.tar.gz` (152 MB, mode 600, checked before the folders were removed). That covers the `me3_backup_2026110x` to `..._20261117_*` folders, `me3.bak_*`, `me3_git_backup_before_scrub_*` and the pre-ship tarballs. It includes old Wi-Fi profiles, passwords included. Today's `me3_backup_20261118_*` folders are kept, as the rollback points the notes above refer to.
+- Restore one with `tar -xzf ~/me3_old_backups_to_20261117.tar.gz <folder>`; the Wi-Fi files need `sudo`.
+
+### 8.15 Bluetooth speaker, 2026-11-18
+
+- **Why:** librespot still can't play. On 2026-11-18 it signed in, but Spotify refused every track's audio key ("error audio key"), the same failure as Nov 7. The laptop sender works but needs the laptop running. Now any phone or laptop can play to "Boots" over Bluetooth.
+- **Chain:** phone → BlueALSA (`bluealsa -p a2dp-sink`, drop-in `bluealsa.service.d/boots.conf`) → `tools/bt_audio_bridge.py` (`boots-bt-audio.service`, resamples to 48 kHz stereo) → `tools/music_receiver.py` :8795 → music FIFO → the agent's mixer (EMEET, ducked while Boots talks). `bluealsa-aplay` is disabled, because the agent owns the EMEET.
+- **Receiver now mixes senders.** It used to serve one at a time, so a connected laptop sender locked Bluetooth out. Now the laptop and a phone can play together. Each sender has a 0.4 s buffer that drops its oldest audio.
+- **Pairing** (`tools/bt_agent.py`, `boots-bt-agent.service`, root):
+  - Normally Boots is not pairable or discoverable, and the agent switches either back off if something else turns them on.
+  - The dashboard's Bluetooth button, or saying "Boots, pair a phone" (`boots_bluetooth_pair`), opens a 3-minute window. In it Boots shows as "Boots" with a speaker icon and accepts Just Works pairing.
+  - Each device paired in the window is trusted and reconnects later on its own.
+  - Only the audio (A2DP) and remote-control (AVRCP) profiles are allowed.
+- **Config:** `/etc/bluetooth/main.conf` has Name Boots, Class 0x240414 and AutoEnable on; the backup is `main.conf.bak-boots`. Copies of everything are in `deploy/`.
+- **Tests:** `tests/test_bluetooth.py` covers the mixer, resampling and wiring. Live, the pairing window opens from the dashboard and the adapter reported pairable and discoverable, then went back to off.
+- **Not tested yet:**
+  - pairing a real phone and playing audio through the EMEET (the EMEET is unplugged);
+  - stutter when Wi-Fi is busy, since the Pi 4 shares one radio chip.
+- **librespot:** still installed, with its service disabled. `~/.cache/librespot` holds an old sign-in and can be deleted.
 
 ## 9. Phase 6: tests and hygiene
 

@@ -1,0 +1,20 @@
+[Unit]
+# Boots Bluetooth pairing agent (2026-11-18, tools/bt_agent.py). Not pairable
+# except during a 3-minute pairing window opened by the dashboard's Bluetooth
+# button or the boots_bluetooth_pair voice tool (they touch /run/boots-bt/pair).
+Description=Boots Bluetooth pairing agent
+After=bluetooth.service
+Requires=bluetooth.service
+
+[Service]
+Type=simple
+User=root
+Group=jan
+RuntimeDirectory=boots-bt
+RuntimeDirectoryMode=0775
+ExecStart=/usr/bin/python3 /home/jan/me3/tools/bt_agent.py
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
